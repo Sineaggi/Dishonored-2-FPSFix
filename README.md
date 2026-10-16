@@ -149,6 +149,7 @@ Edit `d2-high-fps-fix.ini` while the game is closed.
 ### Stable settings
 
 - `UnlockAbove120=1` disables the game's frame spinner. An external FPS limiter is still required.
+- `MaxFPS=0` (off by default). Set it to 30-300 to cap the frame rate with the game's own frame limiter instead of an external one. That limiter is the menu's "Framerate Limiter" slider (the `com_timeScaler` cvar, where 1.0 = 30 FPS), which normally stops at 120. With `MaxFPS` set, the frame spinner stays enabled, Triple Buffering may stay on, and `UnlockAbove120` is not needed. The limiter only runs with in-game V-Sync off. The INI value overrides the menu slider while the game runs; the saved game config is not changed. The cvar is identified by name at runtime before it is written; if it is not found, the plugin logs that and falls back to `UnlockAbove120`.
 - `StabilizeMouseSensitivity=1` removes the game's FPS-dependent mouse multiplier. Mouse sensitivity will feel lower at high FPS; raise the in-game sensitivity once to taste.
 - `StabilizeFirstPersonHands=1` enables the validated renderer-only first-person root correction. It is enabled by default.
 

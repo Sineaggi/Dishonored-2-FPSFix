@@ -48,6 +48,10 @@ struct GameBuildLayout {
     std::uintptr_t frameSpinningRva;
     std::uintptr_t tripleBufferingRva;
     std::uintptr_t fixMouseSensibilityRva;
+    // idCVar object for com_timeScaler, which despite its name is the menu's
+    // frame-rate limiter: the frame spinner waits (1/30 s) / value. The name
+    // pointer is checked at runtime before the value is ever written.
+    std::uintptr_t frameLimiterCvarRva;
     std::uintptr_t copyViewRva;
     std::uintptr_t copyCallsiteRva;
     HookSiteLayout renderModelGpuCopy;
@@ -76,6 +80,10 @@ constexpr GameBuildLayout kGogLayout = {
     0x288E958,
     0x359E228,
     0x3BF2FA8,
+    // Inferred from the Steam registration order (com_timeScaler is constructed
+    // 0x80 bytes before com_disableFrameSpinning); unverified on GOG, so the
+    // runtime name check decides whether it is used.
+    0x288E8B0,
     0x64A90,
     0xA395A6,
     {0x3ACD00, 19, {
@@ -122,6 +130,7 @@ constexpr GameBuildLayout kSteamLayout = {
     0x25B1EA8,
     0x32FA908,
     0x3992158,
+    0x25B1E00,
     0x444C0,
     0x8AC8EF,
     {0x319560, 16, {
@@ -148,6 +157,15 @@ constexpr std::array<const GameBuildLayout*, 2> kKnownLayouts = {
 };
 
 constexpr std::uintptr_t kClockOffset = 0x2E7428;
+
+constexpr std::size_t kCVarIntegerOffset = 0x28;
+constexpr std::size_t kCVarFloatOffset = 0x2C;
+constexpr std::size_t kCVarNameOffset = 0x30;
+constexpr char kFrameLimiterCvarName[] = "com_timeScaler";
+// com_timeScaler 1.0 is 30 FPS; the cvar is registered with range 0.1..10.
+constexpr int kFrameLimiterBaseFps = 30;
+constexpr int kMinimumMaxFps = 30;
+constexpr int kMaximumMaxFps = 300;
 constexpr std::uintptr_t kScaledTimeOffset = 0x68;
 constexpr std::uintptr_t kSimulationTimeOffset = 0xB8;
 
@@ -236,6 +254,7 @@ bool g_f10WasDown = false;
 bool g_f11WasDown = false;
 HANDLE g_telemetryMapping = nullptr;
 bool g_unlockAbove120 = false;
+int g_maxFps = 0;
 bool g_stabilizeMouseSensitivity = false;
 bool g_stabilizeFirstPersonHands = false;
 bool g_interpolateWorldTransforms = false;
@@ -249,6 +268,8 @@ bool g_enableTelemetry = false;
 bool g_enableInterpolationAbProbe = false;
 std::atomic<bool> g_adaptiveInterpolationManualOverride{false};
 std::atomic<int> g_unlockState{0};
+// 0 = not resolved yet, 1 = engine limiter in use, 2 = unavailable.
+std::atomic<int> g_frameLimiterState{0};
 std::atomic<int> g_mouseStabilizationState{0};
 std::atomic<int> g_firstPersonRenderState{0};
 std::atomic<int> g_worldTransformRenderState{0};
@@ -752,6 +773,13 @@ void LoadConfiguration() {
     BuildSiblingPath(path, MAX_PATH, L"d2-high-fps-fix.ini");
     g_unlockAbove120 = GetPrivateProfileIntW(
         L"Fix", L"UnlockAbove120", 0, path) != 0;
+    g_maxFps = static_cast<int>(GetPrivateProfileIntW(
+        L"Fix", L"MaxFPS", 0, path));
+    if (g_maxFps < 0) {
+        g_maxFps = 0;
+    } else if (g_maxFps > 0) {
+        g_maxFps = std::max(kMinimumMaxFps, std::min(kMaximumMaxFps, g_maxFps));
+    }
     g_stabilizeMouseSensitivity = GetPrivateProfileIntW(
         L"Fix", L"StabilizeMouseSensitivity", 1, path) != 0;
     g_stabilizeFirstPersonHands = GetPrivateProfileIntW(
@@ -774,13 +802,14 @@ void LoadConfiguration() {
         L"Diagnostics", L"Telemetry", 0, path) != 0;
     g_enableInterpolationAbProbe = GetPrivateProfileIntW(
         L"Diagnostics", L"InterpolationABProbe", 0, path) != 0;
-    Log("Configuration: UnlockAbove120=%u, StabilizeMouseSensitivity=%u, "
+    Log("Configuration: UnlockAbove120=%u, MaxFPS=%d, StabilizeMouseSensitivity=%u, "
         "StabilizeFirstPersonHands=%u, WorldTransforms=%u, "
         "CinematicTransforms=%u, ShadowTransforms=%u, "
         "FirstPersonSkeletons=%u, WorldSkeletons=%u, "
         "CinematicSkeletons=%u, AdaptivePerformanceGate=%u, Telemetry=%u, "
         "InterpolationABProbe=%u.",
-        g_unlockAbove120 ? 1U : 0U, g_stabilizeMouseSensitivity ? 1U : 0U,
+        g_unlockAbove120 ? 1U : 0U, g_maxFps,
+        g_stabilizeMouseSensitivity ? 1U : 0U,
         g_stabilizeFirstPersonHands ? 1U : 0U,
         g_interpolateWorldTransforms ? 1U : 0U,
         g_interpolateCinematicTransforms ? 1U : 0U,
@@ -5129,8 +5158,73 @@ void ResetPrediction(const void* source, double simulationTime, const Transform&
     g_prediction.current = transform;
 }
 
+bool IsWritableMemory(const void* address, std::size_t size) {
+    if (!IsReadableMemory(address, size)) {
+        return false;
+    }
+    MEMORY_BASIC_INFORMATION information{};
+    if (VirtualQuery(address, &information, sizeof(information)) == 0) {
+        return false;
+    }
+    const DWORD protection = information.Protect & 0xFF;
+    return protection == PAGE_READWRITE || protection == PAGE_WRITECOPY;
+}
+
+// Drives the game's own frame spinner (the menu "Framerate Limiter") at
+// MaxFPS instead of disabling it. The value is re-asserted every frame so the
+// INI stays authoritative if the config load or the menu slider rewrites it;
+// the saved config keeps its own string value.
+void TryApplyEngineFrameLimiter() {
+    if (g_maxFps <= 0 ||
+        g_frameLimiterState.load(std::memory_order_relaxed) == 2) {
+        return;
+    }
+
+    auto* cvar = reinterpret_cast<unsigned char*>(
+        g_executableBase + g_layout->frameLimiterCvarRva);
+    if (g_frameLimiterState.load(std::memory_order_relaxed) == 0) {
+        const char* name = nullptr;
+        if (g_layout->frameLimiterCvarRva != 0 &&
+            IsReadableMemory(cvar + kCVarNameOffset, sizeof(name))) {
+            memcpy(&name, cvar + kCVarNameOffset, sizeof(name));
+            if (name == nullptr) {
+                return;  // The cvar constructor has not run yet.
+            }
+        }
+        if (name == nullptr ||
+            !IsReadableMemory(name, sizeof(kFrameLimiterCvarName)) ||
+            memcmp(name, kFrameLimiterCvarName, sizeof(kFrameLimiterCvarName)) != 0 ||
+            !IsWritableMemory(cvar + kCVarIntegerOffset, 2 * sizeof(LONG))) {
+            g_frameLimiterState.store(2, std::memory_order_relaxed);
+            Log("The engine frame limiter (%s) was not found on the %s "
+                "executable; MaxFPS was not applied and UnlockAbove120 "
+                "behaves as configured.", kFrameLimiterCvarName, g_layout->name);
+            return;
+        }
+        g_frameLimiterState.store(1, std::memory_order_relaxed);
+        Log("Driving the engine frame limiter at MaxFPS=%d (%s=%.4f); "
+            "com_disableFrameSpinning is left enabled. The limiter is skipped "
+            "while V-Sync is on.", g_maxFps, kFrameLimiterCvarName,
+            static_cast<double>(g_maxFps) / kFrameLimiterBaseFps);
+    }
+
+    const float target = static_cast<float>(g_maxFps) / kFrameLimiterBaseFps;
+    auto* value = reinterpret_cast<volatile float*>(cvar + kCVarFloatOffset);
+    if (*value != target) {
+        *value = target;
+        InterlockedExchange(reinterpret_cast<volatile LONG*>(cvar + kCVarIntegerOffset),
+                            static_cast<LONG>(target));
+    }
+}
+
 void TryUnlockAbove120() {
     if (!g_unlockAbove120 || g_unlockState.load(std::memory_order_relaxed) != 0) {
+        return;
+    }
+    // The engine limiter needs the frame spinner; only fall back to disabling
+    // it once MaxFPS is known to be unavailable.
+    if (g_maxFps > 0 &&
+        g_frameLimiterState.load(std::memory_order_relaxed) != 2) {
         return;
     }
 
@@ -5193,6 +5287,7 @@ void TryStabilizeMouseSensitivity() {
 
 void ApplyPrediction(void* destination, const void* source) {
     g_lastAlpha = std::numeric_limits<double>::quiet_NaN();
+    TryApplyEngineFrameLimiter();
     TryUnlockAbove120();
     TryStabilizeMouseSensitivity();
     const bool f10IsDown = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
