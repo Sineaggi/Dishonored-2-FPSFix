@@ -22,6 +22,17 @@ The fully tested reference executable is:
 - `Dishonored2.exe` SHA-256: `C3150F9F2D9BF967D23CA6A79BB32703B90116854AAD9892C7FC1F46A1060293`
 - Windows x64
 
+A layout profile also exists for the Steam executable (Steam build 17576867,
+version 1.77.9.0):
+
+- `Dishonored2.exe` SHA-256: `B671F8249422862BF557D00AAB2F4BB671ED4515CC10AD8A8A9DECAD84516180`
+
+The Steam executable is not SteamStub-encrypted, but it is a separate link of
+the same source, so every code and data address differs from GOG. Its profile
+was mapped by static analysis (object layouts and field offsets are identical
+to GOG). `ShadowTransforms` is not yet mapped on Steam; if it is enabled there
+it is switched off with a log message rather than blocking the other fixes.
+
 The SHA-256 is now an identity diagnostic rather than a hard allowlist. Before
 installing any hook, the ASI verifies that the host is a PE32+ x64
 `Dishonored2.exe`, that every required RVA has the expected code/data section
@@ -32,7 +43,8 @@ therefore activate when it retains the complete verified runtime layout.
 Builds that relocate or change
 any required path fail closed and need a separately researched layout profile.
 Only the GOG build above has received full live testing; layout-compatible
-acceptance is not a gameplay-support claim for other releases.
+acceptance is not a gameplay-support claim for other releases. An unknown hash
+is checked against each known layout profile in turn.
 
 ## What it fixes
 

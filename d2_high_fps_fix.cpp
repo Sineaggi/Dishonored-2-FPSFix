@@ -22,35 +22,140 @@
 
 namespace {
 
-constexpr std::uintptr_t kGamePointerRva = 0x288D608;
-constexpr std::uintptr_t kGameVtableRva = 0x1F02138;
-constexpr std::array<std::uintptr_t, 4> kExpectedGameVtableTargets = {
-    0xA2F190, 0xA3EF00, 0xA3EEF0, 0xA38740,
+// Executable-specific addresses and entry signatures. Everything else the
+// plugin touches (object layouts, field offsets, the view-copy body) is shared
+// by every supported build of Dishonored 2 1.77.9.0.
+struct VtableLayout {
+    std::uintptr_t rva;
+    std::array<std::uintptr_t, 4> targets;
 };
+
+constexpr std::size_t kMaximumHookLength = 32;
+
+struct HookSiteLayout {
+    std::uintptr_t rva;
+    // Leading whole instructions copied into the trampoline. They must be
+    // position-independent and cover at least the 14-byte absolute jump.
+    std::size_t length;
+    std::array<unsigned char, kMaximumHookLength> bytes;
+};
+
+struct GameBuildLayout {
+    const char* name;
+    std::array<unsigned char, 32> sha256;
+    std::uintptr_t gamePointerRva;
+    VtableLayout gameVtable;
+    std::uintptr_t frameSpinningRva;
+    std::uintptr_t tripleBufferingRva;
+    std::uintptr_t fixMouseSensibilityRva;
+    std::uintptr_t copyViewRva;
+    std::uintptr_t copyCallsiteRva;
+    HookSiteLayout renderModelGpuCopy;
+    VtableLayout renderModelStaticVtable;
+    VtableLayout skinnedModelVtable;
+    HookSiteLayout skinnedPoseUpload;
+    // The Steam pose-upload function returns a bool in AL only, leaving the
+    // upper bits of RAX unspecified.
+    bool skinnedPoseUploadReturnsByte;
+    // Builds where the shadow caster-list builders have not been located
+    // force ShadowTransforms off instead of failing the whole plugin.
+    bool shadowCasterBuildSupported;
+    std::array<HookSiteLayout, 2> shadowCasterBuild;
+};
+
+constexpr GameBuildLayout kGogLayout = {
+    "GOG 1.77.9.0",
+    {
+        0xC3, 0x15, 0x0F, 0x9F, 0x2D, 0x9B, 0xF9, 0x67,
+        0xD2, 0x3C, 0xA6, 0xA7, 0x9B, 0xB3, 0x27, 0x03,
+        0xB9, 0x01, 0x16, 0x85, 0x4A, 0xAD, 0x98, 0x92,
+        0xC7, 0xFC, 0x1F, 0x46, 0xA1, 0x06, 0x02, 0x93,
+    },
+    0x288D608,
+    {0x1F02138, {0xA2F190, 0xA3EF00, 0xA3EEF0, 0xA38740}},
+    0x288E958,
+    0x359E228,
+    0x3BF2FA8,
+    0x64A90,
+    0xA395A6,
+    {0x3ACD00, 19, {
+        0x48, 0x89, 0x5C, 0x24, 0x08,
+        0xF3, 0x0F, 0x11, 0x54, 0x24, 0x18,
+        0x57,
+        0x48, 0x81, 0xEC, 0xC0, 0x00, 0x00, 0x00,
+    }},
+    {0x1E55208, {0x224400, 0x2243F0, 0x2243E0, 0x2DA6D0}},
+    {0x1E55008, {0x224400, 0x2243F0, 0x2243E0, 0x2CF590}},
+    {0x2D0C80, 17, {
+        0x48, 0x89, 0x74, 0x24, 0x20,
+        0x57,
+        0x48, 0x83, 0xEC, 0x40,
+        0x80, 0xB9, 0xB1, 0x1F, 0x00, 0x00, 0x00,
+    }},
+    false,
+    true,
+    {{
+        {0x3CA3B0, 15, {
+            0x4C, 0x89, 0x44, 0x24, 0x18, 0x48, 0x89, 0x54, 0x24, 0x10,
+            0x48, 0x89, 0x4C, 0x24, 0x08,
+        }},
+        {0x3CACE0, 15, {
+            0x4C, 0x89, 0x44, 0x24, 0x18, 0x48, 0x89, 0x54, 0x24, 0x10,
+            0x48, 0x89, 0x4C, 0x24, 0x08,
+        }},
+    }},
+};
+
+// Steam build 17576867 (FileVersion 1.77.9.0, PE timestamp 0x67A50CDE). The
+// executable is not SteamStub-wrapped; it is a separate link of the same
+// source, so object layouts match GOG but code and data addresses do not.
+constexpr GameBuildLayout kSteamLayout = {
+    "Steam 1.77.9.0",
+    {
+        0xB6, 0x71, 0xF8, 0x24, 0x94, 0x22, 0x86, 0x2B,
+        0xF5, 0x57, 0xF7, 0x0A, 0xAD, 0x08, 0xD0, 0xB6,
+        0x71, 0xED, 0x45, 0x15, 0xCC, 0x10, 0xAD, 0x8A,
+        0x8A, 0x9D, 0xEC, 0xAD, 0x84, 0x51, 0x61, 0x80,
+    },
+    0x39A5290,
+    {0x1C940A8, {0x8A5F60, 0x8A88E0, 0x8A88F0, 0x8ACDF0}},
+    0x25B1EA8,
+    0x32FA908,
+    0x3992158,
+    0x444C0,
+    0x8AC8EF,
+    {0x319560, 16, {
+        0x48, 0x89, 0x5C, 0x24, 0x10,
+        0x48, 0x89, 0x6C, 0x24, 0x18,
+        0x48, 0x89, 0x74, 0x24, 0x20,
+        0x57,
+    }},
+    {0x1B0DD88, {0x1BD8A0, 0x1BE8C0, 0x1BDD40, 0x2681F0}},
+    {0x1B0D628, {0x1BD8A0, 0x1BE8C0, 0x1BDD40, 0x25D690}},
+    {0x25F930, 17, {
+        0x48, 0x89, 0x5C, 0x24, 0x10,
+        0x57,
+        0x48, 0x83, 0xEC, 0x20,
+        0x80, 0xB9, 0xB1, 0x1F, 0x00, 0x00, 0x00,
+    }},
+    true,
+    false,
+    {},
+};
+
+constexpr std::array<const GameBuildLayout*, 2> kKnownLayouts = {
+    &kGogLayout, &kSteamLayout,
+};
+
 constexpr std::uintptr_t kClockOffset = 0x2E7428;
 constexpr std::uintptr_t kScaledTimeOffset = 0x68;
 constexpr std::uintptr_t kSimulationTimeOffset = 0xB8;
-constexpr std::uintptr_t kFrameSpinningRva = 0x288E958;
-constexpr std::uintptr_t kTripleBufferingRva = 0x359E228;
-constexpr std::uintptr_t kFixMouseSensibilityRva = 0x3BF2FA8;
 
-constexpr std::uintptr_t kCopyViewRva = 0x64A90;
-constexpr std::uintptr_t kCopyCallsiteRva = 0xA395A6;
-constexpr unsigned char kExpectedCallBytes[5] = {0xE8, 0xE5, 0xB4, 0x62, 0xFF};
 constexpr unsigned char kExpectedCopyViewBytes[32] = {
     0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x74,
     0x24, 0x10, 0x48, 0x89, 0x7C, 0x24, 0x18, 0x41,
     0x56, 0x48, 0x83, 0xEC, 0x20, 0x8B, 0x02, 0x4C,
     0x8B, 0xF2, 0x48, 0x8B, 0xF1, 0x89, 0x01, 0x0F,
-};
-
-constexpr std::uintptr_t kRenderModelGpuCopyRva = 0x3ACD00;
-constexpr std::size_t kRenderModelGpuCopyHookLength = 19;
-constexpr unsigned char kExpectedRenderModelGpuCopyBytes[kRenderModelGpuCopyHookLength] = {
-    0x48, 0x89, 0x5C, 0x24, 0x08,
-    0xF3, 0x0F, 0x11, 0x54, 0x24, 0x18,
-    0x57,
-    0x48, 0x81, 0xEC, 0xC0, 0x00, 0x00, 0x00,
 };
 
 constexpr std::size_t kRenderModelSize = 0x1CD0;
@@ -64,36 +169,11 @@ constexpr std::size_t kRenderModelMvpMatrixOffset = 0x1A0;
 constexpr std::size_t kRenderModelPreviousMvpMatrixOffset = 0x1E0;
 constexpr std::size_t kRenderModelDepthHackOffset = 0x18B8;
 constexpr std::size_t kRenderModelOwnerOffset = 0x1C50;
-constexpr std::uintptr_t kRenderModelStaticVtableRva = 0x1E55208;
-constexpr std::array<std::uintptr_t, 4> kExpectedRenderModelStaticVtableTargets = {
-    0x224400, 0x2243F0, 0x2243E0, 0x2DA6D0,
-};
 
-constexpr std::uintptr_t kShadowCasterBuildRvas[2] = {0x3CA3B0, 0x3CACE0};
-constexpr std::size_t kShadowCasterBuildHookLength = 15;
-constexpr unsigned char
-    kExpectedShadowCasterBuildBytes[2][kShadowCasterBuildHookLength] = {
-    {0x4C, 0x89, 0x44, 0x24, 0x18, 0x48, 0x89, 0x54, 0x24, 0x10,
-     0x48, 0x89, 0x4C, 0x24, 0x08},
-    {0x4C, 0x89, 0x44, 0x24, 0x18, 0x48, 0x89, 0x54, 0x24, 0x10,
-     0x48, 0x89, 0x4C, 0x24, 0x08},
-};
 constexpr std::size_t kShadowCasterEntryStride = 0x30;
 constexpr std::size_t kShadowCasterMatrixPointerOffset = 0x08;
 constexpr std::size_t kShadowCasterProxyCapacity = 4096;
 
-constexpr std::uintptr_t kSkinnedModelVtableRva = 0x1E55008;
-constexpr std::array<std::uintptr_t, 4> kExpectedSkinnedModelVtableTargets = {
-    0x224400, 0x2243F0, 0x2243E0, 0x2CF590,
-};
-constexpr std::uintptr_t kSkinnedPoseUploadRva = 0x2D0C80;
-constexpr std::size_t kSkinnedPoseUploadHookLength = 17;
-constexpr unsigned char kExpectedSkinnedPoseUploadBytes[kSkinnedPoseUploadHookLength] = {
-    0x48, 0x89, 0x74, 0x24, 0x20,
-    0x57,
-    0x48, 0x83, 0xEC, 0x40,
-    0x80, 0xB9, 0xB1, 0x1F, 0x00, 0x00, 0x00,
-};
 constexpr std::size_t kSkinnedModelSize = 0x2130;
 constexpr std::size_t kSkinnedPoseUploadFlagsOffset = 0x1FB0;
 constexpr std::size_t kSkinnedPosePendingOffset = 0x1FB1;
@@ -132,13 +212,6 @@ constexpr std::size_t kViewOriginOffset = 0xA8;
 constexpr std::size_t kViewOriginDuplicateOffset = 0xC0;
 constexpr std::size_t kViewAxisOffset = 0xCC;
 
-constexpr unsigned char kExpectedExecutableSha256[32] = {
-    0xC3, 0x15, 0x0F, 0x9F, 0x2D, 0x9B, 0xF9, 0x67,
-    0xD2, 0x3C, 0xA6, 0xA7, 0x9B, 0xB3, 0x27, 0x03,
-    0xB9, 0x01, 0x16, 0x85, 0x4A, 0xAD, 0x98, 0x92,
-    0xC7, 0xFC, 0x1F, 0x46, 0xA1, 0x06, 0x02, 0x93,
-};
-
 constexpr double kTimeEpsilon = 1.0e-7;
 constexpr double kMaximumStateInterval = 0.050;
 constexpr double kMaximumPositionJump = 5.0;
@@ -149,6 +222,7 @@ constexpr double kPi = 3.14159265358979323846;
 
 HMODULE g_pluginModule = nullptr;
 std::uintptr_t g_executableBase = 0;
+const GameBuildLayout* g_layout = &kGogLayout;
 void* g_relay = nullptr;
 std::array<void*, 2> g_shadowCasterBuildTrampolines{};
 void* g_renderModelGpuCopyTrampoline = nullptr;
@@ -885,11 +959,10 @@ bool ValidateMutableDataRange(const ExecutableImageLayout& image,
 }
 
 bool ValidateVtable(const ExecutableImageLayout& image,
-                    std::uintptr_t rva,
-                    const std::array<std::uintptr_t, 4>& expectedTargets,
+                    const VtableLayout& vtable,
                     const char* description) {
-    const std::size_t entriesToValidate = expectedTargets.size();
-    if (!ValidateImageRange(image, rva,
+    const std::size_t entriesToValidate = vtable.targets.size();
+    if (!ValidateImageRange(image, vtable.rva,
                             entriesToValidate * sizeof(std::uintptr_t),
                             IMAGE_SCN_MEM_READ,
                             IMAGE_SCN_MEM_WRITE | IMAGE_SCN_MEM_EXECUTE,
@@ -898,7 +971,7 @@ bool ValidateVtable(const ExecutableImageLayout& image,
     }
 
     const auto* entries = reinterpret_cast<const std::uintptr_t*>(
-        g_executableBase + rva);
+        g_executableBase + vtable.rva);
     for (std::size_t index = 0; index < entriesToValidate; ++index) {
         if (entries[index] < g_executableBase) {
             Log("Executable layout check failed for %s entry %llu; patch not installed.",
@@ -906,7 +979,7 @@ bool ValidateVtable(const ExecutableImageLayout& image,
             return false;
         }
         const std::uintptr_t targetRva = entries[index] - g_executableBase;
-        if (targetRva != expectedTargets[index] ||
+        if (targetRva != vtable.targets[index] ||
             !ValidateCodeRange(image, targetRva, 1, description)) {
             Log("Executable call relationship check failed for %s entry %llu; "
                 "patch not installed.", description,
@@ -917,16 +990,25 @@ bool ValidateVtable(const ExecutableImageLayout& image,
     return true;
 }
 
+bool ValidateHookSite(const ExecutableImageLayout& image,
+                      const HookSiteLayout& site,
+                      const char* description) {
+    return site.length >= 14 && site.length <= site.bytes.size() &&
+           ValidateCodeRange(image, site.rva, site.length, description) &&
+           memcmp(reinterpret_cast<const void*>(g_executableBase + site.rva),
+                  site.bytes.data(), site.length) == 0;
+}
+
 bool ValidateViewCopyCallRelationship(const ExecutableImageLayout& image) {
-    if (!ValidateCodeRange(image, kCopyCallsiteRva, sizeof(kExpectedCallBytes),
+    if (!ValidateCodeRange(image, g_layout->copyCallsiteRva, 5,
                            "renderer view-copy call site") ||
-        !ValidateCodeRange(image, kCopyViewRva, sizeof(kExpectedCopyViewBytes),
+        !ValidateCodeRange(image, g_layout->copyViewRva, sizeof(kExpectedCopyViewBytes),
                            "renderer view-copy target")) {
         return false;
     }
 
     const auto* callsite = reinterpret_cast<const unsigned char*>(
-        g_executableBase + kCopyCallsiteRva);
+        g_executableBase + g_layout->copyCallsiteRva);
     if (callsite[0] != 0xE8) {
         Log("Renderer view-copy site is not a direct call; patch not installed.");
         return false;
@@ -934,11 +1016,10 @@ bool ValidateViewCopyCallRelationship(const ExecutableImageLayout& image) {
     std::int32_t displacement = 0;
     memcpy(&displacement, callsite + 1, sizeof(displacement));
     const std::uintptr_t target = static_cast<std::uintptr_t>(
-        static_cast<std::int64_t>(g_executableBase + kCopyCallsiteRva + 5) +
+        static_cast<std::int64_t>(g_executableBase + g_layout->copyCallsiteRva + 5) +
         displacement);
-    if (target != g_executableBase + kCopyViewRva ||
-        memcmp(callsite, kExpectedCallBytes, sizeof(kExpectedCallBytes)) != 0 ||
-        memcmp(reinterpret_cast<const void*>(g_executableBase + kCopyViewRva),
+    if (target != g_executableBase + g_layout->copyViewRva ||
+        memcmp(reinterpret_cast<const void*>(g_executableBase + g_layout->copyViewRva),
                kExpectedCopyViewBytes, sizeof(kExpectedCopyViewBytes)) != 0) {
         Log("Renderer view-copy call relationship does not match the supported layout; "
             "patch not installed.");
@@ -956,18 +1037,11 @@ bool ValidateHookSignatures(const ExecutableImageLayout& image) {
         g_interpolateCinematicSkeletons;
 
     if (rendererModelFeatures) {
-        if (!ValidateCodeRange(image, kRenderModelGpuCopyRva,
-                               sizeof(kExpectedRenderModelGpuCopyBytes),
-                               "renderer model GPU-copy hook") ||
-            memcmp(reinterpret_cast<const void*>(
-                       g_executableBase + kRenderModelGpuCopyRva),
-                   kExpectedRenderModelGpuCopyBytes,
-                   sizeof(kExpectedRenderModelGpuCopyBytes)) != 0 ||
-            !ValidateVtable(image, kRenderModelStaticVtableRva,
-                            kExpectedRenderModelStaticVtableTargets,
+        if (!ValidateHookSite(image, g_layout->renderModelGpuCopy,
+                              "renderer model GPU-copy hook") ||
+            !ValidateVtable(image, g_layout->renderModelStaticVtable,
                             "static render-model vtable") ||
-            !ValidateVtable(image, kSkinnedModelVtableRva,
-                            kExpectedSkinnedModelVtableTargets,
+            !ValidateVtable(image, g_layout->skinnedModelVtable,
                             "skinned render-model vtable")) {
             Log("Renderer model correction layout/signature validation failed; "
                 "patch not installed.");
@@ -976,15 +1050,9 @@ bool ValidateHookSignatures(const ExecutableImageLayout& image) {
     }
 
     if (skeletalFeatures) {
-        if (!ValidateCodeRange(image, kSkinnedPoseUploadRva,
-                               sizeof(kExpectedSkinnedPoseUploadBytes),
-                               "skinned-pose upload hook") ||
-            memcmp(reinterpret_cast<const void*>(
-                       g_executableBase + kSkinnedPoseUploadRva),
-                   kExpectedSkinnedPoseUploadBytes,
-                   sizeof(kExpectedSkinnedPoseUploadBytes)) != 0 ||
-            !ValidateVtable(image, kSkinnedModelVtableRva,
-                            kExpectedSkinnedModelVtableTargets,
+        if (!ValidateHookSite(image, g_layout->skinnedPoseUpload,
+                              "skinned-pose upload hook") ||
+            !ValidateVtable(image, g_layout->skinnedModelVtable,
                             "skinned render-model vtable")) {
             Log("Skeletal correction layout/signature validation failed; "
                 "patch not installed.");
@@ -992,15 +1060,9 @@ bool ValidateHookSignatures(const ExecutableImageLayout& image) {
         }
     }
 
-    if (g_interpolateShadowTransforms) {
-        for (std::size_t index = 0; index < 2; ++index) {
-            if (!ValidateCodeRange(image, kShadowCasterBuildRvas[index],
-                                   kShadowCasterBuildHookLength,
-                                   "shadow caster-build hook") ||
-                memcmp(reinterpret_cast<const void*>(
-                           g_executableBase + kShadowCasterBuildRvas[index]),
-                       kExpectedShadowCasterBuildBytes[index],
-                       kShadowCasterBuildHookLength) != 0) {
+    if (g_interpolateShadowTransforms && g_layout->shadowCasterBuildSupported) {
+        for (const HookSiteLayout& site : g_layout->shadowCasterBuild) {
+            if (!ValidateHookSite(image, site, "shadow caster-build hook")) {
                 Log("Shadow correction layout/signature validation failed; "
                     "patch not installed.");
                 return false;
@@ -1010,16 +1072,38 @@ bool ValidateHookSignatures(const ExecutableImageLayout& image) {
     return true;
 }
 
-void LogExecutableHash(const wchar_t* path) {
+bool ValidateSelectedLayout(const ExecutableImageLayout& image) {
+    return ValidateViewCopyCallRelationship(image) &&
+           ValidateMutableDataRange(image, g_layout->gamePointerRva,
+                                    sizeof(std::uintptr_t),
+                                    "idGameLocal pointer") &&
+           ValidateVtable(image, g_layout->gameVtable, "idGameLocal vtable") &&
+           (!g_unlockAbove120 ||
+            (ValidateMutableDataRange(image, g_layout->frameSpinningRva, sizeof(LONG),
+                                      "frame-spinning cvar cache") &&
+             ValidateMutableDataRange(image, g_layout->tripleBufferingRva, sizeof(LONG),
+                                      "triple-buffering cvar cache"))) &&
+           (!g_stabilizeMouseSensitivity ||
+            ValidateMutableDataRange(image, g_layout->fixMouseSensibilityRva,
+                                     sizeof(LONG),
+                                     "mouse-sensitivity cvar cache")) &&
+           ValidateHookSignatures(image);
+}
+
+// Returns the layout whose SHA-256 matches the executable, or nullptr when the
+// hash is unknown or could not be computed.
+const GameBuildLayout* IdentifyExecutableByHash(const wchar_t* path) {
     unsigned char actualHash[32]{};
     if (!ComputeFileSha256(path, actualHash)) {
         Log("Unable to hash Dishonored2.exe; continuing with runtime layout validation.");
-        return;
+        return nullptr;
     }
 
-    if (memcmp(actualHash, kExpectedExecutableSha256, sizeof(actualHash)) == 0) {
-        Log("Recognized the validated GOG 1.77.9.0 executable SHA-256.");
-        return;
+    for (const GameBuildLayout* layout : kKnownLayouts) {
+        if (memcmp(actualHash, layout->sha256.data(), sizeof(actualHash)) == 0) {
+            Log("Recognized the validated %s executable SHA-256.", layout->name);
+            return layout;
+        }
     }
 
     char hashText[65]{};
@@ -1027,8 +1111,9 @@ void LogExecutableHash(const wchar_t* path) {
         sprintf_s(hashText + index * 2, sizeof(hashText) - index * 2,
                   "%02X", actualHash[index]);
     }
-    Log("Executable SHA-256 %s is not the reference hash; attempting strict "
+    Log("Executable SHA-256 %s is not a reference hash; attempting strict "
         "runtime layout validation.", hashText);
+    return nullptr;
 }
 
 bool VerifyExecutableLayout() {
@@ -1046,32 +1131,43 @@ bool VerifyExecutableLayout() {
         return false;
     }
 
-    LogExecutableHash(path);
+    const GameBuildLayout* recognized = IdentifyExecutableByHash(path);
 
     ExecutableImageLayout image{};
-    if (!ReadExecutableImageLayout(image) ||
-        !ValidateViewCopyCallRelationship(image) ||
-        !ValidateMutableDataRange(image, kGamePointerRva,
-                                  sizeof(std::uintptr_t),
-                                  "idGameLocal pointer") ||
-        !ValidateVtable(image, kGameVtableRva,
-                        kExpectedGameVtableTargets,
-                        "idGameLocal vtable") ||
-        (g_unlockAbove120 &&
-         (!ValidateMutableDataRange(image, kFrameSpinningRva, sizeof(LONG),
-                                    "frame-spinning cvar cache") ||
-          !ValidateMutableDataRange(image, kTripleBufferingRva, sizeof(LONG),
-                                    "triple-buffering cvar cache"))) ||
-        (g_stabilizeMouseSensitivity &&
-         !ValidateMutableDataRange(image, kFixMouseSensibilityRva,
-                                   sizeof(LONG),
-                                   "mouse-sensitivity cvar cache")) ||
-        !ValidateHookSignatures(image)) {
+    if (!ReadExecutableImageLayout(image)) {
         return false;
     }
 
-    Log("Executable passed strict runtime layout validation; all enabled "
-        "correction paths were validated before hook installation.");
+    // A recognized hash pins the layout. Otherwise every known layout is tried
+    // in turn, and each must pass the full strict validation on its own.
+    const GameBuildLayout* selected = nullptr;
+    for (const GameBuildLayout* layout : kKnownLayouts) {
+        if (recognized != nullptr && layout != recognized) {
+            continue;
+        }
+        if (recognized == nullptr) {
+            Log("Trying the %s layout.", layout->name);
+        }
+        g_layout = layout;
+        if (ValidateSelectedLayout(image)) {
+            selected = layout;
+            break;
+        }
+    }
+    if (selected == nullptr) {
+        g_layout = &kGogLayout;
+        return false;
+    }
+
+    if (g_interpolateShadowTransforms && !selected->shadowCasterBuildSupported) {
+        g_interpolateShadowTransforms = false;
+        Log("ShadowTransforms is not yet supported on the %s executable; "
+            "shadow-transform interpolation was disabled.", selected->name);
+    }
+
+    Log("Executable passed strict runtime layout validation as %s; all enabled "
+        "correction paths were validated before hook installation.",
+        selected->name);
     return true;
 }
 
@@ -1957,9 +2053,9 @@ bool IsEligibleWorldRenderModel(const void* renderModel, const void*& owner,
     }
     memcpy(&vtable, renderModel, sizeof(vtable));
     const bool exactStatic =
-        vtable == g_executableBase + kRenderModelStaticVtableRva;
+        vtable == g_executableBase + g_layout->renderModelStaticVtable.rva;
     const bool exactSkinned =
-        vtable == g_executableBase + kSkinnedModelVtableRva;
+        vtable == g_executableBase + g_layout->skinnedModelVtable.rva;
     if (!exactStatic && !exactSkinned) {
         g_worldDiagnostics.vtableRejected.fetch_add(1, std::memory_order_relaxed);
         if (vtable >= g_executableBase) {
@@ -3252,7 +3348,7 @@ bool PrepareSkeletalPose(
 
     std::uintptr_t vtable = 0;
     memcpy(&vtable, renderModel, sizeof(vtable));
-    if (vtable != g_executableBase + kSkinnedModelVtableRva) {
+    if (vtable != g_executableBase + g_layout->skinnedModelVtable.rva) {
         return false;
     }
     g_skeletalDiagnostics.exactSkinnedType.fetch_add(1,
@@ -4151,7 +4247,7 @@ extern "C" void __fastcall HookRenderModelGpuCopy(
     std::uintptr_t renderModelVtable = 0;
     memcpy(&renderModelVtable, renderModel, sizeof(renderModelVtable));
     const bool exactSkinned =
-        renderModelVtable == g_executableBase + kSkinnedModelVtableRva;
+        renderModelVtable == g_executableBase + g_layout->skinnedModelVtable.rva;
     bool correctedFirstPerson = false;
     std::uint64_t correctionSerial = 0;
     RenderCorrectionState firstPersonCorrection{};
@@ -4236,6 +4332,11 @@ extern "C" void __fastcall HookRenderModelGpuCopy(
     }
 }
 
+bool SkinnedPoseUploaded(std::uint64_t result) {
+    return g_layout->skinnedPoseUploadReturnsByte ? (result & 0xFFU) != 0
+                                                  : result != 0;
+}
+
 extern "C" std::uint64_t __fastcall HookSkinnedPoseUpload(
     void* renderModel, void* renderContext) {
     if (g_enableInterpolationAbProbe) {
@@ -4271,7 +4372,7 @@ extern "C" std::uint64_t __fastcall HookSkinnedPoseUpload(
         std::uint64_t result =
             g_originalSkinnedPoseUpload(renderModel, renderContext);
         bool forced = false;
-        if (result == 0) {
+        if (!SkinnedPoseUploaded(result)) {
             // The native path commonly consumes its two pending uploads on
             // alternating presentation frames. For a valid moving pair, map
             // only the currently selected buffer once on the intervening
@@ -4288,12 +4389,12 @@ extern "C" std::uint64_t __fastcall HookSkinnedPoseUpload(
                    sizeof(savedUploadFlags));
             memcpy(bytes + kSkinnedPosePendingOffset, &savedPending,
                    sizeof(savedPending));
-            forced = result != 0;
+            forced = SkinnedPoseUploaded(result);
         }
         memcpy(bytes + kSkinnedPoseCpuListOffset, &sourcePalette,
                sizeof(sourcePalette));
 
-        if (result != 0) {
+        if (SkinnedPoseUploaded(result)) {
             RecordSkeletalUpload(prepared);
             if (forced) {
                 g_skeletalDiagnostics.forcedUploads.fetch_add(
@@ -4368,9 +4469,9 @@ void PublishTelemetry(const void* source, const void* destination) {
     const Transform output = ReadTransform(destination);
     double scaledTime = std::numeric_limits<double>::quiet_NaN();
     double simulationTime = std::numeric_limits<double>::quiet_NaN();
-    auto* game = *reinterpret_cast<unsigned char**>(g_executableBase + kGamePointerRva);
+    auto* game = *reinterpret_cast<unsigned char**>(g_executableBase + g_layout->gamePointerRva);
     if (game != nullptr && *reinterpret_cast<std::uintptr_t*>(game) ==
-                               g_executableBase + kGameVtableRva) {
+                               g_executableBase + g_layout->gameVtable.rva) {
         unsigned char* clock = game + kClockOffset;
         memcpy(&scaledTime, clock + kScaledTimeOffset, sizeof(scaledTime));
         memcpy(&simulationTime, clock + kSimulationTimeOffset, sizeof(simulationTime));
@@ -4401,9 +4502,9 @@ void PublishTelemetry(const void* source, const void* destination) {
 
 void PublishPresentationContext() {
     PresentationContext context{};
-    auto* game = *reinterpret_cast<unsigned char**>(g_executableBase + kGamePointerRva);
+    auto* game = *reinterpret_cast<unsigned char**>(g_executableBase + g_layout->gamePointerRva);
     if (game != nullptr && *reinterpret_cast<std::uintptr_t*>(game) ==
-                               g_executableBase + kGameVtableRva) {
+                               g_executableBase + g_layout->gameVtable.rva) {
         unsigned char* clock = game + kClockOffset;
         memcpy(&context.scaledTime, clock + kScaledTimeOffset, sizeof(context.scaledTime));
         memcpy(&context.simulationTime, clock + kSimulationTimeOffset,
@@ -5034,9 +5135,9 @@ void TryUnlockAbove120() {
     }
 
     auto* frameSpinning = reinterpret_cast<volatile LONG*>(
-        g_executableBase + kFrameSpinningRva);
+        g_executableBase + g_layout->frameSpinningRva);
     auto* tripleBuffering = reinterpret_cast<volatile LONG*>(
-        g_executableBase + kTripleBufferingRva);
+        g_executableBase + g_layout->tripleBufferingRva);
     const LONG frameSpinningValue = *frameSpinning;
     const LONG tripleBufferingValue = *tripleBuffering;
 
@@ -5067,7 +5168,7 @@ void TryStabilizeMouseSensitivity() {
     }
 
     auto* fixMouseSensibility = reinterpret_cast<volatile LONG*>(
-        g_executableBase + kFixMouseSensibilityRva);
+        g_executableBase + g_layout->fixMouseSensibilityRva);
     const LONG value = *fixMouseSensibility;
 
     // The game initializes this cached cvar to either 0 or 1. Do not write an
@@ -5108,9 +5209,9 @@ void ApplyPrediction(void* destination, const void* source) {
         return;
     }
 
-    auto* game = *reinterpret_cast<unsigned char**>(g_executableBase + kGamePointerRva);
+    auto* game = *reinterpret_cast<unsigned char**>(g_executableBase + g_layout->gamePointerRva);
     if (game == nullptr || *reinterpret_cast<std::uintptr_t*>(game) !=
-                               g_executableBase + kGameVtableRva) {
+                               g_executableBase + g_layout->gameVtable.rva) {
         g_prediction.initialized = false;
         return;
     }
@@ -5246,19 +5347,18 @@ bool InstallShadowCasterBuildHooks() {
         Log("Shadow-transform interpolation is disabled by configuration.");
         return false;
     }
+    const std::array<HookSiteLayout, 2>& sites = g_layout->shadowCasterBuild;
     std::array<unsigned char*, 2> entries{};
     const std::array<const void*, 2> hooks = {
         reinterpret_cast<const void*>(&HookShadowCasterBuildA),
         reinterpret_cast<const void*>(&HookShadowCasterBuildB),
     };
     constexpr std::size_t kAbsoluteJumpLength = 14;
-    constexpr std::size_t kTrampolineSize =
-        kShadowCasterBuildHookLength + kAbsoluteJumpLength;
     for (std::size_t index = 0; index < entries.size(); ++index) {
+        const HookSiteLayout& site = sites[index];
         entries[index] = reinterpret_cast<unsigned char*>(
-            g_executableBase + kShadowCasterBuildRvas[index]);
-        if (memcmp(entries[index], kExpectedShadowCasterBuildBytes[index],
-                   kShadowCasterBuildHookLength) != 0) {
+            g_executableBase + site.rva);
+        if (memcmp(entries[index], site.bytes.data(), site.length) != 0) {
             Log("Shadow caster-build entry %llu bytes do not match; shadow "
                 "transforms were not installed.",
                 static_cast<unsigned long long>(index));
@@ -5278,16 +5378,16 @@ bool InstallShadowCasterBuildHooks() {
                 "transforms were not installed.");
             return false;
         }
-        memcpy(trampoline, entries[index], kShadowCasterBuildHookLength);
-        WriteAbsoluteIndirectJump(trampoline + kShadowCasterBuildHookLength,
-                                  entries[index] + kShadowCasterBuildHookLength);
+        memcpy(trampoline, entries[index], site.length);
+        WriteAbsoluteIndirectJump(trampoline + site.length,
+                                  entries[index] + site.length);
         FlushInstructionCache(GetCurrentProcess(), trampoline,
-                              kTrampolineSize);
+                              site.length + kAbsoluteJumpLength);
         g_shadowCasterBuildTrampolines[index] = trampoline;
     }
 
     const std::size_t protectedLength = static_cast<std::size_t>(
-        entries.back() - entries.front()) + kShadowCasterBuildHookLength;
+        entries.back() - entries.front()) + sites.back().length;
     DWORD oldProtection = 0;
     if (!VirtualProtect(entries.front(), protectedLength,
                         PAGE_EXECUTE_READWRITE, &oldProtection)) {
@@ -5304,10 +5404,10 @@ bool InstallShadowCasterBuildHooks() {
     g_originalShadowCasterBuildB = reinterpret_cast<ShadowCasterBuildFnB>(
         g_shadowCasterBuildTrampolines[1]);
     for (std::size_t index = 0; index < entries.size(); ++index) {
-        unsigned char patch[kShadowCasterBuildHookLength]{};
+        unsigned char patch[kMaximumHookLength]{};
         memset(patch, 0x90, sizeof(patch));
         WriteAbsoluteIndirectJump(patch, hooks[index]);
-        memcpy(entries[index], patch, sizeof(patch));
+        memcpy(entries[index], patch, sites[index].length);
     }
     FlushInstructionCache(GetCurrentProcess(), entries.front(),
                           protectedLength);
@@ -5316,8 +5416,8 @@ bool InstallShadowCasterBuildHooks() {
 
     Log("Installed coherent renderer-only shadow caster-list proxies at build "
         "RVAs 0x%llX and 0x%llX.",
-        static_cast<unsigned long long>(kShadowCasterBuildRvas[0]),
-        static_cast<unsigned long long>(kShadowCasterBuildRvas[1]));
+        static_cast<unsigned long long>(sites[0].rva),
+        static_cast<unsigned long long>(sites[1].rva));
     return true;
 }
 
@@ -5328,17 +5428,14 @@ bool InstallRenderModelGpuCopyHook() {
         return false;
     }
 
-    auto* entry = reinterpret_cast<unsigned char*>(
-        g_executableBase + kRenderModelGpuCopyRva);
-    if (memcmp(entry, kExpectedRenderModelGpuCopyBytes,
-               sizeof(kExpectedRenderModelGpuCopyBytes)) != 0) {
+    const HookSiteLayout& site = g_layout->renderModelGpuCopy;
+    auto* entry = reinterpret_cast<unsigned char*>(g_executableBase + site.rva);
+    if (memcmp(entry, site.bytes.data(), site.length) != 0) {
         Log("Renderer GPU-copy bytes do not match; renderer model features were not installed.");
         return false;
     }
 
     constexpr std::size_t kAbsoluteJumpLength = 14;
-    constexpr std::size_t kTrampolineSize =
-        kRenderModelGpuCopyHookLength + kAbsoluteJumpLength;
     auto* trampoline = static_cast<unsigned char*>(
         VirtualAlloc(nullptr, 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE));
     if (trampoline == nullptr) {
@@ -5346,18 +5443,18 @@ bool InstallRenderModelGpuCopyHook() {
             "hands stabilization was not installed.");
         return false;
     }
-    memcpy(trampoline, entry, kRenderModelGpuCopyHookLength);
-    WriteAbsoluteIndirectJump(trampoline + kRenderModelGpuCopyHookLength,
-                              entry + kRenderModelGpuCopyHookLength);
-    FlushInstructionCache(GetCurrentProcess(), trampoline, kTrampolineSize);
+    memcpy(trampoline, entry, site.length);
+    WriteAbsoluteIndirectJump(trampoline + site.length, entry + site.length);
+    FlushInstructionCache(GetCurrentProcess(), trampoline,
+                          site.length + kAbsoluteJumpLength);
 
-    unsigned char patch[kRenderModelGpuCopyHookLength]{};
+    unsigned char patch[kMaximumHookLength]{};
     memset(patch, 0x90, sizeof(patch));
     WriteAbsoluteIndirectJump(patch,
                               reinterpret_cast<const void*>(&HookRenderModelGpuCopy));
 
     DWORD oldProtection = 0;
-    if (!VirtualProtect(entry, sizeof(patch), PAGE_EXECUTE_READWRITE, &oldProtection)) {
+    if (!VirtualProtect(entry, site.length, PAGE_EXECUTE_READWRITE, &oldProtection)) {
         VirtualFree(trampoline, 0, MEM_RELEASE);
         Log("VirtualProtect failed at the renderer GPU-copy boundary; "
             "renderer model features were not installed.");
@@ -5365,14 +5462,14 @@ bool InstallRenderModelGpuCopyHook() {
     }
     g_originalRenderModelGpuCopy = reinterpret_cast<RenderModelGpuCopyFn>(trampoline);
     g_renderModelGpuCopyTrampoline = trampoline;
-    memcpy(entry, patch, sizeof(patch));
-    FlushInstructionCache(GetCurrentProcess(), entry, sizeof(patch));
+    memcpy(entry, patch, site.length);
+    FlushInstructionCache(GetCurrentProcess(), entry, site.length);
     DWORD ignored = 0;
-    VirtualProtect(entry, sizeof(patch), oldProtection, &ignored);
+    VirtualProtect(entry, site.length, oldProtection, &ignored);
 
     Log("Installed renderer model GPU-copy hook at RVA 0x%llX "
         "(first-person roots=%u, world transforms=%u, cinematic transforms=%u).",
-        static_cast<unsigned long long>(kRenderModelGpuCopyRva),
+        static_cast<unsigned long long>(g_layout->renderModelGpuCopy.rva),
         g_stabilizeFirstPersonHands ? 1U : 0U,
         g_interpolateWorldTransforms ? 1U : 0U,
         g_interpolateCinematicTransforms ? 1U : 0U);
@@ -5387,18 +5484,15 @@ bool InstallSkinnedPoseUploadHook() {
         return false;
     }
 
-    auto* entry = reinterpret_cast<unsigned char*>(
-        g_executableBase + kSkinnedPoseUploadRva);
-    if (memcmp(entry, kExpectedSkinnedPoseUploadBytes,
-               sizeof(kExpectedSkinnedPoseUploadBytes)) != 0) {
+    const HookSiteLayout& site = g_layout->skinnedPoseUpload;
+    auto* entry = reinterpret_cast<unsigned char*>(g_executableBase + site.rva);
+    if (memcmp(entry, site.bytes.data(), site.length) != 0) {
         Log("Skinned-pose upload bytes do not match; skeletal interpolation "
             "was not installed.");
         return false;
     }
 
     constexpr std::size_t kAbsoluteJumpLength = 14;
-    constexpr std::size_t kTrampolineSize =
-        kSkinnedPoseUploadHookLength + kAbsoluteJumpLength;
     auto* trampoline = static_cast<unsigned char*>(
         VirtualAlloc(nullptr, 0x1000, MEM_RESERVE | MEM_COMMIT,
                      PAGE_EXECUTE_READWRITE));
@@ -5407,18 +5501,18 @@ bool InstallSkinnedPoseUploadHook() {
             "interpolation was not installed.");
         return false;
     }
-    memcpy(trampoline, entry, kSkinnedPoseUploadHookLength);
-    WriteAbsoluteIndirectJump(trampoline + kSkinnedPoseUploadHookLength,
-                              entry + kSkinnedPoseUploadHookLength);
-    FlushInstructionCache(GetCurrentProcess(), trampoline, kTrampolineSize);
+    memcpy(trampoline, entry, site.length);
+    WriteAbsoluteIndirectJump(trampoline + site.length, entry + site.length);
+    FlushInstructionCache(GetCurrentProcess(), trampoline,
+                          site.length + kAbsoluteJumpLength);
 
-    unsigned char patch[kSkinnedPoseUploadHookLength]{};
+    unsigned char patch[kMaximumHookLength]{};
     memset(patch, 0x90, sizeof(patch));
     WriteAbsoluteIndirectJump(patch,
                               reinterpret_cast<const void*>(&HookSkinnedPoseUpload));
 
     DWORD oldProtection = 0;
-    if (!VirtualProtect(entry, sizeof(patch), PAGE_EXECUTE_READWRITE,
+    if (!VirtualProtect(entry, site.length, PAGE_EXECUTE_READWRITE,
                         &oldProtection)) {
         VirtualFree(trampoline, 0, MEM_RELEASE);
         Log("VirtualProtect failed at the skinned-pose upload boundary; skeletal "
@@ -5428,16 +5522,16 @@ bool InstallSkinnedPoseUploadHook() {
     g_originalSkinnedPoseUpload =
         reinterpret_cast<SkinnedPoseUploadFn>(trampoline);
     g_skinnedPoseUploadTrampoline = trampoline;
-    memcpy(entry, patch, sizeof(patch));
-    FlushInstructionCache(GetCurrentProcess(), entry, sizeof(patch));
+    memcpy(entry, patch, site.length);
+    FlushInstructionCache(GetCurrentProcess(), entry, site.length);
     DWORD ignored = 0;
-    VirtualProtect(entry, sizeof(patch), oldProtection, &ignored);
+    VirtualProtect(entry, site.length, oldProtection, &ignored);
 
     Log("Installed experimental skeletal hook at pose-upload RVA 0x%llX "
         "(first-person=%u, world=%u, cinematic=%u); CPU poses remain unmodified and "
         "presentation palettes are substituted only during synchronous GPU "
         "upload.",
-        static_cast<unsigned long long>(kSkinnedPoseUploadRva),
+        static_cast<unsigned long long>(g_layout->skinnedPoseUpload.rva),
         g_interpolateFirstPersonSkeletons ? 1U : 0U,
         g_interpolateWorldSkeletons ? 1U : 0U,
         g_interpolateCinematicSkeletons ? 1U : 0U);
@@ -5452,8 +5546,8 @@ bool InstallHook() {
         return false;
     }
 
-    auto* callsite = reinterpret_cast<unsigned char*>(g_executableBase + kCopyCallsiteRva);
-    g_originalCopyView = reinterpret_cast<CopyViewFn>(g_executableBase + kCopyViewRva);
+    auto* callsite = reinterpret_cast<unsigned char*>(g_executableBase + g_layout->copyCallsiteRva);
+    g_originalCopyView = reinterpret_cast<CopyViewFn>(g_executableBase + g_layout->copyViewRva);
     g_relay = AllocateRelayNear(reinterpret_cast<std::uintptr_t>(callsite));
     if (g_relay == nullptr) {
         Log("Unable to allocate a relay within rel32 range; patch not installed.");
@@ -5491,7 +5585,7 @@ bool InstallHook() {
     VirtualProtect(callsite, sizeof(patch), oldProtection, &ignored);
 
     Log("Installed Dishonored 2 high-FPS camera hook at RVA 0x%llX; F10 toggles it.",
-        static_cast<unsigned long long>(kCopyCallsiteRva));
+        static_cast<unsigned long long>(g_layout->copyCallsiteRva));
     return true;
 }
 

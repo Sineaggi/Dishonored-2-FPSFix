@@ -8,6 +8,10 @@ GOG Dishonored 2 version 1.77.9.0 for Windows x64.
 Dishonored2.exe SHA-256:
 C3150F9F2D9BF967D23CA6A79BB32703B90116854AAD9892C7FC1F46A1060293
 
+A separate layout profile covers the Steam executable (1.77.9.0, SHA-256
+B671F8249422862BF557D00AAB2F4BB671ED4515CC10AD8A8A9DECAD84516180).
+ShadowTransforms is not yet supported on Steam and is disabled there.
+
 This hash identifies the fully tested reference build; it is not a hard
 allowlist. Before writing a hook, the ASI validates the x64 PE image layout,
 section permissions, renderer-view call and deep-copy target signatures,
