@@ -103,6 +103,14 @@ struct GameBuildLayout {
     std::uintptr_t renderSystemPointerRva;
     // Debug font height (float, set at runtime) used by the drawer.
     std::uintptr_t debugFontHeightRva;
+    // Load-screen "press a key" gate: the static idCommonLocal object, its
+    // vtable, the prompt callback handle (-1 when no prompt is armed) and the
+    // flag byte whose bit 1 (value 2) lets the loading loop continue.
+    bool autoContinueSupported;
+    std::uintptr_t commonObjectRva;
+    std::uintptr_t commonVtableRva;
+    std::size_t commonLoadPromptHandleOffset;
+    std::size_t commonLoadFlagsOffset;
 };
 
 constexpr GameBuildLayout kGogLayout = {
@@ -225,6 +233,11 @@ constexpr GameBuildLayout kSteamLayout = {
      0x24, 0x10, 0x57, 0x48, 0x83, 0xEC, 0x30, 0x33},
     0x22FCD70,
     0x2BC2A9C,
+    true,
+    0x25AF110,
+    0x1AC4D88,
+    0x12D8,
+    0x19A0,
 };
 
 constexpr std::array<const GameBuildLayout*, 2> kKnownLayouts = {
@@ -361,6 +374,7 @@ bool g_enableTelemetry = false;
 bool g_enableInterpolationAbProbe = false;
 bool g_toggleSounds = true;
 bool g_overlay = false;
+bool g_autoContinueLoadScreen = false;
 void TryEnableOverlayCvar();
 bool g_sourceLevelTransforms = false;
 bool g_sourceLevelWrites = false;
@@ -944,6 +958,8 @@ void LoadConfiguration() {
         L"Diagnostics", L"ToggleSounds", 1, path) != 0;
     g_overlay = GetPrivateProfileIntW(
         L"Diagnostics", L"Overlay", 0, path) != 0;
+    g_autoContinueLoadScreen = GetPrivateProfileIntW(
+        L"Diagnostics", L"AutoContinueLoadScreen", 0, path) != 0;
     Log("Configuration: UnlockAbove120=%u, MaxFPS=%d, StabilizeMouseSensitivity=%u, "
         "StabilizeFirstPersonHands=%u, WorldTransforms=%u, "
         "CinematicTransforms=%u, ShadowTransforms=%u, "
@@ -963,10 +979,11 @@ void LoadConfiguration() {
         g_enableTelemetry ? 1U : 0U,
         g_enableInterpolationAbProbe ? 1U : 0U);
     Log("Configuration: SourceLevelTransforms=%u, SourceLevelWrites=%u, "
-        "SourceLevelHands=%u, ToggleSounds=%u, Overlay=%u.",
+        "SourceLevelHands=%u, ToggleSounds=%u, Overlay=%u, "
+        "AutoContinueLoadScreen=%u.",
         g_sourceLevelTransforms ? 1U : 0U, g_sourceLevelWrites ? 1U : 0U,
         g_sourceLevelHands ? 1U : 0U, g_toggleSounds ? 1U : 0U,
-        g_overlay ? 1U : 0U);
+        g_overlay ? 1U : 0U, g_autoContinueLoadScreen ? 1U : 0U);
     if (g_enableInterpolationAbProbe) {
         Log("A/B controls: Ctrl+F11 starts/stops a clean measurement segment; "
             "F11 toggles all configured interpolation; Alt+F11 cycles all, "
@@ -1442,6 +1459,14 @@ bool VerifyExecutableLayout() {
         Log("The diagnostics overlay is not available on the %s executable "
             "(unsupported or layout mismatch); Overlay was disabled.",
             selected->name);
+    }
+    if (g_autoContinueLoadScreen &&
+        (!selected->autoContinueSupported || !g_sourceLevelTransforms ||
+         !ValidateMutableDataRange(image, selected->commonObjectRva, 0x2000,
+                                   "idCommonLocal object"))) {
+        g_autoContinueLoadScreen = false;
+        Log("AutoContinueLoadScreen needs SourceLevelTransforms=1 on a supported "
+            "executable; it was disabled.");
     }
     if (g_sourceLevelTransforms && !selected->sourceLevelSupported) {
         g_sourceLevelTransforms = false;
@@ -7003,12 +7028,59 @@ extern "C" void __fastcall HookAssemblyMarkDirty(void* model, std::uintptr_t fla
     }
 }
 
+
+// Diagnostics/AutoContinueLoadScreen: when a level finishes loading with the
+// "press a key to continue" prompt armed, the loading loop (0x4B190) waits for
+// bit 1 of idCommonLocal+0x19A0, which the prompt's input callback (0x47D70)
+// sets. This sets the same bit, once, half a second after the prompt is armed.
+// Runs from the render-world flush hook, which keeps running on the main
+// thread while the load screen is shown.
+void TryAutoContinueLoadScreen() {
+    if (!g_autoContinueLoadScreen) {
+        return;
+    }
+    static std::uint64_t armedCounter = 0;
+    static bool continued = false;
+    auto* common = reinterpret_cast<unsigned char*>(
+        g_executableBase + g_layout->commonObjectRva);
+    std::uintptr_t vtable = 0;
+    memcpy(&vtable, common, sizeof(vtable));
+    if (vtable != g_executableBase + g_layout->commonVtableRva) {
+        return;
+    }
+    std::int32_t promptHandle = 0;
+    memcpy(&promptHandle, common + g_layout->commonLoadPromptHandleOffset,
+           sizeof(promptHandle));
+    if (promptHandle == -1) {
+        armedCounter = 0;
+        continued = false;
+        return;
+    }
+    const std::uint64_t now = ReadPerformanceCounter();
+    if (armedCounter == 0) {
+        armedCounter = now;
+        return;
+    }
+    LARGE_INTEGER frequency{};
+    QueryPerformanceFrequency(&frequency);
+    if (continued || now - armedCounter <
+                         static_cast<std::uint64_t>(frequency.QuadPart / 2)) {
+        return;
+    }
+    continued = true;
+    InterlockedOr8(reinterpret_cast<volatile char*>(
+                       common + g_layout->commonLoadFlagsOffset), 2);
+    Log("AutoContinueLoadScreen: the load-screen prompt was armed; continued "
+        "without a key press.");
+}
+
 extern "C" void __fastcall HookRenderWorldFlush(void* world, std::uintptr_t argument) {
     if (g_sourceFlushInProgress.exchange(true, std::memory_order_acq_rel)) {
         // Nested or concurrent flush: the track table is single-threaded.
         g_originalRenderWorldFlush(world, argument);
         return;
     }
+    TryAutoContinueLoadScreen();
     const std::uint64_t start = ReadPerformanceCounter();
     g_sourceFlushThreadId.store(GetCurrentThreadId(), std::memory_order_relaxed);
     PresentationContext context{};
