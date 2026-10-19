@@ -146,7 +146,7 @@ constexpr GameBuildLayout kSteamLayout = {
     "Steam 1.77.9.0",
     {
         0xB6, 0x71, 0xF8, 0x24, 0x94, 0x22, 0x86, 0x2B,
-        0xF5, 0x57, 0xF7, 0x0A, 0xAD, 0x08, 0xD0, 0xB6,
+        0xF5, 0x57, 0xD0, 0x0A, 0xAB, 0x2F, 0x4B, 0xB6,
         0x71, 0xED, 0x45, 0x15, 0xCC, 0x10, 0xAD, 0x8A,
         0x8A, 0x9D, 0xEC, 0xAD, 0x84, 0x51, 0x61, 0x80,
     },
@@ -5870,9 +5870,17 @@ SourceLevelDiagnosticsSnapshot g_sourceLastLogSnapshot{};
 bool g_sourceHasLogSnapshot = false;
 
 SRWLOCK g_sourceDirtyLock = SRWLOCK_INIT;
-std::vector<void*> g_sourceDirty;
+// Each entry records the world the model belonged to at MarkDirty time, while
+// the model was certainly alive, so the flush never reads a model that may
+// have been deleted since.
+struct SourceDirtyEntry {
+    void* model;
+    void* world;
+};
+std::vector<SourceDirtyEntry> g_sourceDirty;
+std::vector<SourceDirtyEntry> g_sourceDirtyPending;
+std::vector<SourceDirtyEntry> g_sourceDirtyDeferred;
 std::vector<void*> g_sourceDirtyScratch;
-std::vector<void*> g_sourceDirtyDeferred;
 bool g_sourceDirtyOverflowed = false;
 
 struct SourceTrack {
@@ -6040,34 +6048,31 @@ void RestoreAndDropSourceTrack(SourceTrack& track, bool registered) {
 }
 
 void CollectSourceDirtyModels(void* world, std::vector<void*>& output, bool& overflowed) {
+    g_sourceDirtyPending.clear();
     AcquireSRWLockExclusive(&g_sourceDirtyLock);
-    output.swap(g_sourceDirty);
+    g_sourceDirtyPending.swap(g_sourceDirty);
     overflowed = g_sourceDirtyOverflowed;
     g_sourceDirtyOverflowed = false;
     ReleaseSRWLockExclusive(&g_sourceDirtyLock);
 
-    std::sort(output.begin(), output.end());
-    output.erase(std::unique(output.begin(), output.end()), output.end());
     // Models of another world wait for that world's flush.
     g_sourceDirtyDeferred.clear();
-    std::size_t kept = 0;
-    for (void* model : output) {
-        void* modelWorld = nullptr;
-        memcpy(&modelWorld, static_cast<unsigned char*>(model) + kRenderModelWorldOffset,
-               sizeof(modelWorld));
-        if (modelWorld == world) {
-            output[kept++] = model;
-        } else if (modelWorld != nullptr) {
-            g_sourceDirtyDeferred.push_back(model);
+    output.clear();
+    for (const SourceDirtyEntry& entry : g_sourceDirtyPending) {
+        if (entry.world == world) {
+            output.push_back(entry.model);
+        } else if (entry.world != nullptr) {
+            g_sourceDirtyDeferred.push_back(entry);
         }
     }
-    output.resize(kept);
+    std::sort(output.begin(), output.end());
+    output.erase(std::unique(output.begin(), output.end()), output.end());
     g_sourceCounters.foreignWorldDirty += g_sourceDirtyDeferred.size();
     if (!g_sourceDirtyDeferred.empty()) {
         AcquireSRWLockExclusive(&g_sourceDirtyLock);
-        for (void* model : g_sourceDirtyDeferred) {
+        for (const SourceDirtyEntry& entry : g_sourceDirtyDeferred) {
             if (g_sourceDirty.size() < kSourceDirtyCapacity) {
-                g_sourceDirty.push_back(model);
+                g_sourceDirty.push_back(entry);
             }
         }
         ReleaseSRWLockExclusive(&g_sourceDirtyLock);
@@ -6606,8 +6611,11 @@ extern "C" void __fastcall HookRenderModelMarkDirty(void* model, std::uintptr_t 
             1, std::memory_order_relaxed);
     }
     AcquireSRWLockExclusive(&g_sourceDirtyLock);
+    void* world = nullptr;
+    memcpy(&world, static_cast<unsigned char*>(model) + kRenderModelWorldOffset,
+           sizeof(world));
     if (g_sourceDirty.size() < kSourceDirtyCapacity) {
-        g_sourceDirty.push_back(model);
+        g_sourceDirty.push_back({model, world});
     } else if (!g_sourceDirtyOverflowed) {
         g_sourceDirtyOverflowed = true;
         g_sourceDiagnostics.dirtyOverflows.fetch_add(1, std::memory_order_relaxed);
@@ -6728,6 +6736,7 @@ bool InstallSourceLevelHooks() {
     g_sourceDirty.reserve(kSourceDirtyCapacity);
     g_sourceDirtyScratch.reserve(kSourceDirtyCapacity);
     g_sourceDirtyDeferred.reserve(kSourceDirtyCapacity);
+    g_sourceDirtyPending.reserve(kSourceDirtyCapacity);
     g_originalRenderWorldFlush = reinterpret_cast<RenderWorldFlushFn>(flushTarget);
     g_originalRenderModelMarkDirty =
         reinterpret_cast<RenderModelMarkDirtyFn>(markDirtyTarget);
