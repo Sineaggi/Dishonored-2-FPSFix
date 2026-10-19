@@ -375,6 +375,10 @@ bool g_enableInterpolationAbProbe = false;
 bool g_toggleSounds = true;
 bool g_overlay = false;
 bool g_autoContinueLoadScreen = false;
+bool g_autoAbSchedule = false;
+int g_autoAbSegmentSeconds = 20;
+int g_autoAbRounds = 2;
+bool g_autoAbQuitWhenDone = false;
 void TryEnableOverlayCvar();
 bool g_sourceLevelTransforms = false;
 bool g_sourceLevelWrites = false;
@@ -960,6 +964,19 @@ void LoadConfiguration() {
         L"Diagnostics", L"Overlay", 0, path) != 0;
     g_autoContinueLoadScreen = GetPrivateProfileIntW(
         L"Diagnostics", L"AutoContinueLoadScreen", 0, path) != 0;
+    g_autoAbSchedule = GetPrivateProfileIntW(
+        L"Diagnostics", L"AutoABSchedule", 0, path) != 0;
+    g_autoAbSegmentSeconds = std::max(5, std::min(120, static_cast<int>(
+        GetPrivateProfileIntW(L"Diagnostics", L"AutoABSegmentSeconds", 20, path))));
+    g_autoAbRounds = std::max(1, std::min(10, static_cast<int>(
+        GetPrivateProfileIntW(L"Diagnostics", L"AutoABRounds", 2, path))));
+    g_autoAbQuitWhenDone = GetPrivateProfileIntW(
+        L"Diagnostics", L"AutoABQuitWhenDone", 0, path) != 0;
+    if (g_autoAbSchedule) {
+        Log("Configuration: AutoABSchedule=1, AutoABSegmentSeconds=%d, "
+            "AutoABRounds=%d, AutoABQuitWhenDone=%u.", g_autoAbSegmentSeconds,
+            g_autoAbRounds, g_autoAbQuitWhenDone ? 1U : 0U);
+    }
     Log("Configuration: UnlockAbove120=%u, MaxFPS=%d, StabilizeMouseSensitivity=%u, "
         "StabilizeFirstPersonHands=%u, WorldTransforms=%u, "
         "CinematicTransforms=%u, ShadowTransforms=%u, "
@@ -6047,6 +6064,223 @@ void ApplyPrediction(void* destination, const void* source) {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// Automated A/B schedule (Diagnostics/AutoABSchedule). Once gameplay has been
+// ticking for a warm-up period it cycles through fixed interpolation profiles,
+// records one probe segment per profile and round (interleaved so drift
+// cancels), logs a summary table, and can close the game window. It only
+// flips the same runtime switches the F11 hotkeys use; no input is simulated.
+// ---------------------------------------------------------------------------
+
+struct AutoAbProfile {
+    const char* name;
+    bool transforms;
+    bool skeletons;
+    bool source;
+};
+
+constexpr std::array<AutoAbProfile, 6> kAutoAbProfiles = {{
+    {"off", false, false, true},
+    {"transforms source", true, false, true},
+    {"transforms per-draw", true, false, false},
+    {"skeletons only", false, true, true},
+    {"all source", true, true, true},
+    {"all per-draw", true, true, false},
+}};
+constexpr double kAutoAbGameplayWarmupSeconds = 10.0;
+constexpr double kAutoAbSettleSeconds = 1.0;
+
+struct AutoAbResult {
+    std::size_t profile = 0;
+    int round = 0;
+    double fps = 0.0;
+    double p50 = 0.0;
+    double p95 = 0.0;
+    double p99 = 0.0;
+    double modelMs = 0.0;
+    double poseMs = 0.0;
+    double flushMs = 0.0;
+    double writesPerFrame = 0.0;
+    std::uint64_t frames = 0;
+};
+
+enum class AutoAbPhase { WaitingForGameplay, Settling, Recording, Done };
+
+struct AutoAbState {
+    AutoAbPhase phase = AutoAbPhase::WaitingForGameplay;
+    std::uint64_t phaseStart = 0;
+    std::uint64_t gameplayStart = 0;
+    double lastSimulationTime = 0.0;
+    std::size_t step = 0;
+    std::vector<AutoAbResult> results;
+};
+
+AutoAbState g_autoAb;
+
+double AutoAbSeconds(std::uint64_t from, std::uint64_t to) {
+    LARGE_INTEGER frequency{};
+    QueryPerformanceFrequency(&frequency);
+    return static_cast<double>(to - from) / static_cast<double>(frequency.QuadPart);
+}
+
+void ApplyAutoAbProfile(const AutoAbProfile& profile) {
+    g_transformInterpolationRuntimeEnabled.store(profile.transforms,
+                                                 std::memory_order_relaxed);
+    g_skeletalInterpolationRuntimeEnabled.store(profile.skeletons,
+                                                std::memory_order_relaxed);
+    if (g_sourceLevelInstalled && g_sourceLevelWrites) {
+        g_sourceLevelRuntimeEnabled.store(profile.source, std::memory_order_relaxed);
+    }
+}
+
+AutoAbResult CaptureAutoAbResult(std::size_t profile, int round) {
+    AutoAbResult result{};
+    result.profile = profile;
+    result.round = round;
+    const InterpolationAbProbeState& probe = g_interpolationAbProbe;
+    result.frames = probe.sampledFrames;
+    if (probe.sampledFrames == 0 || !(probe.sampledSeconds > 0.0)) {
+        return result;
+    }
+    const double frames = static_cast<double>(probe.sampledFrames);
+    result.fps = frames / probe.sampledSeconds;
+    result.p50 = InterpolationAbPercentile(0.50);
+    result.p95 = InterpolationAbPercentile(0.95);
+    result.p99 = InterpolationAbPercentile(0.99);
+    const InterpolationAbCounterSnapshot now = CaptureInterpolationAbCounters();
+    const InterpolationAbCounterSnapshot& start = probe.countersAtStart;
+    const double ticksPerMs = static_cast<double>(probe.frequency.QuadPart) / 1000.0;
+    const auto plugin = [&](std::uint64_t total, std::uint64_t totalStart,
+                            std::uint64_t engine, std::uint64_t engineStart) {
+        const double value = static_cast<double>(CounterDelta(total, totalStart)) -
+                             static_cast<double>(CounterDelta(engine, engineStart));
+        return std::max(0.0, value) / ticksPerMs / frames;
+    };
+    result.modelMs = plugin(now.renderModelHookTicks, start.renderModelHookTicks,
+                            now.renderModelOriginalTicks, start.renderModelOriginalTicks);
+    result.poseMs = plugin(now.skeletalHookTicks, start.skeletalHookTicks,
+                           now.skeletalOriginalTicks, start.skeletalOriginalTicks);
+    result.flushMs = plugin(now.sourceFlushTicks, start.sourceFlushTicks,
+                            now.sourceFlushOriginalTicks, start.sourceFlushOriginalTicks);
+    result.writesPerFrame =
+        static_cast<double>(CounterDelta(now.sourceWrites, start.sourceWrites)) / frames;
+    return result;
+}
+
+BOOL CALLBACK AutoAbCloseWindow(HWND window, LPARAM) {
+    DWORD processId = 0;
+    GetWindowThreadProcessId(window, &processId);
+    if (processId == GetCurrentProcessId() && IsWindowVisible(window) &&
+        GetWindow(window, GW_OWNER) == nullptr) {
+        PostMessageW(window, WM_CLOSE, 0, 0);
+    }
+    return TRUE;
+}
+
+void LogAutoAbSummary() {
+    Log("Auto A/B summary (%d rounds x %zu profiles, %d s segments; plugin ms are "
+        "per frame across all threads):", g_autoAbRounds, kAutoAbProfiles.size(),
+        g_autoAbSegmentSeconds);
+    Log("  %-20s round  frames     FPS   p50ms  p95ms  p99ms  model   pose  flush  "
+        "writes/f", "profile");
+    for (const AutoAbResult& r : g_autoAb.results) {
+        Log("  %-20s %5d %7llu %7.1f %7.3f %6.3f %6.3f %6.3f %6.3f %6.3f %8.1f",
+            kAutoAbProfiles[r.profile].name, r.round,
+            static_cast<unsigned long long>(r.frames), r.fps, r.p50, r.p95, r.p99,
+            r.modelMs, r.poseMs, r.flushMs, r.writesPerFrame);
+    }
+    for (std::size_t profile = 0; profile < kAutoAbProfiles.size(); ++profile) {
+        double fps = 0.0, p99 = 0.0, model = 0.0, pose = 0.0, flush = 0.0;
+        int count = 0;
+        for (const AutoAbResult& r : g_autoAb.results) {
+            if (r.profile == profile && r.frames != 0) {
+                fps += r.fps; p99 += r.p99; model += r.modelMs; pose += r.poseMs;
+                flush += r.flushMs; ++count;
+            }
+        }
+        if (count != 0) {
+            Log("  mean %-15s FPS %7.1f  p99 %6.3f ms  plugin model %.3f pose %.3f "
+                "flush %.3f ms", kAutoAbProfiles[profile].name, fps / count,
+                p99 / count, model / count, pose / count, flush / count);
+        }
+    }
+}
+
+void UpdateAutoAbSchedule(const PresentationContext& context) {
+    if (!g_autoAbSchedule || !g_enableInterpolationAbProbe ||
+        g_autoAb.phase == AutoAbPhase::Done || !context.valid) {
+        return;
+    }
+    const std::uint64_t now = ReadPerformanceCounter();
+    const std::size_t totalSteps =
+        kAutoAbProfiles.size() * static_cast<std::size_t>(g_autoAbRounds);
+    switch (g_autoAb.phase) {
+        case AutoAbPhase::WaitingForGameplay: {
+            const bool ticking = context.simulationTime > g_autoAb.lastSimulationTime;
+            g_autoAb.lastSimulationTime = context.simulationTime;
+            if (!ticking) {
+                return;
+            }
+            if (g_autoAb.gameplayStart == 0) {
+                g_autoAb.gameplayStart = now;
+                Log("Auto A/B: gameplay detected; starting in %.0f s.",
+                    kAutoAbGameplayWarmupSeconds);
+                return;
+            }
+            if (AutoAbSeconds(g_autoAb.gameplayStart, now) < kAutoAbGameplayWarmupSeconds) {
+                return;
+            }
+            if (g_interpolationAbProbe.capturing) {
+                StopInterpolationAbSegment("Auto A/B takeover");
+            }
+            g_autoAb.step = 0;
+            ApplyAutoAbProfile(kAutoAbProfiles[0]);
+            g_autoAb.phase = AutoAbPhase::Settling;
+            g_autoAb.phaseStart = now;
+            return;
+        }
+        case AutoAbPhase::Settling:
+            if (AutoAbSeconds(g_autoAb.phaseStart, now) < kAutoAbSettleSeconds) {
+                return;
+            }
+            Log("Auto A/B step %zu/%zu: %s (round %zu).", g_autoAb.step + 1, totalSteps,
+                kAutoAbProfiles[g_autoAb.step % kAutoAbProfiles.size()].name,
+                g_autoAb.step / kAutoAbProfiles.size() + 1);
+            StartInterpolationAbSegment();
+            g_autoAb.phase = AutoAbPhase::Recording;
+            g_autoAb.phaseStart = now;
+            return;
+        case AutoAbPhase::Recording: {
+            if (AutoAbSeconds(g_autoAb.phaseStart, now) <
+                kAbProbeWarmupSeconds + static_cast<double>(g_autoAbSegmentSeconds)) {
+                return;
+            }
+            const std::size_t profile = g_autoAb.step % kAutoAbProfiles.size();
+            g_autoAb.results.push_back(CaptureAutoAbResult(
+                profile, static_cast<int>(g_autoAb.step / kAutoAbProfiles.size()) + 1));
+            StopInterpolationAbSegment("Auto A/B step complete");
+            ++g_autoAb.step;
+            if (g_autoAb.step >= totalSteps) {
+                ApplyAutoAbProfile(kAutoAbProfiles[4]);
+                g_autoAb.phase = AutoAbPhase::Done;
+                LogAutoAbSummary();
+                if (g_autoAbQuitWhenDone) {
+                    Log("Auto A/B: done; closing the game window.");
+                    EnumWindows(AutoAbCloseWindow, 0);
+                }
+                return;
+            }
+            ApplyAutoAbProfile(kAutoAbProfiles[g_autoAb.step % kAutoAbProfiles.size()]);
+            g_autoAb.phase = AutoAbPhase::Settling;
+            g_autoAb.phaseStart = now;
+            return;
+        }
+        case AutoAbPhase::Done:
+            return;
+    }
+}
+
 extern "C" void* __fastcall HookCopyView(void* destination, const void* source) {
     void* result = g_originalCopyView(destination, source);
     const Transform rawCamera = ReadTransform(destination);
@@ -6057,6 +6291,7 @@ extern "C" void* __fastcall HookCopyView(void* destination, const void* source) 
     if (ReadPresentationContext(probeContext)) {
         UpdateAdaptiveInterpolationGate(probeContext);
         RecordInterpolationAbFrame(probeContext);
+        UpdateAutoAbSchedule(probeContext);
     }
     PublishTelemetry(source, destination);
     return result;
