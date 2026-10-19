@@ -385,6 +385,9 @@ bool g_sourceLevelWrites = false;
 bool g_sourceLevelHands = false;
 bool g_renderModelGpuCopyHookSkipped = false;
 bool g_sourceLevelInstalled = false;
+// AutoContinueLoadScreen without SourceLevelTransforms: only the render-world
+// flush slot is hooked, and the hook does nothing but the load-screen check.
+bool g_flushHookOnly = false;
 std::atomic<bool> g_sourceLevelRuntimeEnabled{true};
 std::atomic<std::uint64_t> g_abSourceFlushTicks{0};
 std::atomic<std::uint64_t> g_abSourceFlushOriginalTicks{0};
@@ -964,6 +967,10 @@ void LoadConfiguration() {
         L"Diagnostics", L"Overlay", 0, path) != 0;
     g_autoContinueLoadScreen = GetPrivateProfileIntW(
         L"Diagnostics", L"AutoContinueLoadScreen", 0, path) != 0;
+    if (g_autoContinueLoadScreen && !g_sourceLevelTransforms) {
+        g_sourceLevelTransforms = true;
+        g_flushHookOnly = true;
+    }
     g_autoAbSchedule = GetPrivateProfileIntW(
         L"Diagnostics", L"AutoABSchedule", 0, path) != 0;
     g_autoAbSegmentSeconds = std::max(5, std::min(120, static_cast<int>(
@@ -1482,8 +1489,8 @@ bool VerifyExecutableLayout() {
          !ValidateMutableDataRange(image, selected->commonObjectRva, 0x2000,
                                    "idCommonLocal object"))) {
         g_autoContinueLoadScreen = false;
-        Log("AutoContinueLoadScreen needs SourceLevelTransforms=1 on a supported "
-            "executable; it was disabled.");
+        Log("AutoContinueLoadScreen is not supported on this executable; it was "
+            "disabled.");
     }
     if (g_sourceLevelTransforms && !selected->sourceLevelSupported) {
         g_sourceLevelTransforms = false;
@@ -6078,16 +6085,23 @@ struct AutoAbProfile {
     bool transforms;
     bool skeletons;
     bool source;
+    bool camera;
+    bool hands;
 };
 
-constexpr std::array<AutoAbProfile, 6> kAutoAbProfiles = {{
-    {"off", false, false, true},
-    {"transforms source", true, false, true},
-    {"transforms per-draw", true, false, false},
-    {"skeletons only", false, true, true},
-    {"all source", true, true, true},
-    {"all per-draw", true, true, false},
+// "unlock only" also turns off camera prediction (F10) and the first-person
+// root correction (Shift+F11), leaving the FPS unlock and measurement.
+constexpr std::array<AutoAbProfile, 7> kAutoAbProfiles = {{
+    {"off", false, false, true, true, true},
+    {"transforms source", true, false, true, true, true},
+    {"transforms per-draw", true, false, false, true, true},
+    {"skeletons only", false, true, true, true, true},
+    {"all source", true, true, true, true, true},
+    {"all per-draw", true, true, false, true, true},
+    {"unlock only", false, false, true, false, false},
 }};
+constexpr std::size_t kAutoAbDefaultProfileCount = 6;
+std::vector<std::size_t> g_autoAbProfileOrder;
 constexpr double kAutoAbGameplayWarmupSeconds = 10.0;
 constexpr double kAutoAbSettleSeconds = 1.0;
 
@@ -6125,6 +6139,11 @@ double AutoAbSeconds(std::uint64_t from, std::uint64_t to) {
 }
 
 void ApplyAutoAbProfile(const AutoAbProfile& profile) {
+    g_enabled.store(profile.camera, std::memory_order_relaxed);
+    if (!profile.camera) {
+        g_prediction.initialized = false;
+    }
+    g_firstPersonHandsRuntimeEnabled.store(profile.hands, std::memory_order_relaxed);
     g_transformInterpolationRuntimeEnabled.store(profile.transforms,
                                                  std::memory_order_relaxed);
     g_skeletalInterpolationRuntimeEnabled.store(profile.skeletons,
@@ -6180,7 +6199,7 @@ BOOL CALLBACK AutoAbCloseWindow(HWND window, LPARAM) {
 
 void LogAutoAbSummary() {
     Log("Auto A/B summary (%d rounds x %zu profiles, %d s segments; plugin ms are "
-        "per frame across all threads):", g_autoAbRounds, kAutoAbProfiles.size(),
+        "per frame across all threads):", g_autoAbRounds, g_autoAbProfileOrder.size(),
         g_autoAbSegmentSeconds);
     Log("  %-20s round  frames     FPS   p50ms  p95ms  p99ms  model   pose  flush  "
         "writes/f", "profile");
@@ -6190,7 +6209,7 @@ void LogAutoAbSummary() {
             static_cast<unsigned long long>(r.frames), r.fps, r.p50, r.p95, r.p99,
             r.modelMs, r.poseMs, r.flushMs, r.writesPerFrame);
     }
-    for (std::size_t profile = 0; profile < kAutoAbProfiles.size(); ++profile) {
+    for (std::size_t profile : g_autoAbProfileOrder) {
         double fps = 0.0, p99 = 0.0, model = 0.0, pose = 0.0, flush = 0.0;
         int count = 0;
         for (const AutoAbResult& r : g_autoAb.results) {
@@ -6207,14 +6226,59 @@ void LogAutoAbSummary() {
     }
 }
 
+void BuildAutoAbProfileOrder() {
+    wchar_t path[MAX_PATH]{};
+    BuildSiblingPath(path, MAX_PATH, L"d2-high-fps-fix.ini");
+    wchar_t list[512]{};
+    GetPrivateProfileStringW(L"Diagnostics", L"AutoABProfiles", L"", list, 512, path);
+    char narrow[512]{};
+    WideCharToMultiByte(CP_UTF8, 0, list, -1, narrow, sizeof(narrow), nullptr, nullptr);
+    char* context = nullptr;
+    for (char* token = strtok_s(narrow, ",", &context); token != nullptr;
+         token = strtok_s(nullptr, ",", &context)) {
+        while (*token == ' ') {
+            ++token;
+        }
+        std::size_t length = strlen(token);
+        while (length != 0 && token[length - 1] == ' ') {
+            token[--length] = '\0';
+        }
+        bool found = false;
+        for (std::size_t index = 0; index < kAutoAbProfiles.size(); ++index) {
+            if (_stricmp(token, kAutoAbProfiles[index].name) == 0) {
+                g_autoAbProfileOrder.push_back(index);
+                found = true;
+                break;
+            }
+        }
+        if (!found && length != 0) {
+            Log("Auto A/B: unknown profile '%s' in AutoABProfiles was ignored.", token);
+        }
+    }
+    if (g_autoAbProfileOrder.empty()) {
+        for (std::size_t index = 0; index < kAutoAbDefaultProfileCount; ++index) {
+            g_autoAbProfileOrder.push_back(index);
+        }
+    }
+    char names[512]{};
+    for (std::size_t index : g_autoAbProfileOrder) {
+        strcat_s(names, kAutoAbProfiles[index].name);
+        strcat_s(names, "; ");
+    }
+    Log("Auto A/B profiles per round: %s", names);
+}
+
 void UpdateAutoAbSchedule(const PresentationContext& context) {
     if (!g_autoAbSchedule || !g_enableInterpolationAbProbe ||
         g_autoAb.phase == AutoAbPhase::Done || !context.valid) {
         return;
     }
+    if (g_autoAbProfileOrder.empty()) {
+        BuildAutoAbProfileOrder();
+    }
     const std::uint64_t now = ReadPerformanceCounter();
     const std::size_t totalSteps =
-        kAutoAbProfiles.size() * static_cast<std::size_t>(g_autoAbRounds);
+        g_autoAbProfileOrder.size() * static_cast<std::size_t>(g_autoAbRounds);
     switch (g_autoAb.phase) {
         case AutoAbPhase::WaitingForGameplay: {
             const bool ticking = context.simulationTime > g_autoAb.lastSimulationTime;
@@ -6235,7 +6299,7 @@ void UpdateAutoAbSchedule(const PresentationContext& context) {
                 StopInterpolationAbSegment("Auto A/B takeover");
             }
             g_autoAb.step = 0;
-            ApplyAutoAbProfile(kAutoAbProfiles[0]);
+            ApplyAutoAbProfile(kAutoAbProfiles[g_autoAbProfileOrder[0]]);
             g_autoAb.phase = AutoAbPhase::Settling;
             g_autoAb.phaseStart = now;
             return;
@@ -6245,8 +6309,9 @@ void UpdateAutoAbSchedule(const PresentationContext& context) {
                 return;
             }
             Log("Auto A/B step %zu/%zu: %s (round %zu).", g_autoAb.step + 1, totalSteps,
-                kAutoAbProfiles[g_autoAb.step % kAutoAbProfiles.size()].name,
-                g_autoAb.step / kAutoAbProfiles.size() + 1);
+                kAutoAbProfiles[g_autoAbProfileOrder[g_autoAb.step %
+                                                     g_autoAbProfileOrder.size()]].name,
+                g_autoAb.step / g_autoAbProfileOrder.size() + 1);
             StartInterpolationAbSegment();
             g_autoAb.phase = AutoAbPhase::Recording;
             g_autoAb.phaseStart = now;
@@ -6256,13 +6321,14 @@ void UpdateAutoAbSchedule(const PresentationContext& context) {
                 kAbProbeWarmupSeconds + static_cast<double>(g_autoAbSegmentSeconds)) {
                 return;
             }
-            const std::size_t profile = g_autoAb.step % kAutoAbProfiles.size();
+            const std::size_t profile =
+                g_autoAbProfileOrder[g_autoAb.step % g_autoAbProfileOrder.size()];
             g_autoAb.results.push_back(CaptureAutoAbResult(
-                profile, static_cast<int>(g_autoAb.step / kAutoAbProfiles.size()) + 1));
+                profile, static_cast<int>(g_autoAb.step / g_autoAbProfileOrder.size()) + 1));
             StopInterpolationAbSegment("Auto A/B step complete");
             ++g_autoAb.step;
             if (g_autoAb.step >= totalSteps) {
-                ApplyAutoAbProfile(kAutoAbProfiles[4]);
+                ApplyAutoAbProfile(kAutoAbProfiles[4]);  // everything back on
                 g_autoAb.phase = AutoAbPhase::Done;
                 LogAutoAbSummary();
                 if (g_autoAbQuitWhenDone) {
@@ -6271,7 +6337,8 @@ void UpdateAutoAbSchedule(const PresentationContext& context) {
                 }
                 return;
             }
-            ApplyAutoAbProfile(kAutoAbProfiles[g_autoAb.step % kAutoAbProfiles.size()]);
+            ApplyAutoAbProfile(kAutoAbProfiles[
+                g_autoAbProfileOrder[g_autoAb.step % g_autoAbProfileOrder.size()]]);
             g_autoAb.phase = AutoAbPhase::Settling;
             g_autoAb.phaseStart = now;
             return;
@@ -7316,6 +7383,11 @@ extern "C" void __fastcall HookRenderWorldFlush(void* world, std::uintptr_t argu
         return;
     }
     TryAutoContinueLoadScreen();
+    if (g_flushHookOnly) {
+        g_originalRenderWorldFlush(world, argument);
+        g_sourceFlushInProgress.store(false, std::memory_order_release);
+        return;
+    }
     const std::uint64_t start = ReadPerformanceCounter();
     g_sourceFlushThreadId.store(GetCurrentThreadId(), std::memory_order_relaxed);
     PresentationContext context{};
@@ -7407,6 +7479,19 @@ bool InstallSourceLevelHooks() {
         return false;
     }
 
+    if (g_flushHookOnly) {
+        g_originalRenderWorldFlush = reinterpret_cast<RenderWorldFlushFn>(flushTarget);
+        if (!ReplaceVtableSlot(flushSlot, flushTarget,
+                               reinterpret_cast<const void*>(&HookRenderWorldFlush))) {
+            g_autoContinueLoadScreen = false;
+            Log("Unable to replace the render-world flush vtable slot; "
+                "AutoContinueLoadScreen was not installed.");
+            return false;
+        }
+        Log("Installed the render-world flush hook for AutoContinueLoadScreen only "
+            "(source-level transforms are off).");
+        return true;
+    }
     g_sourceDirty.reserve(kSourceDirtyCapacity);
     g_sourceDirtyScratch.reserve(kSourceDirtyCapacity);
     g_sourceDirtyDeferred.reserve(kSourceDirtyCapacity);
