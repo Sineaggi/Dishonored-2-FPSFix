@@ -82,6 +82,36 @@ if errorlevel 1 (
   exit /b 1
 )
 
+if not exist "build\layout-profile-test" mkdir "build\layout-profile-test"
+cl.exe /nologo /std:c++17 /O2 /EHsc /W4 /DUNICODE /D_UNICODE ^
+  /Fo:"build\layout-profile-test.obj" ^
+  "layout-profile-test.cpp" ^
+  /link /OUT:"build\layout-profile-test\layout-profile-test.exe" bcrypt.lib user32.lib
+
+if errorlevel 1 (
+  echo.
+  echo Layout-profile test build failed.
+  exit /b 1
+)
+
+rem Optional: validate the real executables when their local paths are set.
+if defined D2_GOG_EXE (
+  "build\layout-profile-test\layout-profile-test.exe" "%D2_GOG_EXE%" "GOG 1.77.9.0"
+  if errorlevel 1 (
+    echo.
+    echo GOG layout-profile test failed.
+    exit /b 1
+  )
+)
+if defined D2_STEAM_EXE (
+  "build\layout-profile-test\layout-profile-test.exe" "%D2_STEAM_EXE%" "Steam 1.77.9.0"
+  if errorlevel 1 (
+    echo.
+    echo Steam layout-profile test failed.
+    exit /b 1
+  )
+)
+
 "build\asi-load-test.exe" "build\Dishonored2HighFPSFix.asi"
 if errorlevel 1 (
   echo.
@@ -101,4 +131,5 @@ echo Built and load-tested: %CD%\build\Dishonored2HighFPSFix.asi
 echo Built: %CD%\build\asi-load-test.exe
 echo Built: %CD%\build\asi-loader-test.exe
 echo Built and passed: %CD%\build\joint-pose-test.exe
+echo Built: %CD%\build\layout-profile-test\layout-profile-test.exe
 endlocal

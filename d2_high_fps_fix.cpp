@@ -22,21 +22,40 @@
 
 namespace {
 
-constexpr std::uintptr_t kGamePointerRva = 0x288D608;
-constexpr std::uintptr_t kGameVtableRva = 0x1F02138;
-constexpr std::array<std::uintptr_t, 4> kExpectedGameVtableTargets = {
-    0xA2F190, 0xA3EF00, 0xA3EEF0, 0xA38740,
-};
 constexpr std::uintptr_t kClockOffset = 0x2E7428;
 constexpr std::uintptr_t kScaledTimeOffset = 0x68;
 constexpr std::uintptr_t kSimulationTimeOffset = 0xB8;
-constexpr std::uintptr_t kFrameSpinningRva = 0x288E958;
-constexpr std::uintptr_t kTripleBufferingRva = 0x359E228;
-constexpr std::uintptr_t kFixMouseSensibilityRva = 0x3BF2FA8;
 
-constexpr std::uintptr_t kCopyViewRva = 0x64A90;
-constexpr std::uintptr_t kCopyCallsiteRva = 0xA395A6;
-constexpr unsigned char kExpectedCallBytes[5] = {0xE8, 0xE5, 0xB4, 0x62, 0xFF};
+// arkGameLogicManager is embedded in idGameLocal. It owns one state object per
+// arkGameLogicStateIds_t value and an idList stack of active state ids.
+constexpr std::uintptr_t kGameLogicManagerOffset = 0x1F6EC8;
+constexpr std::size_t kGameLogicOwnerOffset = 0x08;
+constexpr std::size_t kGameLogicStatesOffset = 0x18;
+constexpr std::size_t kGameLogicStackDataOffset = 0x528;
+constexpr std::size_t kGameLogicStackCountOffset = 0x530;
+constexpr std::uint32_t kGameLogicStackLimit = 32;
+constexpr std::int32_t kGameLogicStateCinematic = 5;
+constexpr std::int32_t kGameLogicStateCount = 17;
+
+// The clock is an array of 0x50-byte timers (0 real, 1 scaled, 2 simulation)
+// whose delta is at +0x28; idGameLocal vtable slot 28 returns timer[index].
+// With g_fixMouseSensibility=1 the mouse-look scaler divides the look input by
+// timer 0's delta, the real frame time, while the view later turns by that
+// rate times the simulation delta. Reading timer 2 instead makes the two cancel
+// on every game frame, whatever the frame rate or tick count.
+constexpr std::size_t kGameClockDeltaVtableSlot = 28;
+constexpr std::uintptr_t kSimulationTimerDeltaOffset = 0xC8;
+constexpr unsigned char kExpectedMouseLookDeltaSite[21] = {
+    0x49, 0x8D, 0x53, 0x08,              // lea rdx,[r11+8]
+    0x45, 0x33, 0xC0,                    // xor r8d,r8d       ; timer 0
+    0x48, 0x8B, 0x01,                    // mov rax,[rcx]
+    0xFF, 0x90, 0xE0, 0x00, 0x00, 0x00,  // call [rax+0xE0]   ; delta accessor
+    0xF3, 0x44, 0x0F, 0x10, 0x08,        // movss xmm9,[rax]
+};
+constexpr std::size_t kMouseLookDeltaPatchOffset = 7;
+constexpr std::size_t kMouseLookDeltaPatchLength = 9;
+
+// The view-copy routine is byte-identical in every supported layout profile.
 constexpr unsigned char kExpectedCopyViewBytes[32] = {
     0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x74,
     0x24, 0x10, 0x48, 0x89, 0x7C, 0x24, 0x18, 0x41,
@@ -44,14 +63,146 @@ constexpr unsigned char kExpectedCopyViewBytes[32] = {
     0x8B, 0xF2, 0x48, 0x8B, 0xF1, 0x89, 0x01, 0x0F,
 };
 
-constexpr std::uintptr_t kRenderModelGpuCopyRva = 0x3ACD00;
-constexpr std::size_t kRenderModelGpuCopyHookLength = 19;
-constexpr unsigned char kExpectedRenderModelGpuCopyBytes[kRenderModelGpuCopyHookLength] = {
-    0x48, 0x89, 0x5C, 0x24, 0x08,
-    0xF3, 0x0F, 0x11, 0x54, 0x24, 0x18,
-    0x57,
-    0x48, 0x81, 0xEC, 0xC0, 0x00, 0x00, 0x00,
+constexpr std::size_t kAbsoluteJumpLength = 14;
+constexpr std::size_t kMaximumHookLength = 32;
+
+// Code and global-data locations for one executable build. Engine structure
+// offsets are shared: both profiles were verified to use identical layouts.
+struct LayoutProfile {
+    const char* name;
+    unsigned char referenceSha256[32];
+    std::uintptr_t gamePointerRva;
+    std::uintptr_t gameVtableRva;
+    std::array<std::uintptr_t, 4> gameVtableTargets;
+    std::uintptr_t frameSpinningRva;
+    std::uintptr_t tripleBufferingRva;
+    std::uintptr_t fixMouseSensibilityRva;
+    std::uintptr_t copyViewRva;
+    std::uintptr_t copyCallsiteRva;
+    std::uintptr_t renderModelGpuCopyRva;
+    std::size_t renderModelGpuCopyHookLength;
+    std::array<unsigned char, kMaximumHookLength> renderModelGpuCopyBytes;
+    std::uintptr_t renderModelStaticVtableRva;
+    std::array<std::uintptr_t, 4> renderModelStaticVtableTargets;
+    std::uintptr_t skinnedModelVtableRva;
+    std::array<std::uintptr_t, 4> skinnedModelVtableTargets;
+    std::uintptr_t skinnedPoseUploadRva;
+    std::size_t skinnedPoseUploadHookLength;
+    std::array<unsigned char, kMaximumHookLength> skinnedPoseUploadBytes;
+    bool hasShadowCasterBuild;
+    std::array<std::uintptr_t, 2> shadowCasterBuildRvas;
+    std::uintptr_t cinematicGameLogicStateVtableRva;
+    std::array<std::uintptr_t, 4> cinematicGameLogicStateVtableTargets;
+    std::uintptr_t mouseLookDeltaSiteRva;
+    std::uintptr_t clockDeltaAccessorRva;
 };
+
+constexpr LayoutProfile kLayoutProfiles[] = {
+    {
+        "GOG 1.77.9.0",
+        {
+            0xC3, 0x15, 0x0F, 0x9F, 0x2D, 0x9B, 0xF9, 0x67,
+            0xD2, 0x3C, 0xA6, 0xA7, 0x9B, 0xB3, 0x27, 0x03,
+            0xB9, 0x01, 0x16, 0x85, 0x4A, 0xAD, 0x98, 0x92,
+            0xC7, 0xFC, 0x1F, 0x46, 0xA1, 0x06, 0x02, 0x93,
+        },
+        0x288D608,
+        0x1F02138,
+        {0xA2F190, 0xA3EF00, 0xA3EEF0, 0xA38740},
+        0x288E958,
+        0x359E228,
+        0x3BF2FA8,
+        0x64A90,
+        0xA395A6,
+        0x3ACD00,
+        19,
+        {
+            0x48, 0x89, 0x5C, 0x24, 0x08,
+            0xF3, 0x0F, 0x11, 0x54, 0x24, 0x18,
+            0x57,
+            0x48, 0x81, 0xEC, 0xC0, 0x00, 0x00, 0x00,
+        },
+        0x1E55208,
+        {0x224400, 0x2243F0, 0x2243E0, 0x2DA6D0},
+        0x1E55008,
+        {0x224400, 0x2243F0, 0x2243E0, 0x2CF590},
+        0x2D0C80,
+        17,
+        {
+            0x48, 0x89, 0x74, 0x24, 0x20,
+            0x57,
+            0x48, 0x83, 0xEC, 0x40,
+            0x80, 0xB9, 0xB1, 0x1F, 0x00, 0x00, 0x00,
+        },
+        true,
+        {0x3CA3B0, 0x3CACE0},
+        0x1EDECF8,
+        {0x8D60F0, 0x8D61C0, 0x8D38A0, 0x8D6230},
+        0x9607F7,
+        0xA3FD00,
+    },
+    {
+        // February 2025 Steam rebuild of 1.77.9.0 (newer compiler, same data
+        // structures). The shadow prototype was not mapped for this build.
+        "Steam 1.77.9.0",
+        {
+            0xB6, 0x71, 0xF8, 0x24, 0x94, 0x22, 0x86, 0x2B,
+            0xF5, 0x57, 0xD0, 0x0A, 0xAB, 0x2F, 0x4B, 0xB6,
+            0x71, 0xED, 0x45, 0x15, 0xCC, 0x10, 0xAD, 0x8A,
+            0x8A, 0x9D, 0xEC, 0xAD, 0x84, 0x51, 0x61, 0x80,
+        },
+        0x25B0AB8,
+        0x1C940A8,
+        {0x8A5F60, 0x8A88E0, 0x8A88F0, 0x8ACDF0},
+        0x25B1EA8,
+        0x32FA908,
+        0x3992158,
+        0x444C0,
+        0x8AC8EF,
+        0x319560,
+        15,
+        {
+            0x48, 0x89, 0x5C, 0x24, 0x10,
+            0x48, 0x89, 0x6C, 0x24, 0x18,
+            0x48, 0x89, 0x74, 0x24, 0x20,
+        },
+        0x1B0DD88,
+        {0x1BD8A0, 0x1BE8C0, 0x1BDD40, 0x2681F0},
+        0x1B0D628,
+        {0x1BD8A0, 0x1BE8C0, 0x1BDD40, 0x25D690},
+        0x25F930,
+        17,
+        {
+            0x48, 0x89, 0x5C, 0x24, 0x10,
+            0x57,
+            0x48, 0x83, 0xEC, 0x20,
+            0x80, 0xB9, 0xB1, 0x1F, 0x00, 0x00, 0x00,
+        },
+        false,
+        {0, 0},
+        0x1C60128,
+        {0x789E20, 0x78A300, 0x7897D0, 0x78A870},
+        0x7FB644,
+        0x8A8980,
+    },
+};
+
+constexpr bool LayoutProfileHookLengthsAreValid() {
+    for (const LayoutProfile& profile : kLayoutProfiles) {
+        if (profile.renderModelGpuCopyHookLength < kAbsoluteJumpLength ||
+            profile.renderModelGpuCopyHookLength > kMaximumHookLength ||
+            profile.skinnedPoseUploadHookLength < kAbsoluteJumpLength ||
+            profile.skinnedPoseUploadHookLength > kMaximumHookLength) {
+            return false;
+        }
+    }
+    return true;
+}
+static_assert(LayoutProfileHookLengthsAreValid(),
+              "Every hook must fit an absolute jump and the patch buffer");
+
+// Selected by VerifyExecutableLayout before any hook is installed.
+const LayoutProfile* g_layout = nullptr;
 
 constexpr std::size_t kRenderModelSize = 0x1CD0;
 constexpr std::size_t kRenderModelMatrixOffset = 0x20;
@@ -64,12 +215,7 @@ constexpr std::size_t kRenderModelMvpMatrixOffset = 0x1A0;
 constexpr std::size_t kRenderModelPreviousMvpMatrixOffset = 0x1E0;
 constexpr std::size_t kRenderModelDepthHackOffset = 0x18B8;
 constexpr std::size_t kRenderModelOwnerOffset = 0x1C50;
-constexpr std::uintptr_t kRenderModelStaticVtableRva = 0x1E55208;
-constexpr std::array<std::uintptr_t, 4> kExpectedRenderModelStaticVtableTargets = {
-    0x224400, 0x2243F0, 0x2243E0, 0x2DA6D0,
-};
 
-constexpr std::uintptr_t kShadowCasterBuildRvas[2] = {0x3CA3B0, 0x3CACE0};
 constexpr std::size_t kShadowCasterBuildHookLength = 15;
 constexpr unsigned char
     kExpectedShadowCasterBuildBytes[2][kShadowCasterBuildHookLength] = {
@@ -82,18 +228,6 @@ constexpr std::size_t kShadowCasterEntryStride = 0x30;
 constexpr std::size_t kShadowCasterMatrixPointerOffset = 0x08;
 constexpr std::size_t kShadowCasterProxyCapacity = 4096;
 
-constexpr std::uintptr_t kSkinnedModelVtableRva = 0x1E55008;
-constexpr std::array<std::uintptr_t, 4> kExpectedSkinnedModelVtableTargets = {
-    0x224400, 0x2243F0, 0x2243E0, 0x2CF590,
-};
-constexpr std::uintptr_t kSkinnedPoseUploadRva = 0x2D0C80;
-constexpr std::size_t kSkinnedPoseUploadHookLength = 17;
-constexpr unsigned char kExpectedSkinnedPoseUploadBytes[kSkinnedPoseUploadHookLength] = {
-    0x48, 0x89, 0x74, 0x24, 0x20,
-    0x57,
-    0x48, 0x83, 0xEC, 0x40,
-    0x80, 0xB9, 0xB1, 0x1F, 0x00, 0x00, 0x00,
-};
 constexpr std::size_t kSkinnedModelSize = 0x2130;
 constexpr std::size_t kSkinnedPoseUploadFlagsOffset = 0x1FB0;
 constexpr std::size_t kSkinnedPosePendingOffset = 0x1FB1;
@@ -132,13 +266,6 @@ constexpr std::size_t kViewOriginOffset = 0xA8;
 constexpr std::size_t kViewOriginDuplicateOffset = 0xC0;
 constexpr std::size_t kViewAxisOffset = 0xCC;
 
-constexpr unsigned char kExpectedExecutableSha256[32] = {
-    0xC3, 0x15, 0x0F, 0x9F, 0x2D, 0x9B, 0xF9, 0x67,
-    0xD2, 0x3C, 0xA6, 0xA7, 0x9B, 0xB3, 0x27, 0x03,
-    0xB9, 0x01, 0x16, 0x85, 0x4A, 0xAD, 0x98, 0x92,
-    0xC7, 0xFC, 0x1F, 0x46, 0xA1, 0x06, 0x02, 0x93,
-};
-
 constexpr double kTimeEpsilon = 1.0e-7;
 constexpr double kMaximumStateInterval = 0.050;
 constexpr double kMaximumPositionJump = 5.0;
@@ -153,6 +280,7 @@ void* g_relay = nullptr;
 std::array<void*, 2> g_shadowCasterBuildTrampolines{};
 void* g_renderModelGpuCopyTrampoline = nullptr;
 void* g_skinnedPoseUploadTrampoline = nullptr;
+bool g_mouseLookDeltaPatched = false;
 std::atomic<bool> g_enabled{true};
 std::atomic<bool> g_transformInterpolationRuntimeEnabled{true};
 std::atomic<bool> g_skeletalInterpolationRuntimeEnabled{true};
@@ -171,6 +299,7 @@ bool g_interpolateFirstPersonSkeletons = false;
 bool g_interpolateWorldSkeletons = false;
 bool g_interpolateCinematicSkeletons = false;
 bool g_enableAdaptiveInterpolation = false;
+bool g_fullInterpolationInCutscenes = false;
 bool g_enableTelemetry = false;
 bool g_enableInterpolationAbProbe = false;
 std::atomic<bool> g_adaptiveInterpolationManualOverride{false};
@@ -636,6 +765,9 @@ struct AdaptiveInterpolationGateState {
     bool hasSkeletalPenalty = false;
     bool hasTransformPenalty = false;
     std::uint32_t recoveryWindows = 0;
+    bool cutsceneOverride = false;
+    bool cutsceneDetectionFailed = false;
+    std::int32_t lastGameLogicState = -1;
 };
 
 AdaptiveInterpolationGateState g_adaptiveInterpolationGate;
@@ -696,6 +828,8 @@ void LoadConfiguration() {
         L"Interpolation", L"CinematicSkeletons", 0, path) != 0;
     g_enableAdaptiveInterpolation = GetPrivateProfileIntW(
         L"Interpolation", L"AdaptivePerformanceGate", 1, path) != 0;
+    g_fullInterpolationInCutscenes = GetPrivateProfileIntW(
+        L"Interpolation", L"FullInterpolationInCutscenes", 1, path) != 0;
     g_enableTelemetry = GetPrivateProfileIntW(
         L"Diagnostics", L"Telemetry", 0, path) != 0;
     g_enableInterpolationAbProbe = GetPrivateProfileIntW(
@@ -704,7 +838,8 @@ void LoadConfiguration() {
         "StabilizeFirstPersonHands=%u, WorldTransforms=%u, "
         "CinematicTransforms=%u, ShadowTransforms=%u, "
         "FirstPersonSkeletons=%u, WorldSkeletons=%u, "
-        "CinematicSkeletons=%u, AdaptivePerformanceGate=%u, Telemetry=%u, "
+        "CinematicSkeletons=%u, AdaptivePerformanceGate=%u, "
+        "FullInterpolationInCutscenes=%u, Telemetry=%u, "
         "InterpolationABProbe=%u.",
         g_unlockAbove120 ? 1U : 0U, g_stabilizeMouseSensitivity ? 1U : 0U,
         g_stabilizeFirstPersonHands ? 1U : 0U,
@@ -715,6 +850,7 @@ void LoadConfiguration() {
         g_interpolateWorldSkeletons ? 1U : 0U,
         g_interpolateCinematicSkeletons ? 1U : 0U,
         g_enableAdaptiveInterpolation ? 1U : 0U,
+        g_fullInterpolationInCutscenes ? 1U : 0U,
         g_enableTelemetry ? 1U : 0U,
         g_enableInterpolationAbProbe ? 1U : 0U);
     if (g_enableInterpolationAbProbe) {
@@ -731,6 +867,10 @@ void LoadConfiguration() {
         Log("Adaptive interpolation gate enabled: skeletal interpolation is "
             "shed before transform interpolation, with cadence hysteresis and "
             "measured-cost recovery.");
+        if (g_fullInterpolationInCutscenes) {
+            Log("Cutscenes keep every configured interpolation layer enabled "
+                "and are excluded from adaptive cadence measurement.");
+        }
     }
 }
 
@@ -852,15 +992,23 @@ bool ReadExecutableImageLayout(ExecutableImageLayout& image) {
     return true;
 }
 
+bool ImageRangeHasCharacteristics(const ExecutableImageLayout& image,
+                                  std::uintptr_t rva, std::size_t size,
+                                  DWORD requiredCharacteristics,
+                                  DWORD forbiddenCharacteristics) {
+    const IMAGE_SECTION_HEADER* section = FindImageSection(image, rva, size);
+    return section != nullptr &&
+           (section->Characteristics & requiredCharacteristics) == requiredCharacteristics &&
+           (section->Characteristics & forbiddenCharacteristics) == 0;
+}
+
 bool ValidateImageRange(const ExecutableImageLayout& image,
                         std::uintptr_t rva, std::size_t size,
                         DWORD requiredCharacteristics,
                         DWORD forbiddenCharacteristics,
                         const char* description) {
-    const IMAGE_SECTION_HEADER* section = FindImageSection(image, rva, size);
-    if (section == nullptr ||
-        (section->Characteristics & requiredCharacteristics) != requiredCharacteristics ||
-        (section->Characteristics & forbiddenCharacteristics) != 0) {
+    if (!ImageRangeHasCharacteristics(image, rva, size, requiredCharacteristics,
+                                      forbiddenCharacteristics)) {
         Log("Executable layout check failed for %s at RVA 0x%llX; patch not installed.",
             description, static_cast<unsigned long long>(rva));
         return false;
@@ -917,16 +1065,74 @@ bool ValidateVtable(const ExecutableImageLayout& image,
     return true;
 }
 
+// Silent identity probe used only to choose which profile to validate: the
+// call site must be a direct call to the profile's byte-identical view copy.
+bool ViewCopyAnchorMatches(const ExecutableImageLayout& image,
+                           const LayoutProfile& profile) {
+    constexpr DWORD kCodeCharacteristics = IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_EXECUTE;
+    if (!ImageRangeHasCharacteristics(image, profile.copyCallsiteRva, 5,
+                                      kCodeCharacteristics, IMAGE_SCN_MEM_WRITE) ||
+        !ImageRangeHasCharacteristics(image, profile.copyViewRva,
+                                      sizeof(kExpectedCopyViewBytes),
+                                      kCodeCharacteristics, IMAGE_SCN_MEM_WRITE)) {
+        return false;
+    }
+
+    const auto* callsite = reinterpret_cast<const unsigned char*>(
+        g_executableBase + profile.copyCallsiteRva);
+    if (callsite[0] != 0xE8) {
+        return false;
+    }
+    std::int32_t displacement = 0;
+    memcpy(&displacement, callsite + 1, sizeof(displacement));
+    const std::uintptr_t target = static_cast<std::uintptr_t>(
+        static_cast<std::int64_t>(g_executableBase + profile.copyCallsiteRva + 5) +
+        displacement);
+    return target == g_executableBase + profile.copyViewRva &&
+           memcmp(reinterpret_cast<const void*>(g_executableBase + profile.copyViewRva),
+                  kExpectedCopyViewBytes, sizeof(kExpectedCopyViewBytes)) == 0;
+}
+
+const LayoutProfile* FindLayoutProfile(const ExecutableImageLayout& image) {
+    for (const LayoutProfile& profile : kLayoutProfiles) {
+        if (ViewCopyAnchorMatches(image, profile)) {
+            return &profile;
+        }
+    }
+    return nullptr;
+}
+
+bool ValidateMouseLookDeltaSite(const ExecutableImageLayout& image) {
+    const std::uintptr_t slotRva =
+        g_layout->gameVtableRva + kGameClockDeltaVtableSlot * sizeof(std::uintptr_t);
+    if (!ValidateCodeRange(image, g_layout->mouseLookDeltaSiteRva,
+                           sizeof(kExpectedMouseLookDeltaSite), "mouse-look delta read") ||
+        !ValidateImageRange(image, slotRva, sizeof(std::uintptr_t), IMAGE_SCN_MEM_READ,
+                            IMAGE_SCN_MEM_WRITE | IMAGE_SCN_MEM_EXECUTE,
+                            "idGameLocal clock-delta slot")) {
+        return false;
+    }
+    std::uintptr_t accessor = 0;
+    memcpy(&accessor, reinterpret_cast<const void*>(g_executableBase + slotRva), sizeof(accessor));
+    if (memcmp(reinterpret_cast<const void*>(g_executableBase + g_layout->mouseLookDeltaSiteRva),
+               kExpectedMouseLookDeltaSite, sizeof(kExpectedMouseLookDeltaSite)) != 0 ||
+        accessor != g_executableBase + g_layout->clockDeltaAccessorRva) {
+        Log("Mouse-look delta read does not match the supported layout; patch not installed.");
+        return false;
+    }
+    return true;
+}
+
 bool ValidateViewCopyCallRelationship(const ExecutableImageLayout& image) {
-    if (!ValidateCodeRange(image, kCopyCallsiteRva, sizeof(kExpectedCallBytes),
+    if (!ValidateCodeRange(image, g_layout->copyCallsiteRva, 5,
                            "renderer view-copy call site") ||
-        !ValidateCodeRange(image, kCopyViewRva, sizeof(kExpectedCopyViewBytes),
+        !ValidateCodeRange(image, g_layout->copyViewRva, sizeof(kExpectedCopyViewBytes),
                            "renderer view-copy target")) {
         return false;
     }
 
     const auto* callsite = reinterpret_cast<const unsigned char*>(
-        g_executableBase + kCopyCallsiteRva);
+        g_executableBase + g_layout->copyCallsiteRva);
     if (callsite[0] != 0xE8) {
         Log("Renderer view-copy site is not a direct call; patch not installed.");
         return false;
@@ -934,11 +1140,10 @@ bool ValidateViewCopyCallRelationship(const ExecutableImageLayout& image) {
     std::int32_t displacement = 0;
     memcpy(&displacement, callsite + 1, sizeof(displacement));
     const std::uintptr_t target = static_cast<std::uintptr_t>(
-        static_cast<std::int64_t>(g_executableBase + kCopyCallsiteRva + 5) +
+        static_cast<std::int64_t>(g_executableBase + g_layout->copyCallsiteRva + 5) +
         displacement);
-    if (target != g_executableBase + kCopyViewRva ||
-        memcmp(callsite, kExpectedCallBytes, sizeof(kExpectedCallBytes)) != 0 ||
-        memcmp(reinterpret_cast<const void*>(g_executableBase + kCopyViewRva),
+    if (target != g_executableBase + g_layout->copyViewRva ||
+        memcmp(reinterpret_cast<const void*>(g_executableBase + g_layout->copyViewRva),
                kExpectedCopyViewBytes, sizeof(kExpectedCopyViewBytes)) != 0) {
         Log("Renderer view-copy call relationship does not match the supported layout; "
             "patch not installed.");
@@ -956,18 +1161,18 @@ bool ValidateHookSignatures(const ExecutableImageLayout& image) {
         g_interpolateCinematicSkeletons;
 
     if (rendererModelFeatures) {
-        if (!ValidateCodeRange(image, kRenderModelGpuCopyRva,
-                               sizeof(kExpectedRenderModelGpuCopyBytes),
+        if (!ValidateCodeRange(image, g_layout->renderModelGpuCopyRva,
+                               g_layout->renderModelGpuCopyHookLength,
                                "renderer model GPU-copy hook") ||
             memcmp(reinterpret_cast<const void*>(
-                       g_executableBase + kRenderModelGpuCopyRva),
-                   kExpectedRenderModelGpuCopyBytes,
-                   sizeof(kExpectedRenderModelGpuCopyBytes)) != 0 ||
-            !ValidateVtable(image, kRenderModelStaticVtableRva,
-                            kExpectedRenderModelStaticVtableTargets,
+                       g_executableBase + g_layout->renderModelGpuCopyRva),
+                   g_layout->renderModelGpuCopyBytes.data(),
+                   g_layout->renderModelGpuCopyHookLength) != 0 ||
+            !ValidateVtable(image, g_layout->renderModelStaticVtableRva,
+                            g_layout->renderModelStaticVtableTargets,
                             "static render-model vtable") ||
-            !ValidateVtable(image, kSkinnedModelVtableRva,
-                            kExpectedSkinnedModelVtableTargets,
+            !ValidateVtable(image, g_layout->skinnedModelVtableRva,
+                            g_layout->skinnedModelVtableTargets,
                             "skinned render-model vtable")) {
             Log("Renderer model correction layout/signature validation failed; "
                 "patch not installed.");
@@ -976,15 +1181,15 @@ bool ValidateHookSignatures(const ExecutableImageLayout& image) {
     }
 
     if (skeletalFeatures) {
-        if (!ValidateCodeRange(image, kSkinnedPoseUploadRva,
-                               sizeof(kExpectedSkinnedPoseUploadBytes),
+        if (!ValidateCodeRange(image, g_layout->skinnedPoseUploadRva,
+                               g_layout->skinnedPoseUploadHookLength,
                                "skinned-pose upload hook") ||
             memcmp(reinterpret_cast<const void*>(
-                       g_executableBase + kSkinnedPoseUploadRva),
-                   kExpectedSkinnedPoseUploadBytes,
-                   sizeof(kExpectedSkinnedPoseUploadBytes)) != 0 ||
-            !ValidateVtable(image, kSkinnedModelVtableRva,
-                            kExpectedSkinnedModelVtableTargets,
+                       g_executableBase + g_layout->skinnedPoseUploadRva),
+                   g_layout->skinnedPoseUploadBytes.data(),
+                   g_layout->skinnedPoseUploadHookLength) != 0 ||
+            !ValidateVtable(image, g_layout->skinnedModelVtableRva,
+                            g_layout->skinnedModelVtableTargets,
                             "skinned render-model vtable")) {
             Log("Skeletal correction layout/signature validation failed; "
                 "patch not installed.");
@@ -992,13 +1197,20 @@ bool ValidateHookSignatures(const ExecutableImageLayout& image) {
         }
     }
 
+    if (g_interpolateShadowTransforms && !g_layout->hasShadowCasterBuild) {
+        // The unsupported shadow prototype is not mapped for every build; drop
+        // only that layer rather than refusing the validated ones.
+        g_interpolateShadowTransforms = false;
+        Log("ShadowTransforms is not available for the %s layout profile; that "
+            "layer is disabled.", g_layout->name);
+    }
     if (g_interpolateShadowTransforms) {
         for (std::size_t index = 0; index < 2; ++index) {
-            if (!ValidateCodeRange(image, kShadowCasterBuildRvas[index],
+            if (!ValidateCodeRange(image, g_layout->shadowCasterBuildRvas[index],
                                    kShadowCasterBuildHookLength,
                                    "shadow caster-build hook") ||
                 memcmp(reinterpret_cast<const void*>(
-                           g_executableBase + kShadowCasterBuildRvas[index]),
+                           g_executableBase + g_layout->shadowCasterBuildRvas[index]),
                        kExpectedShadowCasterBuildBytes[index],
                        kShadowCasterBuildHookLength) != 0) {
                 Log("Shadow correction layout/signature validation failed; "
@@ -1017,9 +1229,11 @@ void LogExecutableHash(const wchar_t* path) {
         return;
     }
 
-    if (memcmp(actualHash, kExpectedExecutableSha256, sizeof(actualHash)) == 0) {
-        Log("Recognized the validated GOG 1.77.9.0 executable SHA-256.");
-        return;
+    for (const LayoutProfile& profile : kLayoutProfiles) {
+        if (memcmp(actualHash, profile.referenceSha256, sizeof(actualHash)) == 0) {
+            Log("Recognized the %s reference executable SHA-256.", profile.name);
+            return;
+        }
     }
 
     char hashText[65]{};
@@ -1027,8 +1241,54 @@ void LogExecutableHash(const wchar_t* path) {
         sprintf_s(hashText + index * 2, sizeof(hashText) - index * 2,
                   "%02X", actualHash[index]);
     }
-    Log("Executable SHA-256 %s is not the reference hash; attempting strict "
+    Log("Executable SHA-256 %s is not a reference hash; attempting strict "
         "runtime layout validation.", hashText);
+}
+
+// Selects the layout profile whose anchor matches the loaded image, then
+// validates every enabled correction path of that profile.
+bool ValidateExecutableImageLayout() {
+    ExecutableImageLayout image{};
+    if (!ReadExecutableImageLayout(image)) {
+        return false;
+    }
+
+    g_layout = FindLayoutProfile(image);
+    if (g_layout == nullptr) {
+        Log("Executable layout does not match a known layout profile (no supported "
+            "renderer view-copy call site); patch not installed.");
+        return false;
+    }
+    Log("Selected the %s runtime-layout profile.", g_layout->name);
+
+    if (!ValidateViewCopyCallRelationship(image) ||
+        !ValidateMutableDataRange(image, g_layout->gamePointerRva,
+                                  sizeof(std::uintptr_t),
+                                  "idGameLocal pointer") ||
+        !ValidateVtable(image, g_layout->gameVtableRva,
+                        g_layout->gameVtableTargets,
+                        "idGameLocal vtable") ||
+        (g_unlockAbove120 &&
+         (!ValidateMutableDataRange(image, g_layout->frameSpinningRva, sizeof(LONG),
+                                    "frame-spinning cvar cache") ||
+          !ValidateMutableDataRange(image, g_layout->tripleBufferingRva, sizeof(LONG),
+                                    "triple-buffering cvar cache"))) ||
+        (g_stabilizeMouseSensitivity &&
+         (!ValidateMutableDataRange(image, g_layout->fixMouseSensibilityRva,
+                                    sizeof(LONG),
+                                    "mouse-sensitivity cvar cache") ||
+          !ValidateMouseLookDeltaSite(image))) ||
+        (g_enableAdaptiveInterpolation && g_fullInterpolationInCutscenes &&
+         !ValidateVtable(image, g_layout->cinematicGameLogicStateVtableRva,
+                         g_layout->cinematicGameLogicStateVtableTargets,
+                         "cinematic game-logic state vtable")) ||
+        !ValidateHookSignatures(image)) {
+        return false;
+    }
+
+    Log("Executable passed strict runtime layout validation; all enabled "
+        "correction paths were validated before hook installation.");
+    return true;
 }
 
 bool VerifyExecutableLayout() {
@@ -1047,32 +1307,7 @@ bool VerifyExecutableLayout() {
     }
 
     LogExecutableHash(path);
-
-    ExecutableImageLayout image{};
-    if (!ReadExecutableImageLayout(image) ||
-        !ValidateViewCopyCallRelationship(image) ||
-        !ValidateMutableDataRange(image, kGamePointerRva,
-                                  sizeof(std::uintptr_t),
-                                  "idGameLocal pointer") ||
-        !ValidateVtable(image, kGameVtableRva,
-                        kExpectedGameVtableTargets,
-                        "idGameLocal vtable") ||
-        (g_unlockAbove120 &&
-         (!ValidateMutableDataRange(image, kFrameSpinningRva, sizeof(LONG),
-                                    "frame-spinning cvar cache") ||
-          !ValidateMutableDataRange(image, kTripleBufferingRva, sizeof(LONG),
-                                    "triple-buffering cvar cache"))) ||
-        (g_stabilizeMouseSensitivity &&
-         !ValidateMutableDataRange(image, kFixMouseSensibilityRva,
-                                   sizeof(LONG),
-                                   "mouse-sensitivity cvar cache")) ||
-        !ValidateHookSignatures(image)) {
-        return false;
-    }
-
-    Log("Executable passed strict runtime layout validation; all enabled "
-        "correction paths were validated before hook installation.");
-    return true;
+    return ValidateExecutableImageLayout();
 }
 
 double Clamp(double value, double minimum, double maximum) {
@@ -1957,9 +2192,9 @@ bool IsEligibleWorldRenderModel(const void* renderModel, const void*& owner,
     }
     memcpy(&vtable, renderModel, sizeof(vtable));
     const bool exactStatic =
-        vtable == g_executableBase + kRenderModelStaticVtableRva;
+        vtable == g_executableBase + g_layout->renderModelStaticVtableRva;
     const bool exactSkinned =
-        vtable == g_executableBase + kSkinnedModelVtableRva;
+        vtable == g_executableBase + g_layout->skinnedModelVtableRva;
     if (!exactStatic && !exactSkinned) {
         g_worldDiagnostics.vtableRejected.fetch_add(1, std::memory_order_relaxed);
         if (vtable >= g_executableBase) {
@@ -3252,7 +3487,7 @@ bool PrepareSkeletalPose(
 
     std::uintptr_t vtable = 0;
     memcpy(&vtable, renderModel, sizeof(vtable));
-    if (vtable != g_executableBase + kSkinnedModelVtableRva) {
+    if (vtable != g_executableBase + g_layout->skinnedModelVtableRva) {
         return false;
     }
     g_skeletalDiagnostics.exactSkinnedType.fetch_add(1,
@@ -4151,7 +4386,7 @@ extern "C" void __fastcall HookRenderModelGpuCopy(
     std::uintptr_t renderModelVtable = 0;
     memcpy(&renderModelVtable, renderModel, sizeof(renderModelVtable));
     const bool exactSkinned =
-        renderModelVtable == g_executableBase + kSkinnedModelVtableRva;
+        renderModelVtable == g_executableBase + g_layout->skinnedModelVtableRva;
     bool correctedFirstPerson = false;
     std::uint64_t correctionSerial = 0;
     RenderCorrectionState firstPersonCorrection{};
@@ -4368,9 +4603,9 @@ void PublishTelemetry(const void* source, const void* destination) {
     const Transform output = ReadTransform(destination);
     double scaledTime = std::numeric_limits<double>::quiet_NaN();
     double simulationTime = std::numeric_limits<double>::quiet_NaN();
-    auto* game = *reinterpret_cast<unsigned char**>(g_executableBase + kGamePointerRva);
+    auto* game = *reinterpret_cast<unsigned char**>(g_executableBase + g_layout->gamePointerRva);
     if (game != nullptr && *reinterpret_cast<std::uintptr_t*>(game) ==
-                               g_executableBase + kGameVtableRva) {
+                               g_executableBase + g_layout->gameVtableRva) {
         unsigned char* clock = game + kClockOffset;
         memcpy(&scaledTime, clock + kScaledTimeOffset, sizeof(scaledTime));
         memcpy(&simulationTime, clock + kSimulationTimeOffset, sizeof(simulationTime));
@@ -4401,9 +4636,9 @@ void PublishTelemetry(const void* source, const void* destination) {
 
 void PublishPresentationContext() {
     PresentationContext context{};
-    auto* game = *reinterpret_cast<unsigned char**>(g_executableBase + kGamePointerRva);
+    auto* game = *reinterpret_cast<unsigned char**>(g_executableBase + g_layout->gamePointerRva);
     if (game != nullptr && *reinterpret_cast<std::uintptr_t*>(game) ==
-                               g_executableBase + kGameVtableRva) {
+                               g_executableBase + g_layout->gameVtableRva) {
         unsigned char* clock = game + kClockOffset;
         memcpy(&context.scaledTime, clock + kScaledTimeOffset, sizeof(context.scaledTime));
         memcpy(&context.simulationTime, clock + kSimulationTimeOffset,
@@ -4474,18 +4709,22 @@ const char* AdaptiveInterpolationModeName(AdaptiveInterpolationMode mode) {
     return "unknown";
 }
 
-void SetAdaptiveInterpolationMode(AdaptiveInterpolationMode mode,
-                                  double measuredFps,
-                                  double predictedFps,
-                                  const char* reason) {
-    g_adaptiveInterpolationGate.mode = mode;
-    g_adaptiveInterpolationGate.recoveryWindows = 0;
+void ApplyAdaptiveInterpolationModeFlags(AdaptiveInterpolationMode mode) {
     g_transformInterpolationRuntimeEnabled.store(
         mode != AdaptiveInterpolationMode::Off,
         std::memory_order_relaxed);
     g_skeletalInterpolationRuntimeEnabled.store(
         mode == AdaptiveInterpolationMode::All,
         std::memory_order_relaxed);
+}
+
+void SetAdaptiveInterpolationMode(AdaptiveInterpolationMode mode,
+                                  double measuredFps,
+                                  double predictedFps,
+                                  const char* reason) {
+    g_adaptiveInterpolationGate.mode = mode;
+    g_adaptiveInterpolationGate.recoveryWindows = 0;
+    ApplyAdaptiveInterpolationModeFlags(mode);
     if (std::isfinite(predictedFps)) {
         Log("Adaptive interpolation -> %s: measured cadence %.2f FPS, "
             "predicted next-profile cadence %.2f FPS (%s).",
@@ -4511,6 +4750,119 @@ void SuspendAdaptiveInterpolationForManualControl() {
     }
 }
 
+const char* GameLogicStateName(std::int32_t state) {
+    static constexpr const char* kNames[kGameLogicStateCount] = {
+        "none", "in-game", "pause", "notification", "read-note", "cinematic",
+        "main-menu", "journal", "power-wheel", "conversation", "black-market",
+        "results", "tutorial", "game-over", "character-choice",
+        "map-transition", "demo",
+    };
+    if (state < 0) {
+        return "empty";
+    }
+    return state < kGameLogicStateCount ? kNames[state] : "unknown";
+}
+
+struct GameLogicStackSnapshot {
+    bool valid = false;
+    bool cinematic = false;
+    bool cinematicStateMismatch = false;
+    std::int32_t top = -1;
+};
+
+// Reads the game-logic state stack of the idGameLocal that supplies the
+// presentation clock. Any failed identity check leaves the snapshot invalid.
+GameLogicStackSnapshot ReadGameLogicStack() {
+    GameLogicStackSnapshot snapshot{};
+    auto* game = *reinterpret_cast<unsigned char**>(g_executableBase + g_layout->gamePointerRva);
+    if (game == nullptr || *reinterpret_cast<std::uintptr_t*>(game) !=
+                               g_executableBase + g_layout->gameVtableRva) {
+        return snapshot;
+    }
+
+    const unsigned char* manager = game + kGameLogicManagerOffset;
+    unsigned char* owner = nullptr;
+    std::uint32_t count = 0;
+    const std::int32_t* ids = nullptr;
+    memcpy(&owner, manager + kGameLogicOwnerOffset, sizeof(owner));
+    memcpy(&count, manager + kGameLogicStackCountOffset, sizeof(count));
+    memcpy(&ids, manager + kGameLogicStackDataOffset, sizeof(ids));
+    count &= 0xFFFFFF;
+    if (owner != game || count > kGameLogicStackLimit ||
+        (count != 0 && !IsReadableMemory(ids, count * sizeof(std::int32_t)))) {
+        return snapshot;
+    }
+
+    snapshot.valid = true;
+    for (std::uint32_t index = 0; index < count; ++index) {
+        snapshot.cinematic = snapshot.cinematic || ids[index] == kGameLogicStateCinematic;
+    }
+    snapshot.top = count != 0 ? ids[count - 1] : -1;
+    if (snapshot.cinematic) {
+        // Fail closed unless the cinematic slot holds the engine's own
+        // arkGameLogicStateCinematic object.
+        const unsigned char* state = nullptr;
+        memcpy(&state, manager + kGameLogicStatesOffset +
+                           kGameLogicStateCinematic * sizeof(void*), sizeof(state));
+        std::uintptr_t vtable = 0;
+        if (IsReadableMemory(state, sizeof(vtable))) {
+            memcpy(&vtable, state, sizeof(vtable));
+        }
+        if (vtable != g_executableBase + g_layout->cinematicGameLogicStateVtableRva) {
+            snapshot.cinematic = false;
+            snapshot.cinematicStateMismatch = true;
+        }
+    }
+    return snapshot;
+}
+
+// Cutscenes are not gameplay, so a lower frame rate there is not worth
+// stepping visibly. While the cinematic game-logic state is active, keep every
+// configured layer on and leave adaptive cadence unmeasured; afterwards the
+// gate resumes in the mode it had chosen for gameplay.
+bool UpdateCutsceneInterpolationOverride(AdaptiveInterpolationGateState& gate,
+                                         const PresentationContext& context) {
+    if (!g_fullInterpolationInCutscenes || gate.cutsceneDetectionFailed) {
+        return false;
+    }
+
+    const GameLogicStackSnapshot stack = ReadGameLogicStack();
+    if (stack.cinematicStateMismatch) {
+        gate.cutsceneDetectionFailed = true;
+        Log("The cinematic game-logic slot does not hold the expected state "
+            "object; cutscene detection is disabled for this session.");
+    } else if (stack.valid && stack.top != gate.lastGameLogicState) {
+        Log("Game-logic state: %s -> %s.",
+            GameLogicStateName(gate.lastGameLogicState),
+            GameLogicStateName(stack.top));
+        gate.lastGameLogicState = stack.top;
+    }
+
+    const bool cutscene = !gate.cutsceneDetectionFailed && stack.valid && stack.cinematic;
+    if (cutscene != gate.cutsceneOverride) {
+        gate.cutsceneOverride = cutscene;
+        // Neither cutscene frames nor a window spanning its edges describe
+        // gameplay cost, so restart measurement and drop pending cost learning.
+        ResetAdaptiveInterpolationWindow();
+        gate.recoveryWindows = 0;
+        gate.learnSkeletalPenalty = false;
+        gate.learnTransformPenalty = false;
+        gate.previousScaledTime = context.scaledTime;
+        gate.previousSimulationTime = context.simulationTime;
+        if (cutscene) {
+            g_transformInterpolationRuntimeEnabled.store(true, std::memory_order_relaxed);
+            g_skeletalInterpolationRuntimeEnabled.store(true, std::memory_order_relaxed);
+            Log("Cutscene started: all configured interpolation layers are enabled "
+                "and adaptive measurement is paused.");
+        } else {
+            ApplyAdaptiveInterpolationModeFlags(gate.mode);
+            Log("Cutscene ended: adaptive interpolation resumes in %s mode.",
+                AdaptiveInterpolationModeName(gate.mode));
+        }
+    }
+    return gate.cutsceneOverride;
+}
+
 void UpdateAdaptiveInterpolationGate(const PresentationContext& context) {
     if (!g_enableAdaptiveInterpolation || g_enableInterpolationAbProbe ||
         g_adaptiveInterpolationManualOverride.load(std::memory_order_relaxed) ||
@@ -4524,6 +4876,9 @@ void UpdateAdaptiveInterpolationGate(const PresentationContext& context) {
         gate.previousScaledTime = context.scaledTime;
         gate.previousSimulationTime = context.simulationTime;
         gate.mode = AdaptiveInterpolationMode::All;
+        return;
+    }
+    if (UpdateCutsceneInterpolationOverride(gate, context)) {
         return;
     }
 
@@ -5034,9 +5389,9 @@ void TryUnlockAbove120() {
     }
 
     auto* frameSpinning = reinterpret_cast<volatile LONG*>(
-        g_executableBase + kFrameSpinningRva);
+        g_executableBase + g_layout->frameSpinningRva);
     auto* tripleBuffering = reinterpret_cast<volatile LONG*>(
-        g_executableBase + kTripleBufferingRva);
+        g_executableBase + g_layout->tripleBufferingRva);
     const LONG frameSpinningValue = *frameSpinning;
     const LONG tripleBufferingValue = *tripleBuffering;
 
@@ -5066,8 +5421,14 @@ void TryStabilizeMouseSensitivity() {
         return;
     }
 
+    // Without the simulation-delta patch, the cvar's frame-time path would
+    // reintroduce the FPS-dependent gain, so leave the game's choice alone.
+    if (!g_mouseLookDeltaPatched) {
+        return;
+    }
+
     auto* fixMouseSensibility = reinterpret_cast<volatile LONG*>(
-        g_executableBase + kFixMouseSensibilityRva);
+        g_executableBase + g_layout->fixMouseSensibilityRva);
     const LONG value = *fixMouseSensibility;
 
     // The game initializes this cached cvar to either 0 or 1. Do not write an
@@ -5076,17 +5437,22 @@ void TryStabilizeMouseSensitivity() {
         return;
     }
 
+    // g_fixMouseSensibility=1 selects the scaler patched to divide by the
+    // simulation delta; the 0 path multiplies the turn by the frame's tick
+    // count, so it speeds up below 120 FPS.
     int expected = 0;
-    if (value == 0) {
+    if (value == 1) {
         if (g_mouseStabilizationState.compare_exchange_strong(expected, 2)) {
-            Log("Mouse sensitivity is already stable: g_fixMouseSensibility=0.");
+            Log("Mouse sensitivity is stable: g_fixMouseSensibility=1 with the "
+                "simulation-delta look scaling.");
         }
         return;
     }
 
     if (g_mouseStabilizationState.compare_exchange_strong(expected, 1)) {
-        InterlockedExchange(fixMouseSensibility, 0);
-        Log("Stabilized mouse sensitivity by applying g_fixMouseSensibility=0.");
+        InterlockedExchange(fixMouseSensibility, 1);
+        Log("Stabilized mouse sensitivity by applying g_fixMouseSensibility=1 with "
+            "the simulation-delta look scaling.");
     }
 }
 
@@ -5108,9 +5474,9 @@ void ApplyPrediction(void* destination, const void* source) {
         return;
     }
 
-    auto* game = *reinterpret_cast<unsigned char**>(g_executableBase + kGamePointerRva);
+    auto* game = *reinterpret_cast<unsigned char**>(g_executableBase + g_layout->gamePointerRva);
     if (game == nullptr || *reinterpret_cast<std::uintptr_t*>(game) !=
-                               g_executableBase + kGameVtableRva) {
+                               g_executableBase + g_layout->gameVtableRva) {
         g_prediction.initialized = false;
         return;
     }
@@ -5242,6 +5608,10 @@ void WriteAbsoluteIndirectJump(unsigned char* destination, const void* target) {
 }
 
 bool InstallShadowCasterBuildHooks() {
+    if (!g_layout->hasShadowCasterBuild) {
+        // ValidateHookSignatures already logged why this layer is unavailable.
+        return false;
+    }
     if (!g_interpolateShadowTransforms) {
         Log("Shadow-transform interpolation is disabled by configuration.");
         return false;
@@ -5251,12 +5621,11 @@ bool InstallShadowCasterBuildHooks() {
         reinterpret_cast<const void*>(&HookShadowCasterBuildA),
         reinterpret_cast<const void*>(&HookShadowCasterBuildB),
     };
-    constexpr std::size_t kAbsoluteJumpLength = 14;
     constexpr std::size_t kTrampolineSize =
         kShadowCasterBuildHookLength + kAbsoluteJumpLength;
     for (std::size_t index = 0; index < entries.size(); ++index) {
         entries[index] = reinterpret_cast<unsigned char*>(
-            g_executableBase + kShadowCasterBuildRvas[index]);
+            g_executableBase + g_layout->shadowCasterBuildRvas[index]);
         if (memcmp(entries[index], kExpectedShadowCasterBuildBytes[index],
                    kShadowCasterBuildHookLength) != 0) {
             Log("Shadow caster-build entry %llu bytes do not match; shadow "
@@ -5316,8 +5685,49 @@ bool InstallShadowCasterBuildHooks() {
 
     Log("Installed coherent renderer-only shadow caster-list proxies at build "
         "RVAs 0x%llX and 0x%llX.",
-        static_cast<unsigned long long>(kShadowCasterBuildRvas[0]),
-        static_cast<unsigned long long>(kShadowCasterBuildRvas[1]));
+        static_cast<unsigned long long>(g_layout->shadowCasterBuildRvas[0]),
+        static_cast<unsigned long long>(g_layout->shadowCasterBuildRvas[1]));
+    return true;
+}
+
+// Makes the mouse-look scaler read the simulation timer's delta in place of
+// the real frame time: `mov rax,[rcx]; call [rax+0xE0]` becomes
+// `lea rax,[rcx+clock+0xC8]` plus a two-byte nop.
+bool InstallMouseLookDeltaPatch() {
+    if (!g_stabilizeMouseSensitivity) {
+        return false;
+    }
+
+    auto* site = reinterpret_cast<unsigned char*>(
+        g_executableBase + g_layout->mouseLookDeltaSiteRva);
+    if (memcmp(site, kExpectedMouseLookDeltaSite, sizeof(kExpectedMouseLookDeltaSite)) != 0) {
+        Log("Mouse-look delta bytes do not match; mouse stabilization was not installed.");
+        return false;
+    }
+
+    const std::uint32_t displacement =
+        static_cast<std::uint32_t>(kClockOffset + kSimulationTimerDeltaOffset);
+    unsigned char patch[kMouseLookDeltaPatchLength] = {0x48, 0x8D, 0x81};
+    memcpy(patch + 3, &displacement, sizeof(displacement));
+    patch[7] = 0x66;
+    patch[8] = 0x90;
+
+    unsigned char* entry = site + kMouseLookDeltaPatchOffset;
+    DWORD oldProtection = 0;
+    if (!VirtualProtect(entry, sizeof(patch), PAGE_EXECUTE_READWRITE, &oldProtection)) {
+        Log("VirtualProtect failed at the mouse-look delta read; mouse stabilization "
+            "was not installed.");
+        return false;
+    }
+    memcpy(entry, patch, sizeof(patch));
+    FlushInstructionCache(GetCurrentProcess(), entry, sizeof(patch));
+    DWORD ignored = 0;
+    VirtualProtect(entry, sizeof(patch), oldProtection, &ignored);
+    g_mouseLookDeltaPatched = true;
+
+    Log("Installed mouse-look simulation-delta scaling at RVA 0x%llX.",
+        static_cast<unsigned long long>(g_layout->mouseLookDeltaSiteRva +
+                                        kMouseLookDeltaPatchOffset));
     return true;
 }
 
@@ -5329,16 +5739,14 @@ bool InstallRenderModelGpuCopyHook() {
     }
 
     auto* entry = reinterpret_cast<unsigned char*>(
-        g_executableBase + kRenderModelGpuCopyRva);
-    if (memcmp(entry, kExpectedRenderModelGpuCopyBytes,
-               sizeof(kExpectedRenderModelGpuCopyBytes)) != 0) {
+        g_executableBase + g_layout->renderModelGpuCopyRva);
+    const std::size_t hookLength = g_layout->renderModelGpuCopyHookLength;
+    if (memcmp(entry, g_layout->renderModelGpuCopyBytes.data(), hookLength) != 0) {
         Log("Renderer GPU-copy bytes do not match; renderer model features were not installed.");
         return false;
     }
 
-    constexpr std::size_t kAbsoluteJumpLength = 14;
-    constexpr std::size_t kTrampolineSize =
-        kRenderModelGpuCopyHookLength + kAbsoluteJumpLength;
+    const std::size_t trampolineSize = hookLength + kAbsoluteJumpLength;
     auto* trampoline = static_cast<unsigned char*>(
         VirtualAlloc(nullptr, 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE));
     if (trampoline == nullptr) {
@@ -5346,18 +5754,17 @@ bool InstallRenderModelGpuCopyHook() {
             "hands stabilization was not installed.");
         return false;
     }
-    memcpy(trampoline, entry, kRenderModelGpuCopyHookLength);
-    WriteAbsoluteIndirectJump(trampoline + kRenderModelGpuCopyHookLength,
-                              entry + kRenderModelGpuCopyHookLength);
-    FlushInstructionCache(GetCurrentProcess(), trampoline, kTrampolineSize);
+    memcpy(trampoline, entry, hookLength);
+    WriteAbsoluteIndirectJump(trampoline + hookLength, entry + hookLength);
+    FlushInstructionCache(GetCurrentProcess(), trampoline, trampolineSize);
 
-    unsigned char patch[kRenderModelGpuCopyHookLength]{};
-    memset(patch, 0x90, sizeof(patch));
+    unsigned char patch[kMaximumHookLength]{};
+    memset(patch, 0x90, hookLength);
     WriteAbsoluteIndirectJump(patch,
                               reinterpret_cast<const void*>(&HookRenderModelGpuCopy));
 
     DWORD oldProtection = 0;
-    if (!VirtualProtect(entry, sizeof(patch), PAGE_EXECUTE_READWRITE, &oldProtection)) {
+    if (!VirtualProtect(entry, hookLength, PAGE_EXECUTE_READWRITE, &oldProtection)) {
         VirtualFree(trampoline, 0, MEM_RELEASE);
         Log("VirtualProtect failed at the renderer GPU-copy boundary; "
             "renderer model features were not installed.");
@@ -5365,14 +5772,14 @@ bool InstallRenderModelGpuCopyHook() {
     }
     g_originalRenderModelGpuCopy = reinterpret_cast<RenderModelGpuCopyFn>(trampoline);
     g_renderModelGpuCopyTrampoline = trampoline;
-    memcpy(entry, patch, sizeof(patch));
-    FlushInstructionCache(GetCurrentProcess(), entry, sizeof(patch));
+    memcpy(entry, patch, hookLength);
+    FlushInstructionCache(GetCurrentProcess(), entry, hookLength);
     DWORD ignored = 0;
-    VirtualProtect(entry, sizeof(patch), oldProtection, &ignored);
+    VirtualProtect(entry, hookLength, oldProtection, &ignored);
 
     Log("Installed renderer model GPU-copy hook at RVA 0x%llX "
         "(first-person roots=%u, world transforms=%u, cinematic transforms=%u).",
-        static_cast<unsigned long long>(kRenderModelGpuCopyRva),
+        static_cast<unsigned long long>(g_layout->renderModelGpuCopyRva),
         g_stabilizeFirstPersonHands ? 1U : 0U,
         g_interpolateWorldTransforms ? 1U : 0U,
         g_interpolateCinematicTransforms ? 1U : 0U);
@@ -5388,17 +5795,15 @@ bool InstallSkinnedPoseUploadHook() {
     }
 
     auto* entry = reinterpret_cast<unsigned char*>(
-        g_executableBase + kSkinnedPoseUploadRva);
-    if (memcmp(entry, kExpectedSkinnedPoseUploadBytes,
-               sizeof(kExpectedSkinnedPoseUploadBytes)) != 0) {
+        g_executableBase + g_layout->skinnedPoseUploadRva);
+    const std::size_t hookLength = g_layout->skinnedPoseUploadHookLength;
+    if (memcmp(entry, g_layout->skinnedPoseUploadBytes.data(), hookLength) != 0) {
         Log("Skinned-pose upload bytes do not match; skeletal interpolation "
             "was not installed.");
         return false;
     }
 
-    constexpr std::size_t kAbsoluteJumpLength = 14;
-    constexpr std::size_t kTrampolineSize =
-        kSkinnedPoseUploadHookLength + kAbsoluteJumpLength;
+    const std::size_t trampolineSize = hookLength + kAbsoluteJumpLength;
     auto* trampoline = static_cast<unsigned char*>(
         VirtualAlloc(nullptr, 0x1000, MEM_RESERVE | MEM_COMMIT,
                      PAGE_EXECUTE_READWRITE));
@@ -5407,18 +5812,17 @@ bool InstallSkinnedPoseUploadHook() {
             "interpolation was not installed.");
         return false;
     }
-    memcpy(trampoline, entry, kSkinnedPoseUploadHookLength);
-    WriteAbsoluteIndirectJump(trampoline + kSkinnedPoseUploadHookLength,
-                              entry + kSkinnedPoseUploadHookLength);
-    FlushInstructionCache(GetCurrentProcess(), trampoline, kTrampolineSize);
+    memcpy(trampoline, entry, hookLength);
+    WriteAbsoluteIndirectJump(trampoline + hookLength, entry + hookLength);
+    FlushInstructionCache(GetCurrentProcess(), trampoline, trampolineSize);
 
-    unsigned char patch[kSkinnedPoseUploadHookLength]{};
-    memset(patch, 0x90, sizeof(patch));
+    unsigned char patch[kMaximumHookLength]{};
+    memset(patch, 0x90, hookLength);
     WriteAbsoluteIndirectJump(patch,
                               reinterpret_cast<const void*>(&HookSkinnedPoseUpload));
 
     DWORD oldProtection = 0;
-    if (!VirtualProtect(entry, sizeof(patch), PAGE_EXECUTE_READWRITE,
+    if (!VirtualProtect(entry, hookLength, PAGE_EXECUTE_READWRITE,
                         &oldProtection)) {
         VirtualFree(trampoline, 0, MEM_RELEASE);
         Log("VirtualProtect failed at the skinned-pose upload boundary; skeletal "
@@ -5428,16 +5832,16 @@ bool InstallSkinnedPoseUploadHook() {
     g_originalSkinnedPoseUpload =
         reinterpret_cast<SkinnedPoseUploadFn>(trampoline);
     g_skinnedPoseUploadTrampoline = trampoline;
-    memcpy(entry, patch, sizeof(patch));
-    FlushInstructionCache(GetCurrentProcess(), entry, sizeof(patch));
+    memcpy(entry, patch, hookLength);
+    FlushInstructionCache(GetCurrentProcess(), entry, hookLength);
     DWORD ignored = 0;
-    VirtualProtect(entry, sizeof(patch), oldProtection, &ignored);
+    VirtualProtect(entry, hookLength, oldProtection, &ignored);
 
     Log("Installed experimental skeletal hook at pose-upload RVA 0x%llX "
         "(first-person=%u, world=%u, cinematic=%u); CPU poses remain unmodified and "
         "presentation palettes are substituted only during synchronous GPU "
         "upload.",
-        static_cast<unsigned long long>(kSkinnedPoseUploadRva),
+        static_cast<unsigned long long>(g_layout->skinnedPoseUploadRva),
         g_interpolateFirstPersonSkeletons ? 1U : 0U,
         g_interpolateWorldSkeletons ? 1U : 0U,
         g_interpolateCinematicSkeletons ? 1U : 0U);
@@ -5452,8 +5856,8 @@ bool InstallHook() {
         return false;
     }
 
-    auto* callsite = reinterpret_cast<unsigned char*>(g_executableBase + kCopyCallsiteRva);
-    g_originalCopyView = reinterpret_cast<CopyViewFn>(g_executableBase + kCopyViewRva);
+    auto* callsite = reinterpret_cast<unsigned char*>(g_executableBase + g_layout->copyCallsiteRva);
+    g_originalCopyView = reinterpret_cast<CopyViewFn>(g_executableBase + g_layout->copyViewRva);
     g_relay = AllocateRelayNear(reinterpret_cast<std::uintptr_t>(callsite));
     if (g_relay == nullptr) {
         Log("Unable to allocate a relay within rel32 range; patch not installed.");
@@ -5491,7 +5895,7 @@ bool InstallHook() {
     VirtualProtect(callsite, sizeof(patch), oldProtection, &ignored);
 
     Log("Installed Dishonored 2 high-FPS camera hook at RVA 0x%llX; F10 toggles it.",
-        static_cast<unsigned long long>(kCopyCallsiteRva));
+        static_cast<unsigned long long>(g_layout->copyCallsiteRva));
     return true;
 }
 
@@ -5512,6 +5916,7 @@ DWORD WINAPI InstallThread(void*) {
         InitializeTelemetry();
     }
     if (InstallHook()) {
+        InstallMouseLookDeltaPatch();
         InstallRenderModelGpuCopyHook();
         InstallSkinnedPoseUploadHook();
         InstallShadowCasterBuildHooks();
