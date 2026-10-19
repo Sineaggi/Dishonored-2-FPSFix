@@ -5876,7 +5876,11 @@ SRWLOCK g_sourceDirtyLock = SRWLOCK_INIT;
 struct SourceDirtyEntry {
     void* model;
     void* world;
+    std::uint32_t deferrals;
 };
+// Entries waiting for a world that is never flushed again (unloaded) are
+// discarded after this many foreign flushes.
+constexpr std::uint32_t kSourceMaximumDirtyDeferrals = 600;
 std::vector<SourceDirtyEntry> g_sourceDirty;
 std::vector<SourceDirtyEntry> g_sourceDirtyPending;
 std::vector<SourceDirtyEntry> g_sourceDirtyDeferred;
@@ -6061,8 +6065,10 @@ void CollectSourceDirtyModels(void* world, std::vector<void*>& output, bool& ove
     for (const SourceDirtyEntry& entry : g_sourceDirtyPending) {
         if (entry.world == world) {
             output.push_back(entry.model);
-        } else if (entry.world != nullptr) {
-            g_sourceDirtyDeferred.push_back(entry);
+        } else if (entry.world != nullptr &&
+                   entry.deferrals < kSourceMaximumDirtyDeferrals) {
+            g_sourceDirtyDeferred.push_back({entry.model, entry.world,
+                                             entry.deferrals + 1});
         }
     }
     std::sort(output.begin(), output.end());
@@ -6615,7 +6621,7 @@ extern "C" void __fastcall HookRenderModelMarkDirty(void* model, std::uintptr_t 
     memcpy(&world, static_cast<unsigned char*>(model) + kRenderModelWorldOffset,
            sizeof(world));
     if (g_sourceDirty.size() < kSourceDirtyCapacity) {
-        g_sourceDirty.push_back({model, world});
+        g_sourceDirty.push_back({model, world, 0});
     } else if (!g_sourceDirtyOverflowed) {
         g_sourceDirtyOverflowed = true;
         g_sourceDiagnostics.dirtyOverflows.fetch_add(1, std::memory_order_relaxed);
