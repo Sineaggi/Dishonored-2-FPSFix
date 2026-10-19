@@ -295,6 +295,12 @@ std::atomic<std::uint64_t> g_firstPersonSkeletalAdjustedCount{0};
 std::atomic<std::uint64_t> g_abRenderModelHookCalls{0};
 std::atomic<std::uint64_t> g_abFirstPersonRootCorrections{0};
 std::atomic<std::uint64_t> g_abSkeletalHookCalls{0};
+// QPC ticks spent in each hook in total and inside the original engine
+// function; the difference is the plugin's own CPU cost. Probe-only.
+std::atomic<std::uint64_t> g_abRenderModelHookTicks{0};
+std::atomic<std::uint64_t> g_abRenderModelOriginalTicks{0};
+std::atomic<std::uint64_t> g_abSkeletalHookTicks{0};
+std::atomic<std::uint64_t> g_abSkeletalOriginalTicks{0};
 
 struct WorldTransformDiagnostics {
     std::atomic<std::uint64_t> candidates{0};
@@ -661,6 +667,10 @@ struct InterpolationAbCounterSnapshot {
     std::uint64_t skeletalPrepareCalls = 0;
     std::uint64_t skeletalAdjustments = 0;
     std::uint64_t forcedUploads = 0;
+    std::uint64_t renderModelHookTicks = 0;
+    std::uint64_t renderModelOriginalTicks = 0;
+    std::uint64_t skeletalHookTicks = 0;
+    std::uint64_t skeletalOriginalTicks = 0;
 };
 
 struct InterpolationAbProbeState {
@@ -4250,7 +4260,38 @@ bool CorrectWorldRenderModelClone(unsigned char* object,
                             correction.previousInverseDelta);
 }
 
-extern "C" void __fastcall HookRenderModelGpuCopy(
+std::uint64_t ReadPerformanceCounter() {
+    LARGE_INTEGER counter{};
+    QueryPerformanceCounter(&counter);
+    return static_cast<std::uint64_t>(counter.QuadPart);
+}
+
+void CallOriginalRenderModelGpuCopy(void* state, void* renderContext,
+                                    float parameter, void* drawSurface) {
+    if (!g_enableInterpolationAbProbe) {
+        g_originalRenderModelGpuCopy(state, renderContext, parameter, drawSurface);
+        return;
+    }
+    const std::uint64_t start = ReadPerformanceCounter();
+    g_originalRenderModelGpuCopy(state, renderContext, parameter, drawSurface);
+    g_abRenderModelOriginalTicks.fetch_add(ReadPerformanceCounter() - start,
+                                           std::memory_order_relaxed);
+}
+
+std::uint64_t CallOriginalSkinnedPoseUpload(void* renderModel,
+                                            void* renderContext) {
+    if (!g_enableInterpolationAbProbe) {
+        return g_originalSkinnedPoseUpload(renderModel, renderContext);
+    }
+    const std::uint64_t start = ReadPerformanceCounter();
+    const std::uint64_t result =
+        g_originalSkinnedPoseUpload(renderModel, renderContext);
+    g_abSkeletalOriginalTicks.fetch_add(ReadPerformanceCounter() - start,
+                                        std::memory_order_relaxed);
+    return result;
+}
+
+void HookRenderModelGpuCopyBody(
     void* state, void* renderContext, float parameter, void* drawSurface) {
     if (g_enableInterpolationAbProbe) {
         g_abRenderModelHookCalls.fetch_add(1, std::memory_order_relaxed);
@@ -4262,14 +4303,14 @@ extern "C" void __fastcall HookRenderModelGpuCopy(
     if ((!firstPersonHandsEnabled && !transformInterpolationEnabled) ||
         g_renderModelGpuCopyTrampoline == nullptr ||
         !IsReadableMemory(drawSurface, 16)) {
-        g_originalRenderModelGpuCopy(state, renderContext, parameter, drawSurface);
+        CallOriginalRenderModelGpuCopy(state, renderContext, parameter, drawSurface);
         return;
     }
 
     void* renderModel = nullptr;
     memcpy(&renderModel, static_cast<unsigned char*>(drawSurface) + 8, sizeof(renderModel));
     if (!IsReadableMemory(renderModel, kRenderModelSize)) {
-        g_originalRenderModelGpuCopy(state, renderContext, parameter, drawSurface);
+        CallOriginalRenderModelGpuCopy(state, renderContext, parameter, drawSurface);
         return;
     }
 
@@ -4300,14 +4341,14 @@ extern "C" void __fastcall HookRenderModelGpuCopy(
     }
 
     if (!hasCorrection) {
-        g_originalRenderModelGpuCopy(state, renderContext, parameter, drawSurface);
+        CallOriginalRenderModelGpuCopy(state, renderContext, parameter, drawSurface);
         return;
     }
 
     const std::size_t renderModelCloneSize =
         exactSkinned ? kSkinnedModelSize : kRenderModelSize;
     if (!IsReadableMemory(renderModel, renderModelCloneSize)) {
-        g_originalRenderModelGpuCopy(state, renderContext, parameter,
+        CallOriginalRenderModelGpuCopy(state, renderContext, parameter,
                                      drawSurface);
         return;
     }
@@ -4317,7 +4358,7 @@ extern "C" void __fastcall HookRenderModelGpuCopy(
         ? CorrectRenderModelClone(renderModelClone, firstPersonCorrection)
         : CorrectWorldRenderModelClone(renderModelClone, worldCorrection);
     if (!corrected) {
-        g_originalRenderModelGpuCopy(state, renderContext, parameter,
+        CallOriginalRenderModelGpuCopy(state, renderContext, parameter,
                                      drawSurface);
         return;
     }
@@ -4329,7 +4370,7 @@ extern "C" void __fastcall HookRenderModelGpuCopy(
     memcpy(drawSurfaceProxy, drawSurface, sizeof(drawSurfaceProxy));
     void* renderModelClonePointer = renderModelClone;
     memcpy(drawSurfaceProxy + 8, &renderModelClonePointer, sizeof(renderModelClonePointer));
-    g_originalRenderModelGpuCopy(state, renderContext, parameter, drawSurfaceProxy);
+    CallOriginalRenderModelGpuCopy(state, renderContext, parameter, drawSurfaceProxy);
 
     // The original function caches the source pointer in its renderer-local state.
     // Keep that cache tied to the real model rather than this stack-only clone.
@@ -4366,7 +4407,7 @@ bool SkinnedPoseUploaded(std::uint64_t result) {
                                                   : result != 0;
 }
 
-extern "C" std::uint64_t __fastcall HookSkinnedPoseUpload(
+std::uint64_t HookSkinnedPoseUploadBody(
     void* renderModel, void* renderContext) {
     if (g_enableInterpolationAbProbe) {
         g_abSkeletalHookCalls.fetch_add(1, std::memory_order_relaxed);
@@ -4376,7 +4417,7 @@ extern "C" std::uint64_t __fastcall HookSkinnedPoseUpload(
          !g_interpolateFirstPersonSkeletons &&
          !g_interpolateCinematicSkeletons) ||
         g_skinnedPoseUploadTrampoline == nullptr) {
-        return g_originalSkinnedPoseUpload(renderModel, renderContext);
+        return CallOriginalSkinnedPoseUpload(renderModel, renderContext);
     }
 
     // PrepareSkeletalPose initializes every byte that can be consumed when it
@@ -4399,7 +4440,7 @@ extern "C" std::uint64_t __fastcall HookSkinnedPoseUpload(
                sizeof(savedPending));
 
         std::uint64_t result =
-            g_originalSkinnedPoseUpload(renderModel, renderContext);
+            CallOriginalSkinnedPoseUpload(renderModel, renderContext);
         bool forced = false;
         if (!SkinnedPoseUploaded(result)) {
             // The native path commonly consumes its two pending uploads on
@@ -4413,7 +4454,7 @@ extern "C" std::uint64_t __fastcall HookSkinnedPoseUpload(
                    sizeof(forcedUploadFlags));
             memcpy(bytes + kSkinnedPosePendingOffset, &forcedPending,
                    sizeof(forcedPending));
-            result = g_originalSkinnedPoseUpload(renderModel, renderContext);
+            result = CallOriginalSkinnedPoseUpload(renderModel, renderContext);
             memcpy(bytes + kSkinnedPoseUploadFlagsOffset, &savedUploadFlags,
                    sizeof(savedUploadFlags));
             memcpy(bytes + kSkinnedPosePendingOffset, &savedPending,
@@ -4462,7 +4503,32 @@ extern "C" std::uint64_t __fastcall HookSkinnedPoseUpload(
         }
         return result;
     }
-    return g_originalSkinnedPoseUpload(renderModel, renderContext);
+    return CallOriginalSkinnedPoseUpload(renderModel, renderContext);
+}
+
+extern "C" void __fastcall HookRenderModelGpuCopy(
+    void* state, void* renderContext, float parameter, void* drawSurface) {
+    if (!g_enableInterpolationAbProbe) {
+        HookRenderModelGpuCopyBody(state, renderContext, parameter, drawSurface);
+        return;
+    }
+    const std::uint64_t start = ReadPerformanceCounter();
+    HookRenderModelGpuCopyBody(state, renderContext, parameter, drawSurface);
+    g_abRenderModelHookTicks.fetch_add(ReadPerformanceCounter() - start,
+                                       std::memory_order_relaxed);
+}
+
+extern "C" std::uint64_t __fastcall HookSkinnedPoseUpload(
+    void* renderModel, void* renderContext) {
+    if (!g_enableInterpolationAbProbe) {
+        return HookSkinnedPoseUploadBody(renderModel, renderContext);
+    }
+    const std::uint64_t start = ReadPerformanceCounter();
+    const std::uint64_t result =
+        HookSkinnedPoseUploadBody(renderModel, renderContext);
+    g_abSkeletalHookTicks.fetch_add(ReadPerformanceCounter() - start,
+                                    std::memory_order_relaxed);
+    return result;
 }
 
 bool InitializeTelemetry() {
@@ -4798,6 +4864,14 @@ InterpolationAbCounterSnapshot CaptureInterpolationAbCounters() {
         g_skeletalDiagnostics.adjustedUploads.load(std::memory_order_relaxed);
     counters.forcedUploads =
         g_skeletalDiagnostics.forcedUploads.load(std::memory_order_relaxed);
+    counters.renderModelHookTicks =
+        g_abRenderModelHookTicks.load(std::memory_order_relaxed);
+    counters.renderModelOriginalTicks =
+        g_abRenderModelOriginalTicks.load(std::memory_order_relaxed);
+    counters.skeletalHookTicks =
+        g_abSkeletalHookTicks.load(std::memory_order_relaxed);
+    counters.skeletalOriginalTicks =
+        g_abSkeletalOriginalTicks.load(std::memory_order_relaxed);
     return counters;
 }
 
@@ -4823,6 +4897,49 @@ double InterpolationAbPercentile(double percentile) {
     }
     return (static_cast<double>(kAbProbeHistogramBinCount) - 0.5) *
            kAbProbeHistogramBinMilliseconds;
+}
+
+void LogInterpolationAbTiming(const InterpolationAbCounterSnapshot& current,
+                              double averageFrameMilliseconds) {
+    const InterpolationAbCounterSnapshot& start =
+        g_interpolationAbProbe.countersAtStart;
+    const double frames = static_cast<double>(
+        g_interpolationAbProbe.sampledFrames);
+    const double ticksPerMillisecond =
+        static_cast<double>(g_interpolationAbProbe.frequency.QuadPart) / 1000.0;
+    if (!(frames > 0.0) || !(ticksPerMillisecond > 0.0)) {
+        return;
+    }
+    const auto perFrame = [&](std::uint64_t now, std::uint64_t then) {
+        return static_cast<double>(CounterDelta(now, then)) /
+               ticksPerMillisecond / frames;
+    };
+    const double modelTotal =
+        perFrame(current.renderModelHookTicks, start.renderModelHookTicks);
+    const double modelEngine =
+        perFrame(current.renderModelOriginalTicks, start.renderModelOriginalTicks);
+    const double poseTotal =
+        perFrame(current.skeletalHookTicks, start.skeletalHookTicks);
+    const double poseEngine =
+        perFrame(current.skeletalOriginalTicks, start.skeletalOriginalTicks);
+    const double modelPlugin = std::max(0.0, modelTotal - modelEngine);
+    const double posePlugin = std::max(0.0, poseTotal - poseEngine);
+    const double pluginTotal = modelPlugin + posePlugin;
+    Log("A/B segment %llu hook CPU per sampled frame (all threads): "
+        "modelHook plugin=%.3fms engine=%.3fms calls=%.1f; poseHook "
+        "plugin=%.3fms engine=%.3fms calls=%.1f; plugin total=%.3fms "
+        "(%.1f%% of the %.3fms average frame).",
+        static_cast<unsigned long long>(g_interpolationAbProbe.segmentId),
+        modelPlugin, modelEngine,
+        static_cast<double>(CounterDelta(current.renderModelHookCalls,
+                                         start.renderModelHookCalls)) / frames,
+        posePlugin, poseEngine,
+        static_cast<double>(CounterDelta(current.skeletalHookCalls,
+                                         start.skeletalHookCalls)) / frames,
+        pluginTotal,
+        averageFrameMilliseconds > 0.0
+            ? 100.0 * pluginTotal / averageFrameMilliseconds : 0.0,
+        averageFrameMilliseconds);
 }
 
 void ReportInterpolationAbSegment(const char* reason) {
@@ -4918,6 +5035,7 @@ void ReportInterpolationAbSegment(const char* reason) {
         static_cast<unsigned long long>(CounterDelta(
             current.forcedUploads,
             g_interpolationAbProbe.countersAtStart.forcedUploads)));
+    LogInterpolationAbTiming(current, averageFrameMilliseconds);
 }
 
 void StartInterpolationAbSegment() {
