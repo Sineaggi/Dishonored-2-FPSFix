@@ -65,6 +65,25 @@ struct GameBuildLayout {
     // force ShadowTransforms off instead of failing the whole plugin.
     bool shadowCasterBuildSupported;
     std::array<HookSiteLayout, 2> shadowCasterBuild;
+    // Source-level transform layer (SourceLevelTransforms). Builds where the
+    // render-world flush and render-model MarkDirty/Commit have not been
+    // located leave this unsupported and the layer disables itself.
+    bool sourceLevelSupported;
+    // idRenderWorldLocal vtable; the flush slot commits every dirty render
+    // model (rebuilding +0x20/+0xA0) once per rendered frame.
+    VtableLayout renderWorldVtable;
+    std::size_t renderWorldFlushSlot;
+    std::uintptr_t renderWorldFlushRva;
+    // Shared idRenderModelStatic/arkSkinnedRenderModel MarkDirty (vtable
+    // +0x28) and Commit (vtable +0xC0).
+    std::size_t renderModelMarkDirtySlot;
+    std::uintptr_t renderModelMarkDirtyRva;
+    std::size_t renderModelCommitSlot;
+    std::uintptr_t renderModelCommitRva;
+    // Entry signatures checked before any vtable slot is replaced.
+    std::array<unsigned char, 16> renderWorldFlushBytes;
+    std::array<unsigned char, 16> renderModelMarkDirtyBytes;
+    std::array<unsigned char, 16> renderModelCommitBytes;
 };
 
 constexpr GameBuildLayout kGogLayout = {
@@ -150,6 +169,20 @@ constexpr GameBuildLayout kSteamLayout = {
     true,
     false,
     {},
+    true,
+    {0x1B08868, {0x238A50, 0x239790, 0x239120, 0x2396D0}},
+    0xD8,
+    0x239180,
+    0x28,
+    0x235880,
+    0xC0,
+    0x235680,
+    {0x40, 0x57, 0x48, 0x83, 0xEC, 0x50, 0x48, 0xC7,
+     0x44, 0x24, 0x20, 0xFE, 0xFF, 0xFF, 0xFF, 0x48},
+    {0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x6C,
+     0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x57},
+    {0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x6C,
+     0x24, 0x18, 0x48, 0x89, 0x74, 0x24, 0x20, 0x57},
 };
 
 constexpr std::array<const GameBuildLayout*, 2> kKnownLayouts = {
@@ -187,6 +220,18 @@ constexpr std::size_t kRenderModelMvpMatrixOffset = 0x1A0;
 constexpr std::size_t kRenderModelPreviousMvpMatrixOffset = 0x1E0;
 constexpr std::size_t kRenderModelDepthHackOffset = 0x18B8;
 constexpr std::size_t kRenderModelOwnerOffset = 0x1C50;
+constexpr std::size_t kRenderModelWorldOffset = 0x1BF8;
+constexpr std::size_t kRenderModelHandleOffset = 0x1C18;
+constexpr std::size_t kRenderWorldModelArrayOffset = 0x20538;
+constexpr std::uint32_t kRenderModelDirtyTransform = 0x01;
+constexpr std::size_t kSourceTrackCapacity = 8192;
+constexpr std::size_t kSourceTrackProbeLimit = 64;
+constexpr std::size_t kSourceDirtyCapacity = 32768;
+// Ticks a tracked model may go without a commit before its committed matrix is
+// restored and the track is dropped.
+constexpr std::uint32_t kSourceIdleTicksBeforeDrop = 3;
+// Presentation frames a track may go unseen by its world's flush.
+constexpr std::uint64_t kSourceStaleFrames = 600;
 
 constexpr std::size_t kShadowCasterEntryStride = 0x30;
 constexpr std::size_t kShadowCasterMatrixPointerOffset = 0x08;
@@ -266,6 +311,15 @@ bool g_interpolateCinematicSkeletons = false;
 bool g_enableAdaptiveInterpolation = false;
 bool g_enableTelemetry = false;
 bool g_enableInterpolationAbProbe = false;
+bool g_sourceLevelTransforms = false;
+bool g_sourceLevelWrites = false;
+bool g_sourceLevelInstalled = false;
+std::atomic<bool> g_sourceLevelRuntimeEnabled{true};
+std::atomic<std::uint64_t> g_abSourceFlushTicks{0};
+std::atomic<std::uint64_t> g_abSourceFlushOriginalTicks{0};
+std::atomic<std::uint64_t> g_abSourceWrites{0};
+bool SourceLevelWritesSelected();
+void ObserveSourceLevelRendererCall();
 std::atomic<bool> g_adaptiveInterpolationManualOverride{false};
 std::atomic<int> g_unlockState{0};
 // 0 = not resolved yet, 1 = engine limiter in use, 2 = unavailable.
@@ -671,6 +725,9 @@ struct InterpolationAbCounterSnapshot {
     std::uint64_t renderModelOriginalTicks = 0;
     std::uint64_t skeletalHookTicks = 0;
     std::uint64_t skeletalOriginalTicks = 0;
+    std::uint64_t sourceFlushTicks = 0;
+    std::uint64_t sourceFlushOriginalTicks = 0;
+    std::uint64_t sourceWrites = 0;
 };
 
 struct InterpolationAbProbeState {
@@ -680,6 +737,7 @@ struct InterpolationAbProbeState {
     bool transformInterpolationEnabled = true;
     bool skeletalInterpolationEnabled = true;
     bool firstPersonHandsEnabled = true;
+    bool sourceLevelTransforms = false;
     std::uint64_t segmentId = 0;
     std::uint64_t startPresentationSerial = 0;
     std::uint64_t sampleStartPresentationSerial = 0;
@@ -808,6 +866,10 @@ void LoadConfiguration() {
         L"Interpolation", L"CinematicSkeletons", 0, path) != 0;
     g_enableAdaptiveInterpolation = GetPrivateProfileIntW(
         L"Interpolation", L"AdaptivePerformanceGate", 1, path) != 0;
+    g_sourceLevelTransforms = GetPrivateProfileIntW(
+        L"Interpolation", L"SourceLevelTransforms", 0, path) != 0;
+    g_sourceLevelWrites = g_sourceLevelTransforms &&
+        GetPrivateProfileIntW(L"Interpolation", L"SourceLevelWrites", 0, path) != 0;
     g_enableTelemetry = GetPrivateProfileIntW(
         L"Diagnostics", L"Telemetry", 0, path) != 0;
     g_enableInterpolationAbProbe = GetPrivateProfileIntW(
@@ -830,12 +892,18 @@ void LoadConfiguration() {
         g_enableAdaptiveInterpolation ? 1U : 0U,
         g_enableTelemetry ? 1U : 0U,
         g_enableInterpolationAbProbe ? 1U : 0U);
+    Log("Configuration: SourceLevelTransforms=%u, SourceLevelWrites=%u.",
+        g_sourceLevelTransforms ? 1U : 0U, g_sourceLevelWrites ? 1U : 0U);
     if (g_enableInterpolationAbProbe) {
         Log("A/B controls: Ctrl+F11 starts/stops a clean measurement segment; "
             "F11 toggles all configured interpolation; Alt+F11 cycles all, "
             "transforms-only, skeletons-only, and off; Shift+F11 toggles only "
             "first-person root stabilization. Camera prediction, mouse "
             "stabilization, and the FPS unlock remain unchanged.");
+        if (g_sourceLevelWrites) {
+            Log("A/B control: Ctrl+Shift+F11 switches world transforms between "
+                "the source-level (render-world flush) and per-draw methods.");
+        }
         if (g_enableAdaptiveInterpolation) {
             Log("Adaptive interpolation is suspended while "
                 "InterpolationABProbe=1 so benchmark profiles remain fixed.");
@@ -1067,6 +1135,58 @@ bool ValidateViewCopyCallRelationship(const ExecutableImageLayout& image) {
     return true;
 }
 
+bool ValidateVtableSlot(const ExecutableImageLayout& image,
+                        std::uintptr_t vtableRva, std::size_t slotOffset,
+                        std::uintptr_t expectedTarget,
+                        const std::array<unsigned char, 16>& expectedBytes,
+                        const char* description) {
+    if (!ValidateImageRange(image, vtableRva + slotOffset, sizeof(std::uintptr_t),
+                            IMAGE_SCN_MEM_READ,
+                            IMAGE_SCN_MEM_WRITE | IMAGE_SCN_MEM_EXECUTE,
+                            description)) {
+        return false;
+    }
+    std::uintptr_t entry = 0;
+    memcpy(&entry, reinterpret_cast<const void*>(g_executableBase + vtableRva + slotOffset),
+           sizeof(entry));
+    if (entry != g_executableBase + expectedTarget ||
+        !ValidateCodeRange(image, expectedTarget, expectedBytes.size(), description) ||
+        memcmp(reinterpret_cast<const void*>(g_executableBase + expectedTarget),
+               expectedBytes.data(), expectedBytes.size()) != 0) {
+        Log("Executable call relationship check failed for %s (vtable RVA 0x%llX "
+            "slot 0x%llX); patch not installed.", description,
+            static_cast<unsigned long long>(vtableRva),
+            static_cast<unsigned long long>(slotOffset));
+        return false;
+    }
+    return true;
+}
+
+bool ValidateSourceLevelLayout(const ExecutableImageLayout& image) {
+    const GameBuildLayout& layout = *g_layout;
+    if (!ValidateVtable(image, layout.renderWorldVtable, "render-world vtable") ||
+        !ValidateVtableSlot(image, layout.renderWorldVtable.rva,
+                            layout.renderWorldFlushSlot, layout.renderWorldFlushRva,
+                            layout.renderWorldFlushBytes, "render-world flush slot")) {
+        return false;
+    }
+    for (const VtableLayout* vtable : {&layout.renderModelStaticVtable,
+                                       &layout.skinnedModelVtable}) {
+        if (!ValidateVtable(image, *vtable, "render-model vtable") ||
+            !ValidateVtableSlot(image, vtable->rva, layout.renderModelMarkDirtySlot,
+                                layout.renderModelMarkDirtyRva,
+                                layout.renderModelMarkDirtyBytes,
+                                "render-model MarkDirty slot") ||
+            !ValidateVtableSlot(image, vtable->rva, layout.renderModelCommitSlot,
+                                layout.renderModelCommitRva,
+                                layout.renderModelCommitBytes,
+                                "render-model Commit slot")) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool ValidateHookSignatures(const ExecutableImageLayout& image) {
     const bool rendererModelFeatures =
         g_stabilizeFirstPersonHands || g_interpolateWorldTransforms ||
@@ -1107,6 +1227,13 @@ bool ValidateHookSignatures(const ExecutableImageLayout& image) {
                 return false;
             }
         }
+    }
+
+    if (g_sourceLevelTransforms && g_layout->sourceLevelSupported &&
+        !ValidateSourceLevelLayout(image)) {
+        Log("Source-level transform layout/signature validation failed; "
+            "patch not installed.");
+        return false;
     }
     return true;
 }
@@ -1202,6 +1329,13 @@ bool VerifyExecutableLayout() {
         g_interpolateShadowTransforms = false;
         Log("ShadowTransforms is not yet supported on the %s executable; "
             "shadow-transform interpolation was disabled.", selected->name);
+    }
+    if (g_sourceLevelTransforms && !selected->sourceLevelSupported) {
+        g_sourceLevelTransforms = false;
+        g_sourceLevelWrites = false;
+        Log("SourceLevelTransforms is not supported on the %s executable; the "
+            "source-level layer was disabled and the per-draw path is used.",
+            selected->name);
     }
 
     Log("Executable passed strict runtime layout validation as %s; all enabled "
@@ -4296,10 +4430,16 @@ void HookRenderModelGpuCopyBody(
     if (g_enableInterpolationAbProbe) {
         g_abRenderModelHookCalls.fetch_add(1, std::memory_order_relaxed);
     }
+    if (g_sourceLevelInstalled) {
+        ObserveSourceLevelRendererCall();
+    }
     const bool firstPersonHandsEnabled = RuntimeFirstPersonHandsEnabled();
+    // The source-level layer already wrote presentation matrices into the
+    // render models; the per-draw world path would treat them as raw input.
     const bool transformInterpolationEnabled =
         RuntimeTransformInterpolationEnabled() &&
-        (g_interpolateWorldTransforms || g_interpolateCinematicTransforms);
+        (g_interpolateWorldTransforms || g_interpolateCinematicTransforms) &&
+        !SourceLevelWritesSelected();
     if ((!firstPersonHandsEnabled && !transformInterpolationEnabled) ||
         g_renderModelGpuCopyTrampoline == nullptr ||
         !IsReadableMemory(drawSurface, 16)) {
@@ -4872,6 +5012,11 @@ InterpolationAbCounterSnapshot CaptureInterpolationAbCounters() {
         g_abSkeletalHookTicks.load(std::memory_order_relaxed);
     counters.skeletalOriginalTicks =
         g_abSkeletalOriginalTicks.load(std::memory_order_relaxed);
+    counters.sourceFlushTicks =
+        g_abSourceFlushTicks.load(std::memory_order_relaxed);
+    counters.sourceFlushOriginalTicks =
+        g_abSourceFlushOriginalTicks.load(std::memory_order_relaxed);
+    counters.sourceWrites = g_abSourceWrites.load(std::memory_order_relaxed);
     return counters;
 }
 
@@ -4922,12 +5067,18 @@ void LogInterpolationAbTiming(const InterpolationAbCounterSnapshot& current,
         perFrame(current.skeletalHookTicks, start.skeletalHookTicks);
     const double poseEngine =
         perFrame(current.skeletalOriginalTicks, start.skeletalOriginalTicks);
+    const double flushTotal =
+        perFrame(current.sourceFlushTicks, start.sourceFlushTicks);
+    const double flushEngine =
+        perFrame(current.sourceFlushOriginalTicks, start.sourceFlushOriginalTicks);
     const double modelPlugin = std::max(0.0, modelTotal - modelEngine);
     const double posePlugin = std::max(0.0, poseTotal - poseEngine);
-    const double pluginTotal = modelPlugin + posePlugin;
+    const double flushPlugin = std::max(0.0, flushTotal - flushEngine);
+    const double pluginTotal = modelPlugin + posePlugin + flushPlugin;
     Log("A/B segment %llu hook CPU per sampled frame (all threads): "
         "modelHook plugin=%.3fms engine=%.3fms calls=%.1f; poseHook "
-        "plugin=%.3fms engine=%.3fms calls=%.1f; plugin total=%.3fms "
+        "plugin=%.3fms engine=%.3fms calls=%.1f; sourceFlush plugin=%.3fms "
+        "engine=%.3fms writes=%.1f; plugin total=%.3fms "
         "(%.1f%% of the %.3fms average frame).",
         static_cast<unsigned long long>(g_interpolationAbProbe.segmentId),
         modelPlugin, modelEngine,
@@ -4936,6 +5087,9 @@ void LogInterpolationAbTiming(const InterpolationAbCounterSnapshot& current,
         posePlugin, poseEngine,
         static_cast<double>(CounterDelta(current.skeletalHookCalls,
                                          start.skeletalHookCalls)) / frames,
+        flushPlugin, flushEngine,
+        static_cast<double>(CounterDelta(current.sourceWrites,
+                                         start.sourceWrites)) / frames,
         pluginTotal,
         averageFrameMilliseconds > 0.0
             ? 100.0 * pluginTotal / averageFrameMilliseconds : 0.0,
@@ -4951,11 +5105,12 @@ void ReportInterpolationAbSegment(const char* reason) {
         CaptureInterpolationAbCounters();
     if (g_interpolationAbProbe.sampledFrames == 0 ||
         !(g_interpolationAbProbe.sampledSeconds > 0.0)) {
-        Log("A/B segment %llu ended (%s): transforms=%s skeletons=%s hands=%s, "
+        Log("A/B segment %llu ended (%s): transforms=%s(%s) skeletons=%s hands=%s, "
             "serial=%llu..%llu; no post-warm-up samples were captured.",
             static_cast<unsigned long long>(g_interpolationAbProbe.segmentId),
             reason,
             g_interpolationAbProbe.transformInterpolationEnabled ? "on" : "off",
+            g_interpolationAbProbe.sourceLevelTransforms ? "source" : "per-draw",
             g_interpolationAbProbe.skeletalInterpolationEnabled ? "on" : "off",
             g_interpolationAbProbe.firstPersonHandsEnabled ? "on" : "off",
             static_cast<unsigned long long>(
@@ -4978,7 +5133,7 @@ void ReportInterpolationAbSegment(const char* reason) {
                   g_interpolationAbProbe.simulationTicks
             : std::numeric_limits<double>::quiet_NaN();
 
-    Log("A/B segment %llu ended (%s): transforms=%s skeletons=%s hands=%s, "
+    Log("A/B segment %llu ended (%s): transforms=%s(%s) skeletons=%s hands=%s, "
         "serial=%llu..%llu, warmup=%.1fs/%llu frames, sample=%.3fs/%llu "
         "frames; avg=%.3fms %.2fFPS, p50=%.3fms p95=%.3fms p99=%.3fms "
         "min=%.3fms max=%.3fms; cadence=%.2fFPS ticks[zero=%llu one=%llu "
@@ -4988,6 +5143,7 @@ void ReportInterpolationAbSegment(const char* reason) {
         static_cast<unsigned long long>(g_interpolationAbProbe.segmentId),
         reason,
         g_interpolationAbProbe.transformInterpolationEnabled ? "on" : "off",
+        g_interpolationAbProbe.sourceLevelTransforms ? "source" : "per-draw",
         g_interpolationAbProbe.skeletalInterpolationEnabled ? "on" : "off",
         g_interpolationAbProbe.firstPersonHandsEnabled ? "on" : "off",
         static_cast<unsigned long long>(
@@ -5053,15 +5209,17 @@ void StartInterpolationAbSegment() {
         RuntimeSkeletalInterpolationEnabled();
     g_interpolationAbProbe.firstPersonHandsEnabled =
         RuntimeFirstPersonHandsEnabled();
+    g_interpolationAbProbe.sourceLevelTransforms = SourceLevelWritesSelected();
     g_interpolationAbProbe.segmentId = g_nextInterpolationAbSegmentId++;
     g_interpolationAbProbe.startPresentationSerial =
         g_presentationSerial.load(std::memory_order_acquire);
     g_interpolationAbProbe.lastPresentationSerial =
         g_interpolationAbProbe.startPresentationSerial;
-    Log("A/B segment %llu started: transforms=%s skeletons=%s hands=%s at "
+    Log("A/B segment %llu started: transforms=%s(%s) skeletons=%s hands=%s at "
         "presentation serial %llu; first %.1f seconds are warm-up.",
         static_cast<unsigned long long>(g_interpolationAbProbe.segmentId),
         g_interpolationAbProbe.transformInterpolationEnabled ? "on" : "off",
+        g_interpolationAbProbe.sourceLevelTransforms ? "source" : "per-draw",
         g_interpolationAbProbe.skeletalInterpolationEnabled ? "on" : "off",
         g_interpolationAbProbe.firstPersonHandsEnabled ? "on" : "off",
         static_cast<unsigned long long>(
@@ -5166,7 +5324,27 @@ void HandleInterpolationAbControls() {
             (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
         const bool shiftIsDown =
             (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
-        if (controlIsDown) {
+        if (controlIsDown && shiftIsDown) {
+            if (!g_sourceLevelInstalled || !g_sourceLevelWrites) {
+                Log("Ctrl+Shift+F11: the source-level transform method is not "
+                    "available (requires SourceLevelTransforms=1 and "
+                    "SourceLevelWrites=1 on a supported executable).");
+            } else {
+                const bool wasCapturing = g_interpolationAbProbe.capturing;
+                if (wasCapturing) {
+                    StopInterpolationAbSegment("Ctrl+Shift+F11 method change");
+                }
+                const bool nowSource = !g_sourceLevelRuntimeEnabled.load(
+                    std::memory_order_relaxed);
+                g_sourceLevelRuntimeEnabled.store(nowSource,
+                                                  std::memory_order_relaxed);
+                Log("Ctrl+Shift+F11: world-transform method is now %s.",
+                    nowSource ? "source-level (render-world flush)" : "per-draw");
+                if (wasCapturing) {
+                    StartInterpolationAbSegment();
+                }
+            }
+        } else if (controlIsDown) {
             if (!g_enableInterpolationAbProbe) {
                 Log("Ctrl+F11: A/B measurement is unavailable because "
                     "Diagnostics/InterpolationABProbe is disabled.");
@@ -5555,6 +5733,830 @@ void WriteAbsoluteIndirectJump(unsigned char* destination, const void* target) {
     memcpy(destination + 6, &address, sizeof(address));
 }
 
+// ---------------------------------------------------------------------------
+// Source-level world-transform layer (SourceLevelTransforms).
+//
+// The game thread writes each entity's origin/axis/scale into its render model
+// and calls MarkDirty (render-model vtable +0x28) once per 120 Hz tick. Once
+// per rendered frame the render-world flush (idRenderWorldLocal vtable +0xD8)
+// runs Commit for every dirty model, rebuilding the world matrix at +0x20 and
+// its inverse at +0xA0. The per-view cull job then copies +0x20 into the
+// previous-matrix slot +0x60 and builds the view/MVP matrices from it.
+//
+// Phase A (SourceLevelWrites=0) only observes MarkDirty and the flush. Phase B
+// (SourceLevelWrites=1) samples each committed matrix after the flush returns
+// and, before any view job runs, overwrites +0x20/+0xA0 with the presentation
+// blend. The cull job then derives +0x60 and the MVP from it, so no per-draw
+// correction is needed. Entity transforms, origin/axis/scale fields, and the
+// bounds that gameplay reads back are never modified.
+// ---------------------------------------------------------------------------
+
+using RenderWorldFlushFn = void(__fastcall*)(void*, std::uintptr_t);
+using RenderModelMarkDirtyFn = void(__fastcall*)(void*, std::uintptr_t);
+RenderWorldFlushFn g_originalRenderWorldFlush = nullptr;
+RenderModelMarkDirtyFn g_originalRenderModelMarkDirty = nullptr;
+
+struct SourceLevelDiagnostics {
+    std::atomic<std::uint64_t> markDirtyCalls{0};
+    std::atomic<std::uint64_t> markDirtyTransform{0};
+    std::atomic<std::uint64_t> markDirtyOffFlushThread{0};
+    std::atomic<std::uint64_t> dirtyOverflows{0};
+    std::atomic<std::uint64_t> rendererFirstAfterFlush{0};
+    std::atomic<std::uint64_t> rendererFirstBeforeFlush{0};
+    std::atomic<std::uint64_t> rendererCallsDuringFlush{0};
+};
+
+// Counters only touched by the flush thread.
+struct SourceLevelCounters {
+    std::uint64_t flushCalls = 0;
+    std::uint64_t flushesWithTick = 0;
+    std::uint64_t uniqueDirty = 0;
+    std::uint64_t foreignWorldDirty = 0;
+    std::uint64_t flushEngineTicks = 0;
+    std::uint64_t flushPluginTicks = 0;
+    std::uint64_t tracksCreated = 0;
+    std::uint64_t samples = 0;
+    std::uint64_t holds = 0;
+    std::uint64_t writes = 0;
+    std::uint64_t restores = 0;
+    std::uint64_t drops = 0;
+    std::uint64_t deadTracks = 0;
+    std::uint64_t staleTracks = 0;
+    std::uint64_t ineligible = 0;
+    std::uint64_t capacityMisses = 0;
+    std::uint64_t jumpSnaps = 0;
+    std::uint64_t intervalSnaps = 0;
+    std::uint64_t sameTimeSnaps = 0;
+    std::uint64_t timeResets = 0;
+    std::uint64_t nonRigid = 0;
+    std::uint64_t activeTracks = 0;
+};
+
+SourceLevelDiagnostics g_sourceDiagnostics;
+SourceLevelCounters g_sourceCounters;
+
+struct SourceLevelDiagnosticsSnapshot {
+    std::uint64_t serial = 0;
+    std::uint64_t markDirtyCalls = 0;
+    std::uint64_t markDirtyTransform = 0;
+    std::uint64_t markDirtyOffFlushThread = 0;
+    std::uint64_t dirtyOverflows = 0;
+    std::uint64_t rendererFirstAfterFlush = 0;
+    std::uint64_t rendererFirstBeforeFlush = 0;
+    std::uint64_t rendererCallsDuringFlush = 0;
+    SourceLevelCounters plain{};
+};
+
+std::atomic<DWORD> g_sourceFlushThreadId{0};
+std::atomic<DWORD> g_sourceRendererThreadId{0};
+std::atomic<std::uint64_t> g_sourceLastFlushSerial{0};
+std::atomic<std::uint64_t> g_sourceLastRendererSerial{0};
+std::atomic<bool> g_sourceFlushInProgress{false};
+double g_sourceLastFlushSimulationTime = std::numeric_limits<double>::quiet_NaN();
+std::uint64_t g_sourceLastLogCounter = 0;
+SourceLevelDiagnosticsSnapshot g_sourceLastLogSnapshot{};
+bool g_sourceHasLogSnapshot = false;
+
+SRWLOCK g_sourceDirtyLock = SRWLOCK_INIT;
+std::vector<void*> g_sourceDirty;
+std::vector<void*> g_sourceDirtyScratch;
+std::vector<void*> g_sourceDirtyDeferred;
+bool g_sourceDirtyOverflowed = false;
+
+struct SourceTrack {
+    void* model = nullptr;
+    void* world = nullptr;
+    const void* owner = nullptr;
+    const void* modelAsset = nullptr;
+    std::uintptr_t vtable = 0;
+    std::uint16_t handle = 0;
+    double previousTime = 0.0;
+    double currentTime = 0.0;
+    Matrix4 previous{};
+    Matrix4 current{};
+    Matrix4 currentInverse{};
+    // What the model's +0x20 holds unless the engine committed it again.
+    Matrix4 expected{};
+    std::uint64_t lastFlushSerial = 0;
+    std::uint32_t idleTicks = 0;
+    bool hasPair = false;
+    bool dirty = false;
+    bool fresh = false;
+};
+
+std::array<SourceTrack, kSourceTrackCapacity> g_sourceTracks{};
+
+bool SourceLevelWritesSelected() {
+    return g_sourceLevelInstalled && g_sourceLevelWrites &&
+           g_sourceLevelRuntimeEnabled.load(std::memory_order_relaxed);
+}
+
+bool SourceLevelWritesActive() {
+    return SourceLevelWritesSelected() && RuntimeTransformInterpolationEnabled() &&
+           (g_interpolateWorldTransforms || g_interpolateCinematicTransforms);
+}
+
+void ObserveSourceLevelRendererCall() {
+    if (g_sourceFlushInProgress.load(std::memory_order_acquire)) {
+        g_sourceDiagnostics.rendererCallsDuringFlush.fetch_add(
+            1, std::memory_order_relaxed);
+    }
+    const std::uint64_t serial = g_presentationSerial.load(std::memory_order_acquire);
+    std::uint64_t last = g_sourceLastRendererSerial.load(std::memory_order_relaxed);
+    if (serial == last ||
+        !g_sourceLastRendererSerial.compare_exchange_strong(
+            last, serial, std::memory_order_relaxed)) {
+        return;
+    }
+    g_sourceRendererThreadId.store(GetCurrentThreadId(), std::memory_order_relaxed);
+    if (g_sourceLastFlushSerial.load(std::memory_order_acquire) == serial) {
+        g_sourceDiagnostics.rendererFirstAfterFlush.fetch_add(
+            1, std::memory_order_relaxed);
+    } else {
+        g_sourceDiagnostics.rendererFirstBeforeFlush.fetch_add(
+            1, std::memory_order_relaxed);
+    }
+}
+
+std::size_t SourceTrackHash(const void* model) {
+    std::uintptr_t value = reinterpret_cast<std::uintptr_t>(model) >> 4;
+    value ^= value >> 17;
+    value *= static_cast<std::uintptr_t>(0x9E3779B97F4A7C15ULL);
+    return static_cast<std::size_t>(value >> 7) & (kSourceTrackCapacity - 1);
+}
+
+SourceTrack* FindSourceTrack(const void* model) {
+    const std::size_t base = SourceTrackHash(model);
+    for (std::size_t probe = 0; probe < kSourceTrackProbeLimit; ++probe) {
+        SourceTrack& track = g_sourceTracks[(base + probe) & (kSourceTrackCapacity - 1)];
+        if (track.model == model) {
+            return &track;
+        }
+    }
+    return nullptr;
+}
+
+SourceTrack* CreateSourceTrack(void* model) {
+    const std::size_t base = SourceTrackHash(model);
+    for (std::size_t probe = 0; probe < kSourceTrackProbeLimit; ++probe) {
+        SourceTrack& track = g_sourceTracks[(base + probe) & (kSourceTrackCapacity - 1)];
+        if (track.model == nullptr) {
+            track = {};
+            track.model = model;
+            return &track;
+        }
+    }
+    return nullptr;
+}
+
+// Resolves the world's model-pointer array once per flush. A model is alive
+// and owned by this world exactly when array[handle] still points at it.
+struct SourceWorldView {
+    void* world = nullptr;
+    void* const* models = nullptr;
+    std::uintptr_t readableEnd = 0;
+};
+
+bool SourceModelRegistered(const SourceWorldView& view, const void* model,
+                           std::uint16_t handle) {
+    if (view.models == nullptr) {
+        return false;
+    }
+    const std::uintptr_t slot = reinterpret_cast<std::uintptr_t>(view.models + handle);
+    return slot + sizeof(void*) <= view.readableEnd && view.models[handle] == model;
+}
+
+void WriteSourceMatrices(SourceTrack& track, const Matrix4& matrix,
+                         const Matrix4& inverse) {
+    auto* bytes = static_cast<unsigned char*>(track.model);
+    WriteMatrix(bytes, kRenderModelMatrixOffset, matrix);
+    WriteMatrix(bytes, kRenderModelInverseMatrixOffset, inverse);
+    track.expected = matrix;
+}
+
+bool MatricesBitwiseEqual(const Matrix4& left, const Matrix4& right) {
+    return memcmp(&left, &right, sizeof(left)) == 0;
+}
+
+// Restores the engine's committed matrices for every track of `world` and
+// forgets them. Used when the layer is switched off at runtime or the
+// presentation context is unavailable.
+void RestoreSourceTracks(const SourceWorldView& view) {
+    for (SourceTrack& track : g_sourceTracks) {
+        if (track.model == nullptr || track.world != view.world) {
+            continue;
+        }
+        if (SourceModelRegistered(view, track.model, track.handle) &&
+            !track.fresh) {
+            const Matrix4 raw = ReadMatrix(static_cast<const unsigned char*>(track.model),
+                                           kRenderModelMatrixOffset);
+            if (MatricesBitwiseEqual(raw, track.expected) &&
+                !MatricesBitwiseEqual(raw, track.current)) {
+                WriteSourceMatrices(track, track.current, track.currentInverse);
+                ++g_sourceCounters.restores;
+            }
+        }
+        track = {};
+        ++g_sourceCounters.drops;
+    }
+}
+
+void CollectSourceDirtyModels(void* world, std::vector<void*>& output, bool& overflowed) {
+    AcquireSRWLockExclusive(&g_sourceDirtyLock);
+    output.swap(g_sourceDirty);
+    overflowed = g_sourceDirtyOverflowed;
+    g_sourceDirtyOverflowed = false;
+    ReleaseSRWLockExclusive(&g_sourceDirtyLock);
+
+    std::sort(output.begin(), output.end());
+    output.erase(std::unique(output.begin(), output.end()), output.end());
+    // Models of another world wait for that world's flush.
+    g_sourceDirtyDeferred.clear();
+    std::size_t kept = 0;
+    for (void* model : output) {
+        void* modelWorld = nullptr;
+        memcpy(&modelWorld, static_cast<unsigned char*>(model) + kRenderModelWorldOffset,
+               sizeof(modelWorld));
+        if (modelWorld == world) {
+            output[kept++] = model;
+        } else if (modelWorld != nullptr) {
+            g_sourceDirtyDeferred.push_back(model);
+        }
+    }
+    output.resize(kept);
+    g_sourceCounters.foreignWorldDirty += g_sourceDirtyDeferred.size();
+    if (!g_sourceDirtyDeferred.empty()) {
+        AcquireSRWLockExclusive(&g_sourceDirtyLock);
+        for (void* model : g_sourceDirtyDeferred) {
+            if (g_sourceDirty.size() < kSourceDirtyCapacity) {
+                g_sourceDirty.push_back(model);
+            }
+        }
+        ReleaseSRWLockExclusive(&g_sourceDirtyLock);
+    }
+}
+
+bool ResolveSourceWorldView(void* world, SourceWorldView& view) {
+    view.world = world;
+    view.models = nullptr;
+    void* const* models = nullptr;
+    if (!IsReadableMemory(static_cast<unsigned char*>(world) + kRenderWorldModelArrayOffset,
+                          sizeof(models))) {
+        return false;
+    }
+    memcpy(&models, static_cast<unsigned char*>(world) + kRenderWorldModelArrayOffset,
+           sizeof(models));
+    MEMORY_BASIC_INFORMATION information{};
+    if (!IsReadableMemory(models, sizeof(void*)) ||
+        VirtualQuery(models, &information, sizeof(information)) == 0) {
+        return false;
+    }
+    // Handles are 16-bit; each lookup stays inside this readable region.
+    view.models = models;
+    view.readableEnd = reinterpret_cast<std::uintptr_t>(information.BaseAddress) +
+                       information.RegionSize;
+    return true;
+}
+
+void RegisterSourceDirtyModels(const SourceWorldView& view,
+                               const std::vector<void*>& dirty) {
+    for (void* model : dirty) {
+        SourceTrack* track = FindSourceTrack(model);
+        if (track != nullptr) {
+            track->dirty = true;
+            continue;
+        }
+        if (!IsReadableMemory(model, kRenderModelSize)) {
+            continue;
+        }
+        std::uint16_t handle = 0;
+        memcpy(&handle, static_cast<unsigned char*>(model) + kRenderModelHandleOffset,
+               sizeof(handle));
+        if (!SourceModelRegistered(view, model, handle)) {
+            ++g_sourceCounters.ineligible;
+            continue;
+        }
+        const void* owner = nullptr;
+        const void* modelAsset = nullptr;
+        std::uintptr_t vtable = 0;
+        bool cinematic = false;
+        if (!IsEligibleWorldRenderModel(model, owner, vtable, modelAsset, cinematic)) {
+            ++g_sourceCounters.ineligible;
+            continue;
+        }
+        track = CreateSourceTrack(model);
+        if (track == nullptr) {
+            ++g_sourceCounters.capacityMisses;
+            continue;
+        }
+        track->world = view.world;
+        track->handle = handle;
+        track->vtable = vtable;
+        track->owner = owner;
+        track->modelAsset = modelAsset;
+        track->fresh = true;
+        track->dirty = true;
+        ++g_sourceCounters.tracksCreated;
+    }
+}
+
+// Returns false when the pair must not be blended (interval, rigidity, jump).
+bool SourcePairBlendable(const SourceTrack& track) {
+    const double interval = track.currentTime - track.previousTime;
+    if (!(interval > kTimeEpsilon) || interval > kMaximumWorldStateInterval) {
+        ++g_sourceCounters.intervalSnaps;
+        return false;
+    }
+    Transform previousTransform{};
+    Transform currentTransform{};
+    double previousScale = 1.0;
+    double currentScale = 1.0;
+    bool previousReflected = false;
+    bool currentReflected = false;
+    if (!ReadWorldTransform(track.previous, previousTransform, previousScale,
+                            previousReflected) ||
+        !ReadWorldTransform(track.current, currentTransform, currentScale,
+                            currentReflected) ||
+        previousReflected != currentReflected) {
+        ++g_sourceCounters.nonRigid;
+        return false;
+    }
+    if (PositionDistance(previousTransform, currentTransform) > kMaximumWorldPositionJump ||
+        RotationDistanceDegrees(previousTransform, currentTransform) >
+            kMaximumWorldRotationJumpDegrees ||
+        currentScale / previousScale > 1.10 || previousScale / currentScale > 1.10) {
+        ++g_sourceCounters.jumpSnaps;
+        return false;
+    }
+    return true;
+}
+
+void UpdateSourceTrack(SourceTrack& track, const PresentationContext& context,
+                       std::uint64_t& writes) {
+    auto* bytes = static_cast<unsigned char*>(track.model);
+    const Matrix4 raw = ReadMatrix(bytes, kRenderModelMatrixOffset);
+    const bool committed = track.dirty || track.fresh ||
+                           !MatricesBitwiseEqual(raw, track.expected);
+    track.dirty = false;
+    track.lastFlushSerial = context.serial;
+
+    if (track.fresh) {
+        track.fresh = false;
+        track.previous = raw;
+        track.current = raw;
+        track.currentInverse = ReadMatrix(bytes, kRenderModelInverseMatrixOffset);
+        track.expected = raw;
+        track.previousTime = context.simulationTime;
+        track.currentTime = context.simulationTime;
+        track.hasPair = false;
+        track.idleTicks = 0;
+        return;
+    }
+
+    if (context.simulationTime < track.currentTime - kTimeEpsilon) {
+        // Time went backwards (load or restart): start over from what the
+        // model holds now.
+        if (committed) {
+            track.current = raw;
+            track.currentInverse = ReadMatrix(bytes, kRenderModelInverseMatrixOffset);
+        }
+        track.previous = track.current;
+        track.previousTime = context.simulationTime;
+        track.currentTime = context.simulationTime;
+        track.hasPair = false;
+        ++g_sourceCounters.timeResets;
+    } else if (context.simulationTime > track.currentTime + kTimeEpsilon) {
+        track.previous = track.current;
+        track.previousTime = track.currentTime;
+        if (committed) {
+            track.current = raw;
+            track.currentInverse = ReadMatrix(bytes, kRenderModelInverseMatrixOffset);
+            track.idleTicks = 0;
+            ++g_sourceCounters.samples;
+        } else {
+            // Not committed this tick: the entity's committed state is still
+            // the last committed matrix.
+            ++track.idleTicks;
+            ++g_sourceCounters.holds;
+        }
+        track.currentTime = context.simulationTime;
+        track.hasPair = true;
+    } else if (committed && !MatricesBitwiseEqual(raw, track.current)) {
+        // A second commit for the same simulation time is a discontinuity.
+        track.current = raw;
+        track.currentInverse = ReadMatrix(bytes, kRenderModelInverseMatrixOffset);
+        track.previous = raw;
+        track.hasPair = false;
+        track.idleTicks = 0;
+        ++g_sourceCounters.sameTimeSnaps;
+    }
+    if (committed) {
+        track.expected = raw;
+    }
+
+    Matrix4 output = track.current;
+    Matrix4 outputInverse = track.currentInverse;
+    bool blended = false;
+    if (track.hasPair) {
+        if (!SourcePairBlendable(track)) {
+            track.hasPair = false;
+        } else {
+            const double interval = track.currentTime - track.previousTime;
+            const double targetTime = Clamp(context.scaledTime, track.previousTime,
+                                            track.currentTime + kNativeSimulationStep);
+            const double alpha = (targetTime - track.previousTime) / interval;
+            Matrix4 target{};
+            Matrix4 targetInverse{};
+            if (InterpolateWorldMatrices(track.previous, track.current, alpha, target) &&
+                InvertAffineTransform(target, targetInverse) &&
+                WorldMatricesDiffer(target, track.current)) {
+                output = target;
+                outputInverse = targetInverse;
+                blended = true;
+            }
+        }
+    }
+
+    // The model currently holds `raw`. Write only when the presentation
+    // matrix differs from it.
+    if (!MatricesBitwiseEqual(raw, output)) {
+        WriteSourceMatrices(track, output, outputInverse);
+        ++writes;
+        if (blended) {
+            ++g_sourceCounters.writes;
+        } else {
+            ++g_sourceCounters.restores;
+        }
+    }
+
+    if (!blended && track.idleTicks >= kSourceIdleTicksBeforeDrop) {
+        // The model holds its committed matrix; nothing remains to restore.
+        track = {};
+        ++g_sourceCounters.drops;
+    }
+}
+
+void ProcessSourceLevelTracks(void* world, const PresentationContext& context,
+                              bool hasContext, const std::vector<void*>& dirty) {
+    SourceWorldView view{};
+    const bool viewValid = ResolveSourceWorldView(world, view);
+    if (!viewValid) {
+        // Without the model array nothing can be validated; forget this
+        // world's tracks without touching their models.
+        for (SourceTrack& track : g_sourceTracks) {
+            if (track.model != nullptr && track.world == world) {
+                track = {};
+                ++g_sourceCounters.deadTracks;
+            }
+        }
+        return;
+    }
+    if (!hasContext || !SourceLevelWritesActive()) {
+        RestoreSourceTracks(view);
+        return;
+    }
+
+    RegisterSourceDirtyModels(view, dirty);
+    std::uint64_t writes = 0;
+    std::uint64_t active = 0;
+    for (SourceTrack& track : g_sourceTracks) {
+        if (track.model == nullptr) {
+            continue;
+        }
+        if (track.world != world) {
+            if (track.lastFlushSerial != 0 &&
+                track.lastFlushSerial + kSourceStaleFrames < context.serial) {
+                track = {};
+                ++g_sourceCounters.staleTracks;
+            }
+            continue;
+        }
+        std::uintptr_t vtable = 0;
+        if (!SourceModelRegistered(view, track.model, track.handle) ||
+            (memcpy(&vtable, track.model, sizeof(vtable)), vtable != track.vtable)) {
+            // Deleted or replaced in this flush: never write to it again.
+            track = {};
+            ++g_sourceCounters.deadTracks;
+            continue;
+        }
+        float depthHack = 0.0f;
+        memcpy(&depthHack, static_cast<const unsigned char*>(track.model) +
+                               kRenderModelDepthHackOffset, sizeof(depthHack));
+        if (!std::isfinite(depthHack) || std::abs(depthHack) > 1.0e-6f) {
+            // Became a depth-hacked (first-person) model: hand it back.
+            const Matrix4 raw = ReadMatrix(
+                static_cast<const unsigned char*>(track.model), kRenderModelMatrixOffset);
+            if (!track.fresh && MatricesBitwiseEqual(raw, track.expected) &&
+                !MatricesBitwiseEqual(raw, track.current)) {
+                WriteSourceMatrices(track, track.current, track.currentInverse);
+                ++g_sourceCounters.restores;
+            }
+            track = {};
+            ++g_sourceCounters.ineligible;
+            continue;
+        }
+        // A lost dirty notification (overflow) is still caught by the
+        // expected-matrix comparison in UpdateSourceTrack.
+        UpdateSourceTrack(track, context, writes);
+        if (track.model != nullptr) {
+            ++active;
+        }
+    }
+    g_sourceCounters.activeTracks = active;
+    if (writes != 0) {
+        if (g_enableInterpolationAbProbe) {
+            g_abSourceWrites.fetch_add(writes, std::memory_order_relaxed);
+        }
+        int expected = 0;
+        if (g_worldTransformRenderState.compare_exchange_strong(expected, 2)) {
+            Log("Applied source-level world-transform interpolation after the "
+                "render-world flush (presentation serial %llu).",
+                static_cast<unsigned long long>(context.serial));
+        }
+    }
+}
+
+SourceLevelDiagnosticsSnapshot CaptureSourceLevelDiagnostics(std::uint64_t serial) {
+    SourceLevelDiagnosticsSnapshot snapshot{};
+    snapshot.serial = serial;
+    snapshot.markDirtyCalls =
+        g_sourceDiagnostics.markDirtyCalls.load(std::memory_order_relaxed);
+    snapshot.markDirtyTransform =
+        g_sourceDiagnostics.markDirtyTransform.load(std::memory_order_relaxed);
+    snapshot.markDirtyOffFlushThread =
+        g_sourceDiagnostics.markDirtyOffFlushThread.load(std::memory_order_relaxed);
+    snapshot.dirtyOverflows =
+        g_sourceDiagnostics.dirtyOverflows.load(std::memory_order_relaxed);
+    snapshot.rendererFirstAfterFlush =
+        g_sourceDiagnostics.rendererFirstAfterFlush.load(std::memory_order_relaxed);
+    snapshot.rendererFirstBeforeFlush =
+        g_sourceDiagnostics.rendererFirstBeforeFlush.load(std::memory_order_relaxed);
+    snapshot.rendererCallsDuringFlush =
+        g_sourceDiagnostics.rendererCallsDuringFlush.load(std::memory_order_relaxed);
+    snapshot.plain = g_sourceCounters;
+    return snapshot;
+}
+
+void MaybeLogSourceLevelDiagnostics(std::uint64_t serial) {
+    LARGE_INTEGER frequency{};
+    LARGE_INTEGER now{};
+    if (!QueryPerformanceFrequency(&frequency) || frequency.QuadPart <= 0 ||
+        !QueryPerformanceCounter(&now)) {
+        return;
+    }
+    const std::uint64_t counter = static_cast<std::uint64_t>(now.QuadPart);
+    if (!g_sourceHasLogSnapshot) {
+        g_sourceLastLogSnapshot = CaptureSourceLevelDiagnostics(serial);
+        g_sourceLastLogCounter = counter;
+        g_sourceHasLogSnapshot = true;
+        return;
+    }
+    if (counter - g_sourceLastLogCounter <
+        static_cast<std::uint64_t>(frequency.QuadPart)) {
+        return;
+    }
+    const SourceLevelDiagnosticsSnapshot current = CaptureSourceLevelDiagnostics(serial);
+    const SourceLevelDiagnosticsSnapshot& last = g_sourceLastLogSnapshot;
+    const auto delta = [](std::uint64_t later, std::uint64_t earlier) {
+        return static_cast<unsigned long long>(CounterDelta(later, earlier));
+    };
+    const double seconds = static_cast<double>(counter - g_sourceLastLogCounter) /
+                           static_cast<double>(frequency.QuadPart);
+    const double ticksPerMillisecond = static_cast<double>(frequency.QuadPart) / 1000.0;
+    const unsigned long long frames = delta(current.serial, last.serial);
+    const unsigned long long flushes =
+        delta(current.plain.flushCalls, last.plain.flushCalls);
+    const double perFlush = flushes != 0 ? 1.0 / static_cast<double>(flushes) : 0.0;
+    Log("Source-level %.2fs: frames=%llu flushes=%llu (%.2f/frame, with tick=%llu) "
+        "markDirty=%llu transform=%llu offFlushThread=%llu uniqueDirty/flush=%.1f "
+        "foreignWorld=%llu overflows=%llu; renderer first call after-flush=%llu "
+        "before-flush=%llu during-flush=%llu; threads flush=%lu renderer=%lu; per flush "
+        "engine=%.3fms plugin=%.3fms; tracks active=%llu created=%llu samples=%llu "
+        "holds=%llu writes=%llu restores=%llu drops=%llu dead=%llu stale=%llu "
+        "ineligible=%llu capMiss=%llu snaps[jump=%llu interval=%llu sameTime=%llu "
+        "timeReset=%llu nonRigid=%llu]; writes %s.",
+        seconds, frames, flushes,
+        frames != 0 ? static_cast<double>(flushes) / static_cast<double>(frames) : 0.0,
+        delta(current.plain.flushesWithTick, last.plain.flushesWithTick),
+        delta(current.markDirtyCalls, last.markDirtyCalls),
+        delta(current.markDirtyTransform, last.markDirtyTransform),
+        delta(current.markDirtyOffFlushThread, last.markDirtyOffFlushThread),
+        static_cast<double>(delta(current.plain.uniqueDirty, last.plain.uniqueDirty)) *
+            perFlush,
+        delta(current.plain.foreignWorldDirty, last.plain.foreignWorldDirty),
+        delta(current.dirtyOverflows, last.dirtyOverflows),
+        delta(current.rendererFirstAfterFlush, last.rendererFirstAfterFlush),
+        delta(current.rendererFirstBeforeFlush, last.rendererFirstBeforeFlush),
+        delta(current.rendererCallsDuringFlush, last.rendererCallsDuringFlush),
+        static_cast<unsigned long>(g_sourceFlushThreadId.load(std::memory_order_relaxed)),
+        static_cast<unsigned long>(g_sourceRendererThreadId.load(std::memory_order_relaxed)),
+        static_cast<double>(delta(current.plain.flushEngineTicks,
+                                  last.plain.flushEngineTicks)) /
+            ticksPerMillisecond * perFlush,
+        static_cast<double>(delta(current.plain.flushPluginTicks,
+                                  last.plain.flushPluginTicks)) /
+            ticksPerMillisecond * perFlush,
+        static_cast<unsigned long long>(current.plain.activeTracks),
+        delta(current.plain.tracksCreated, last.plain.tracksCreated),
+        delta(current.plain.samples, last.plain.samples),
+        delta(current.plain.holds, last.plain.holds),
+        delta(current.plain.writes, last.plain.writes),
+        delta(current.plain.restores, last.plain.restores),
+        delta(current.plain.drops, last.plain.drops),
+        delta(current.plain.deadTracks, last.plain.deadTracks),
+        delta(current.plain.staleTracks, last.plain.staleTracks),
+        delta(current.plain.ineligible, last.plain.ineligible),
+        delta(current.plain.capacityMisses, last.plain.capacityMisses),
+        delta(current.plain.jumpSnaps, last.plain.jumpSnaps),
+        delta(current.plain.intervalSnaps, last.plain.intervalSnaps),
+        delta(current.plain.sameTimeSnaps, last.plain.sameTimeSnaps),
+        delta(current.plain.timeResets, last.plain.timeResets),
+        delta(current.plain.nonRigid, last.plain.nonRigid),
+        SourceLevelWritesActive() ? "active" :
+            (g_sourceLevelWrites ? "configured but inactive" : "disabled (Phase A)"));
+    g_sourceLastLogSnapshot = current;
+    g_sourceLastLogCounter = counter;
+}
+
+extern "C" void __fastcall HookRenderModelMarkDirty(void* model, std::uintptr_t flags) {
+    g_originalRenderModelMarkDirty(model, flags);
+    g_sourceDiagnostics.markDirtyCalls.fetch_add(1, std::memory_order_relaxed);
+    if ((flags & kRenderModelDirtyTransform) == 0) {
+        return;
+    }
+    g_sourceDiagnostics.markDirtyTransform.fetch_add(1, std::memory_order_relaxed);
+    if (GetCurrentThreadId() != g_sourceFlushThreadId.load(std::memory_order_relaxed)) {
+        g_sourceDiagnostics.markDirtyOffFlushThread.fetch_add(
+            1, std::memory_order_relaxed);
+    }
+    AcquireSRWLockExclusive(&g_sourceDirtyLock);
+    if (g_sourceDirty.size() < kSourceDirtyCapacity) {
+        g_sourceDirty.push_back(model);
+    } else if (!g_sourceDirtyOverflowed) {
+        g_sourceDirtyOverflowed = true;
+        g_sourceDiagnostics.dirtyOverflows.fetch_add(1, std::memory_order_relaxed);
+    }
+    ReleaseSRWLockExclusive(&g_sourceDirtyLock);
+}
+
+extern "C" void __fastcall HookRenderWorldFlush(void* world, std::uintptr_t argument) {
+    if (g_sourceFlushInProgress.exchange(true, std::memory_order_acq_rel)) {
+        // Nested or concurrent flush: the track table is single-threaded.
+        g_originalRenderWorldFlush(world, argument);
+        return;
+    }
+    const std::uint64_t start = ReadPerformanceCounter();
+    g_sourceFlushThreadId.store(GetCurrentThreadId(), std::memory_order_relaxed);
+    PresentationContext context{};
+    const bool hasContext = ReadPresentationContext(context);
+
+    const std::uint64_t engineStart = ReadPerformanceCounter();
+    g_originalRenderWorldFlush(world, argument);
+    const std::uint64_t engineEnd = ReadPerformanceCounter();
+    if (hasContext) {
+        g_sourceLastFlushSerial.store(context.serial, std::memory_order_release);
+    }
+
+    ++g_sourceCounters.flushCalls;
+    if (hasContext) {
+        if (!(context.simulationTime <= g_sourceLastFlushSimulationTime + kTimeEpsilon)) {
+            ++g_sourceCounters.flushesWithTick;
+        }
+        g_sourceLastFlushSimulationTime = context.simulationTime;
+    }
+
+    bool overflowed = false;
+    g_sourceDirtyScratch.clear();
+    CollectSourceDirtyModels(world, g_sourceDirtyScratch, overflowed);
+    g_sourceCounters.uniqueDirty += g_sourceDirtyScratch.size();
+    if (g_sourceLevelWrites) {
+        ProcessSourceLevelTracks(world, context, hasContext, g_sourceDirtyScratch);
+    }
+    g_sourceDirtyScratch.clear();
+
+    const std::uint64_t end = ReadPerformanceCounter();
+    g_sourceCounters.flushEngineTicks += engineEnd - engineStart;
+    g_sourceCounters.flushPluginTicks +=
+        (end - start) - (engineEnd - engineStart);
+    if (g_enableInterpolationAbProbe) {
+        g_abSourceFlushTicks.fetch_add(end - start, std::memory_order_relaxed);
+        g_abSourceFlushOriginalTicks.fetch_add(engineEnd - engineStart,
+                                               std::memory_order_relaxed);
+    }
+    MaybeLogSourceLevelDiagnostics(hasContext ? context.serial
+                                              : g_presentationSerial.load(
+                                                    std::memory_order_acquire));
+    // Covers the engine flush and the matrix writes that follow it.
+    g_sourceFlushInProgress.store(false, std::memory_order_release);
+}
+
+bool ReplaceVtableSlot(std::uintptr_t slotAddress, std::uintptr_t expected,
+                       const void* replacement) {
+    auto* slot = reinterpret_cast<volatile LONG64*>(slotAddress);
+    DWORD oldProtection = 0;
+    if (!VirtualProtect(reinterpret_cast<void*>(slotAddress), sizeof(std::uintptr_t),
+                        PAGE_READWRITE, &oldProtection)) {
+        return false;
+    }
+    const LONG64 previous = InterlockedCompareExchange64(
+        slot, static_cast<LONG64>(reinterpret_cast<std::uintptr_t>(replacement)),
+        static_cast<LONG64>(expected));
+    DWORD ignored = 0;
+    VirtualProtect(reinterpret_cast<void*>(slotAddress), sizeof(std::uintptr_t),
+                   oldProtection, &ignored);
+    return static_cast<std::uintptr_t>(previous) == expected;
+}
+
+bool InstallSourceLevelHooks() {
+    if (!g_sourceLevelTransforms) {
+        Log("Source-level transforms are disabled by configuration.");
+        return false;
+    }
+    const GameBuildLayout& layout = *g_layout;
+    if (!layout.sourceLevelSupported) {
+        return false;
+    }
+    const std::uintptr_t flushTarget = g_executableBase + layout.renderWorldFlushRva;
+    const std::uintptr_t markDirtyTarget = g_executableBase + layout.renderModelMarkDirtyRva;
+    const std::uintptr_t flushSlot =
+        g_executableBase + layout.renderWorldVtable.rva + layout.renderWorldFlushSlot;
+    const std::array<std::uintptr_t, 2> markDirtySlots = {
+        g_executableBase + layout.renderModelStaticVtable.rva +
+            layout.renderModelMarkDirtySlot,
+        g_executableBase + layout.skinnedModelVtable.rva + layout.renderModelMarkDirtySlot,
+    };
+    if (memcmp(reinterpret_cast<const void*>(flushTarget),
+               layout.renderWorldFlushBytes.data(),
+               layout.renderWorldFlushBytes.size()) != 0 ||
+        memcmp(reinterpret_cast<const void*>(markDirtyTarget),
+               layout.renderModelMarkDirtyBytes.data(),
+               layout.renderModelMarkDirtyBytes.size()) != 0) {
+        Log("Source-level hook entry bytes changed after preflight; source-level "
+            "transforms were not installed.");
+        return false;
+    }
+
+    g_sourceDirty.reserve(kSourceDirtyCapacity);
+    g_sourceDirtyScratch.reserve(kSourceDirtyCapacity);
+    g_sourceDirtyDeferred.reserve(kSourceDirtyCapacity);
+    g_originalRenderWorldFlush = reinterpret_cast<RenderWorldFlushFn>(flushTarget);
+    g_originalRenderModelMarkDirty =
+        reinterpret_cast<RenderModelMarkDirtyFn>(markDirtyTarget);
+
+    std::size_t patched = 0;
+    for (; patched < markDirtySlots.size(); ++patched) {
+        if (!ReplaceVtableSlot(markDirtySlots[patched], markDirtyTarget,
+                               reinterpret_cast<const void*>(&HookRenderModelMarkDirty))) {
+            break;
+        }
+    }
+    if (patched != markDirtySlots.size()) {
+        for (std::size_t index = 0; index < patched; ++index) {
+            ReplaceVtableSlot(markDirtySlots[index],
+                              reinterpret_cast<std::uintptr_t>(&HookRenderModelMarkDirty),
+                              reinterpret_cast<const void*>(markDirtyTarget));
+        }
+        Log("Unable to replace the render-model MarkDirty vtable slots; "
+            "source-level transforms were not installed.");
+        return false;
+    }
+    // Writes are enabled before the flush slot goes live so the first flush
+    // already sees a consistent configuration.
+    g_sourceLevelInstalled = true;
+    if (!ReplaceVtableSlot(flushSlot, flushTarget,
+                           reinterpret_cast<const void*>(&HookRenderWorldFlush))) {
+        g_sourceLevelInstalled = false;
+        for (std::uintptr_t slot : markDirtySlots) {
+            ReplaceVtableSlot(slot,
+                              reinterpret_cast<std::uintptr_t>(&HookRenderModelMarkDirty),
+                              reinterpret_cast<const void*>(markDirtyTarget));
+        }
+        Log("Unable to replace the render-world flush vtable slot; source-level "
+            "transforms were not installed.");
+        return false;
+    }
+
+    Log("Installed source-level transform hooks: render-world flush slot RVA 0x%llX "
+        "(target 0x%llX) and render-model MarkDirty slots RVA 0x%llX/0x%llX "
+        "(target 0x%llX); writes=%s. %s",
+        static_cast<unsigned long long>(layout.renderWorldVtable.rva +
+                                        layout.renderWorldFlushSlot),
+        static_cast<unsigned long long>(layout.renderWorldFlushRva),
+        static_cast<unsigned long long>(layout.renderModelStaticVtable.rva +
+                                        layout.renderModelMarkDirtySlot),
+        static_cast<unsigned long long>(layout.skinnedModelVtable.rva +
+                                        layout.renderModelMarkDirtySlot),
+        static_cast<unsigned long long>(layout.renderModelMarkDirtyRva),
+        g_sourceLevelWrites ? "on (per-draw world transforms are skipped)"
+                            : "off (logging only)",
+        g_sourceLevelWrites && !(g_interpolateWorldTransforms ||
+                                 g_interpolateCinematicTransforms)
+            ? "WorldTransforms/CinematicTransforms are both 0, so no model is "
+              "eligible for source-level writes."
+            : "");
+    return true;
+}
+
 bool InstallShadowCasterBuildHooks() {
     if (!g_interpolateShadowTransforms) {
         Log("Shadow-transform interpolation is disabled by configuration.");
@@ -5822,6 +6824,7 @@ DWORD WINAPI InstallThread(void*) {
         InstallRenderModelGpuCopyHook();
         InstallSkinnedPoseUploadHook();
         InstallShadowCasterBuildHooks();
+        InstallSourceLevelHooks();
     }
     return 0;
 }
