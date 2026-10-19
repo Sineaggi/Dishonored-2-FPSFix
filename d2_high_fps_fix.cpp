@@ -90,6 +90,19 @@ struct GameBuildLayout {
     VtableLayout assemblyVtable;
     std::uintptr_t assemblyMarkDirtyRva;
     std::array<unsigned char, 16> assemblyMarkDirtyBytes;
+    // Diagnostics overlay: the engine's com_showFPS drawer is hooked and our
+    // status lines are appended with the engine's own DrawString.
+    bool overlaySupported;
+    std::uintptr_t showFpsCvarRva;
+    HookSiteLayout fpsOverlayDrawer;
+    std::uintptr_t drawStringRva;
+    std::array<unsigned char, 16> drawStringBytes;
+    std::uintptr_t textWidthRva;
+    std::array<unsigned char, 16> textWidthBytes;
+    // idRenderSystem* global; vtable +0x238 returns the screen width.
+    std::uintptr_t renderSystemPointerRva;
+    // Debug font height (float, set at runtime) used by the drawer.
+    std::uintptr_t debugFontHeightRva;
 };
 
 constexpr GameBuildLayout kGogLayout = {
@@ -193,6 +206,25 @@ constexpr GameBuildLayout kSteamLayout = {
     0x1BD1B0,
     {0x48, 0x89, 0x5C, 0x24, 0x10, 0x48, 0x89, 0x6C,
      0x24, 0x18, 0x48, 0x89, 0x74, 0x24, 0x20, 0x41},
+    true,
+    0x25B2DD0,
+    {0x4D840, 17, {
+        0x48, 0x8B, 0xC4,
+        0x55,
+        0x41, 0x54,
+        0x41, 0x55,
+        0x41, 0x56,
+        0x41, 0x57,
+        0x48, 0x8D, 0x6C, 0x24, 0x80,
+    }},
+    0x230FD0,
+    {0x48, 0x89, 0x5C, 0x24, 0x18, 0x48, 0x89, 0x6C,
+     0x24, 0x20, 0x57, 0x48, 0x83, 0xEC, 0x30, 0x48},
+    0x231180,
+    {0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x74,
+     0x24, 0x10, 0x57, 0x48, 0x83, 0xEC, 0x30, 0x33},
+    0x22FCD70,
+    0x2BC2A9C,
 };
 
 constexpr std::array<const GameBuildLayout*, 2> kKnownLayouts = {
@@ -328,6 +360,8 @@ bool g_enableAdaptiveInterpolation = false;
 bool g_enableTelemetry = false;
 bool g_enableInterpolationAbProbe = false;
 bool g_toggleSounds = true;
+bool g_overlay = false;
+void TryEnableOverlayCvar();
 bool g_sourceLevelTransforms = false;
 bool g_sourceLevelWrites = false;
 bool g_sourceLevelHands = false;
@@ -898,6 +932,8 @@ void LoadConfiguration() {
         L"Diagnostics", L"InterpolationABProbe", 0, path) != 0;
     g_toggleSounds = GetPrivateProfileIntW(
         L"Diagnostics", L"ToggleSounds", 1, path) != 0;
+    g_overlay = GetPrivateProfileIntW(
+        L"Diagnostics", L"Overlay", 0, path) != 0;
     Log("Configuration: UnlockAbove120=%u, MaxFPS=%d, StabilizeMouseSensitivity=%u, "
         "StabilizeFirstPersonHands=%u, WorldTransforms=%u, "
         "CinematicTransforms=%u, ShadowTransforms=%u, "
@@ -917,9 +953,10 @@ void LoadConfiguration() {
         g_enableTelemetry ? 1U : 0U,
         g_enableInterpolationAbProbe ? 1U : 0U);
     Log("Configuration: SourceLevelTransforms=%u, SourceLevelWrites=%u, "
-        "SourceLevelHands=%u, ToggleSounds=%u.",
+        "SourceLevelHands=%u, ToggleSounds=%u, Overlay=%u.",
         g_sourceLevelTransforms ? 1U : 0U, g_sourceLevelWrites ? 1U : 0U,
-        g_sourceLevelHands ? 1U : 0U, g_toggleSounds ? 1U : 0U);
+        g_sourceLevelHands ? 1U : 0U, g_toggleSounds ? 1U : 0U,
+        g_overlay ? 1U : 0U);
     if (g_enableInterpolationAbProbe) {
         Log("A/B controls: Ctrl+F11 starts/stops a clean measurement segment; "
             "F11 toggles all configured interpolation; Alt+F11 cycles all, "
@@ -1188,6 +1225,30 @@ bool ValidateVtableSlot(const ExecutableImageLayout& image,
     return true;
 }
 
+bool ValidateCodeSignature(const ExecutableImageLayout& image, std::uintptr_t rva,
+                           const std::array<unsigned char, 16>& bytes,
+                           const char* description) {
+    return ValidateCodeRange(image, rva, bytes.size(), description) &&
+           memcmp(reinterpret_cast<const void*>(g_executableBase + rva), bytes.data(),
+                  bytes.size()) == 0;
+}
+
+bool ValidateOverlayLayout(const ExecutableImageLayout& image,
+                           const GameBuildLayout& layout) {
+    return layout.overlaySupported &&
+           ValidateHookSite(image, layout.fpsOverlayDrawer, "FPS overlay drawer") &&
+           ValidateCodeSignature(image, layout.drawStringRva, layout.drawStringBytes,
+                                 "debug DrawString") &&
+           ValidateCodeSignature(image, layout.textWidthRva, layout.textWidthBytes,
+                                 "debug text width") &&
+           ValidateMutableDataRange(image, layout.showFpsCvarRva, 0x40,
+                                    "com_showFPS cvar") &&
+           ValidateMutableDataRange(image, layout.renderSystemPointerRva,
+                                    sizeof(void*), "render system pointer") &&
+           ValidateMutableDataRange(image, layout.debugFontHeightRva, sizeof(float),
+                                    "debug font height");
+}
+
 bool ValidateSourceLevelLayout(const ExecutableImageLayout& image) {
     const GameBuildLayout& layout = *g_layout;
     if (!ValidateVtable(image, layout.renderWorldVtable, "render-world vtable") ||
@@ -1365,6 +1426,12 @@ bool VerifyExecutableLayout() {
         g_interpolateShadowTransforms = false;
         Log("ShadowTransforms is not yet supported on the %s executable; "
             "shadow-transform interpolation was disabled.", selected->name);
+    }
+    if (g_overlay && !ValidateOverlayLayout(image, *selected)) {
+        g_overlay = false;
+        Log("The diagnostics overlay is not available on the %s executable "
+            "(unsupported or layout mismatch); Overlay was disabled.",
+            selected->name);
     }
     if (g_sourceLevelTransforms && !selected->sourceLevelSupported) {
         g_sourceLevelTransforms = false;
@@ -5761,6 +5828,7 @@ void TryStabilizeMouseSensitivity() {
 void ApplyPrediction(void* destination, const void* source) {
     g_lastAlpha = std::numeric_limits<double>::quiet_NaN();
     TryApplyEngineFrameLimiter();
+    TryEnableOverlayCvar();
     TryUnlockAbove120();
     TryStabilizeMouseSensitivity();
     const bool f10IsDown = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
@@ -6987,6 +7055,251 @@ bool InstallSourceLevelHooks() {
     return true;
 }
 
+
+// ---------------------------------------------------------------------------
+// Diagnostics overlay (Diagnostics/Overlay). com_showFPS makes the engine draw
+// its FPS block every frame through 0x4D840; the hook calls it and then
+// appends a few status lines with the engine's DrawString, in the same 2D
+// pass and font.
+// ---------------------------------------------------------------------------
+
+constexpr char kShowFpsCvarName[] = "com_showFPS";
+constexpr std::size_t kCommonDebugFontOffset = 0x340;
+constexpr std::size_t kRenderSystemWidthSlot = 0x238;
+
+// Returns the width of the drawn block (text width plus margin).
+using FpsOverlayDrawerFn = float(__fastcall*)(void*, void*, float*, void*);
+using DrawStringFn = void(__fastcall*)(void*, float, float, const char*,
+                                       const float*, bool, float);
+using TextWidthFn = int(__fastcall*)(void*, const char*, float);
+using RenderSystemIntFn = int(__fastcall*)(void*);
+
+FpsOverlayDrawerFn g_originalFpsOverlayDrawer = nullptr;
+void* g_fpsOverlayTrampoline = nullptr;
+std::atomic<int> g_overlayCvarState{0};
+
+struct OverlayStatistics {
+    bool initialized = false;
+    std::uint64_t lastCounter = 0;
+    std::uint64_t lastSerial = 0;
+    InterpolationAbCounterSnapshot lastCounters{};
+    double fps = 0.0;
+    double modelMs = 0.0;
+    double poseMs = 0.0;
+    double flushMs = 0.0;
+    double writesPerFrame = 0.0;
+};
+
+OverlayStatistics g_overlayStatistics;
+
+void TryEnableOverlayCvar() {
+    if (!g_overlay || g_overlayCvarState.load(std::memory_order_relaxed) != 0) {
+        return;
+    }
+    auto* cvar = reinterpret_cast<unsigned char*>(g_executableBase + g_layout->showFpsCvarRva);
+    const char* name = nullptr;
+    memcpy(&name, cvar + kCVarNameOffset, sizeof(name));
+    if (name == nullptr) {
+        return;  // The cvar constructor has not run yet.
+    }
+    if (!IsReadableMemory(name, sizeof(kShowFpsCvarName)) ||
+        memcmp(name, kShowFpsCvarName, sizeof(kShowFpsCvarName)) != 0 ||
+        !IsWritableMemory(cvar + kCVarIntegerOffset, 2 * sizeof(LONG))) {
+        g_overlayCvarState.store(2, std::memory_order_relaxed);
+        Log("%s was not found; the diagnostics overlay stays hidden.", kShowFpsCvarName);
+        return;
+    }
+    g_overlayCvarState.store(1, std::memory_order_relaxed);
+    LONG current = 0;
+    memcpy(&current, cvar + kCVarIntegerOffset, sizeof(current));
+    if (current == 0) {
+        *reinterpret_cast<volatile float*>(cvar + kCVarFloatOffset) = 1.0f;
+        InterlockedExchange(reinterpret_cast<volatile LONG*>(cvar + kCVarIntegerOffset), 1);
+    }
+    Log("Diagnostics overlay: %s=%ld; status lines are appended to the engine FPS "
+        "block.", kShowFpsCvarName, current == 0 ? 1L : static_cast<long>(current));
+}
+
+void UpdateOverlayStatistics() {
+    OverlayStatistics& stats = g_overlayStatistics;
+    const std::uint64_t now = ReadPerformanceCounter();
+    LARGE_INTEGER frequency{};
+    QueryPerformanceFrequency(&frequency);
+    const std::uint64_t serial = g_presentationSerial.load(std::memory_order_acquire);
+    if (!stats.initialized) {
+        stats.initialized = true;
+        stats.lastCounter = now;
+        stats.lastSerial = serial;
+        stats.lastCounters = CaptureInterpolationAbCounters();
+        return;
+    }
+    const double seconds = static_cast<double>(now - stats.lastCounter) /
+                           static_cast<double>(frequency.QuadPart);
+    if (seconds < 0.5) {
+        return;
+    }
+    const InterpolationAbCounterSnapshot counters = CaptureInterpolationAbCounters();
+    const double frames = static_cast<double>(CounterDelta(serial, stats.lastSerial));
+    const double ticksPerMs = static_cast<double>(frequency.QuadPart) / 1000.0;
+    const auto perFrameMs = [&](std::uint64_t total, std::uint64_t engine,
+                                std::uint64_t totalBefore, std::uint64_t engineBefore) {
+        if (!(frames > 0.0)) {
+            return 0.0;
+        }
+        const double plugin =
+            static_cast<double>(CounterDelta(total, totalBefore)) -
+            static_cast<double>(CounterDelta(engine, engineBefore));
+        return std::max(0.0, plugin) / ticksPerMs / frames;
+    };
+    stats.fps = frames / seconds;
+    stats.modelMs = perFrameMs(counters.renderModelHookTicks,
+                               counters.renderModelOriginalTicks,
+                               stats.lastCounters.renderModelHookTicks,
+                               stats.lastCounters.renderModelOriginalTicks);
+    stats.poseMs = perFrameMs(counters.skeletalHookTicks, counters.skeletalOriginalTicks,
+                              stats.lastCounters.skeletalHookTicks,
+                              stats.lastCounters.skeletalOriginalTicks);
+    stats.flushMs = perFrameMs(counters.sourceFlushTicks, counters.sourceFlushOriginalTicks,
+                               stats.lastCounters.sourceFlushTicks,
+                               stats.lastCounters.sourceFlushOriginalTicks);
+    stats.writesPerFrame = frames > 0.0
+        ? static_cast<double>(CounterDelta(counters.sourceWrites,
+                                           stats.lastCounters.sourceWrites)) / frames
+        : 0.0;
+    stats.lastCounter = now;
+    stats.lastSerial = serial;
+    stats.lastCounters = counters;
+}
+
+float DrawOverlayLines(void* common, float* cursor) {
+    void* font = nullptr;
+    memcpy(&font, static_cast<unsigned char*>(common) + kCommonDebugFontOffset,
+           sizeof(font));
+    void* renderSystem = *reinterpret_cast<void**>(
+        g_executableBase + g_layout->renderSystemPointerRva);
+    if (font == nullptr || renderSystem == nullptr || cursor == nullptr) {
+        return 0.0f;
+    }
+    const auto drawString = reinterpret_cast<DrawStringFn>(
+        g_executableBase + g_layout->drawStringRva);
+    const auto textWidth = reinterpret_cast<TextWidthFn>(
+        g_executableBase + g_layout->textWidthRva);
+    const auto screenWidth = reinterpret_cast<RenderSystemIntFn>(
+        (*reinterpret_cast<std::uintptr_t**>(renderSystem))[kRenderSystemWidthSlot /
+                                                             sizeof(std::uintptr_t)]);
+
+    UpdateOverlayStatistics();
+    const OverlayStatistics& stats = g_overlayStatistics;
+    const bool transforms = RuntimeTransformInterpolationEnabled();
+    const bool skeletons = RuntimeSkeletalInterpolationEnabled();
+    const bool hands = RuntimeFirstPersonHandsEnabled();
+    const bool camera = g_enabled.load(std::memory_order_relaxed);
+    char lines[5][160]{};
+    sprintf_s(lines[0], "FPSFix  camera %s  transforms %s%s  skeletons %s  hands %s",
+              camera ? "on" : "OFF", transforms ? "on" : "OFF",
+              transforms ? (SourceLevelWritesSelected() ? " (source)" : " (per-draw)") : "",
+              skeletons ? "on" : "OFF", hands ? "on" : "OFF");
+    if (g_enableInterpolationAbProbe) {
+        if (g_interpolationAbProbe.capturing) {
+            LARGE_INTEGER now{};
+            QueryPerformanceCounter(&now);
+            const double elapsed = static_cast<double>(
+                now.QuadPart - g_interpolationAbProbe.segmentStartCounter.QuadPart) /
+                static_cast<double>(g_interpolationAbProbe.frequency.QuadPart);
+            sprintf_s(lines[1], "A/B segment %llu RECORDING %.1fs%s",
+                      static_cast<unsigned long long>(g_interpolationAbProbe.segmentId),
+                      elapsed, elapsed < kAbProbeWarmupSeconds ? " (warm-up)" : "");
+        } else {
+            sprintf_s(lines[1], "A/B idle (Ctrl+F11 to record)");
+        }
+        sprintf_s(lines[2], "plugin ms/frame  model %.2f  pose %.2f  flush %.2f",
+                  stats.modelMs, stats.poseMs, stats.flushMs);
+    } else {
+        sprintf_s(lines[1], "A/B probe off");
+        sprintf_s(lines[2], "plugin timing needs InterpolationABProbe=1");
+    }
+    sprintf_s(lines[3], "frames/s %.0f  source tracks %llu  writes/frame %.1f",
+              stats.fps, static_cast<unsigned long long>(g_sourceCounters.activeTracks),
+              stats.writesPerFrame);
+
+    const float fontHeight = *reinterpret_cast<const float*>(
+        g_executableBase + g_layout->debugFontHeightRva);
+    const float lineHeight = (std::isfinite(fontHeight) && fontHeight > 0.0f &&
+                              fontHeight < 200.0f ? fontHeight : 16.0f) + 4.0f;
+    const float margin = lineHeight;
+    const float width = static_cast<float>(screenWidth(renderSystem));
+    static const float color[4] = {1.0f, 0.85f, 0.2f, 1.0f};
+    float blockWidth = 0.0f;
+    for (const char* line : {lines[0], lines[1], lines[2], lines[3]}) {
+        if (line[0] == '\0') {
+            continue;
+        }
+        const float lineWidth = static_cast<float>(textWidth(font, line, 1.0f));
+        drawString(font, width - margin - lineWidth, *cursor + 2.0f, line, color, false,
+                   1.0f);
+        *cursor += lineHeight;
+        blockWidth = std::max(blockWidth, lineWidth + margin);
+    }
+    return blockWidth;
+}
+
+extern "C" float __fastcall HookFpsOverlayDrawer(void* common, void* second, float* cursor,
+                                                 void* fourth) {
+    const float engineWidth = g_originalFpsOverlayDrawer(common, second, cursor, fourth);
+    if (!g_overlay) {
+        return engineWidth;
+    }
+    // The caller lays out the next debug block from the returned width.
+    return std::max(engineWidth, DrawOverlayLines(common, cursor));
+}
+
+bool InstallFpsOverlayHook() {
+    if (!g_overlay) {
+        return false;
+    }
+    const HookSiteLayout& site = g_layout->fpsOverlayDrawer;
+    auto* entry = reinterpret_cast<unsigned char*>(g_executableBase + site.rva);
+    if (memcmp(entry, site.bytes.data(), site.length) != 0) {
+        g_overlay = false;
+        Log("FPS overlay drawer bytes do not match; the diagnostics overlay was not "
+            "installed.");
+        return false;
+    }
+    constexpr std::size_t kAbsoluteJumpLength = 14;
+    auto* trampoline = static_cast<unsigned char*>(
+        VirtualAlloc(nullptr, 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE));
+    if (trampoline == nullptr) {
+        g_overlay = false;
+        Log("Unable to allocate the overlay trampoline; the diagnostics overlay was not "
+            "installed.");
+        return false;
+    }
+    memcpy(trampoline, entry, site.length);
+    WriteAbsoluteIndirectJump(trampoline + site.length, entry + site.length);
+    FlushInstructionCache(GetCurrentProcess(), trampoline, site.length + kAbsoluteJumpLength);
+
+    unsigned char patch[kMaximumHookLength]{};
+    memset(patch, 0x90, sizeof(patch));
+    WriteAbsoluteIndirectJump(patch, reinterpret_cast<const void*>(&HookFpsOverlayDrawer));
+    DWORD oldProtection = 0;
+    if (!VirtualProtect(entry, site.length, PAGE_EXECUTE_READWRITE, &oldProtection)) {
+        VirtualFree(trampoline, 0, MEM_RELEASE);
+        g_overlay = false;
+        Log("VirtualProtect failed at the FPS overlay drawer; the diagnostics overlay "
+            "was not installed.");
+        return false;
+    }
+    g_originalFpsOverlayDrawer = reinterpret_cast<FpsOverlayDrawerFn>(trampoline);
+    g_fpsOverlayTrampoline = trampoline;
+    memcpy(entry, patch, site.length);
+    FlushInstructionCache(GetCurrentProcess(), entry, site.length);
+    DWORD ignored = 0;
+    VirtualProtect(entry, site.length, oldProtection, &ignored);
+    Log("Installed diagnostics overlay at the engine FPS drawer RVA 0x%llX.",
+        static_cast<unsigned long long>(site.rva));
+    return true;
+}
+
 bool InstallShadowCasterBuildHooks() {
     if (!g_interpolateShadowTransforms) {
         Log("Shadow-transform interpolation is disabled by configuration.");
@@ -7267,6 +7580,7 @@ DWORD WINAPI InstallThread(void*) {
         }
         InstallSkinnedPoseUploadHook();
         InstallShadowCasterBuildHooks();
+        InstallFpsOverlayHook();
     }
     return 0;
 }
