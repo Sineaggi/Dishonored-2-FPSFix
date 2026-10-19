@@ -84,6 +84,12 @@ struct GameBuildLayout {
     std::array<unsigned char, 16> renderWorldFlushBytes;
     std::array<unsigned char, 16> renderModelMarkDirtyBytes;
     std::array<unsigned char, 16> renderModelCommitBytes;
+    // arkRenderModelAssembly: its MarkDirty (vtable +0x28) recomposes each
+    // part's origin/axis/scale from the assembly transform and then calls the
+    // part's own (static) MarkDirty. Hooked for diagnostics only.
+    VtableLayout assemblyVtable;
+    std::uintptr_t assemblyMarkDirtyRva;
+    std::array<unsigned char, 16> assemblyMarkDirtyBytes;
 };
 
 constexpr GameBuildLayout kGogLayout = {
@@ -183,6 +189,10 @@ constexpr GameBuildLayout kSteamLayout = {
      0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x57},
     {0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x6C,
      0x24, 0x18, 0x48, 0x89, 0x74, 0x24, 0x20, 0x57},
+    {0x1B03BC8, {0x1BD8A0, 0x1BE8C0, 0x1BDD40, 0x1BC810}},
+    0x1BD1B0,
+    {0x48, 0x89, 0x5C, 0x24, 0x10, 0x48, 0x89, 0x6C,
+     0x24, 0x18, 0x48, 0x89, 0x74, 0x24, 0x20, 0x41},
 };
 
 constexpr std::array<const GameBuildLayout*, 2> kKnownLayouts = {
@@ -223,6 +233,12 @@ constexpr std::size_t kRenderModelOwnerOffset = 0x1C50;
 constexpr std::size_t kRenderModelWorldOffset = 0x1BF8;
 constexpr std::size_t kRenderModelHandleOffset = 0x1C18;
 constexpr std::size_t kRenderWorldModelArrayOffset = 0x20538;
+// idList count (low 24 bits) of the model-pointer array.
+constexpr std::size_t kRenderWorldModelCountOffset = 0x20540;
+// Model committed together with its owner by the flush (0x2395A0).
+constexpr std::size_t kRenderModelLinkedModelOffset = 0x1930;
+// Byte set to 1 by the arkRenderModelAssembly constructor on its parts.
+constexpr std::size_t kRenderModelAssemblyPartOffset = 0x1C60;
 constexpr std::uint32_t kRenderModelDirtyTransform = 0x01;
 constexpr std::size_t kSourceTrackCapacity = 8192;
 constexpr std::size_t kSourceTrackProbeLimit = 64;
@@ -1184,7 +1200,17 @@ bool ValidateSourceLevelLayout(const ExecutableImageLayout& image) {
             return false;
         }
     }
-    return true;
+    return ValidateVtable(image, layout.assemblyVtable, "assembly render-model vtable") &&
+           ValidateVtableSlot(image, layout.assemblyVtable.rva,
+                              layout.renderModelMarkDirtySlot,
+                              layout.assemblyMarkDirtyRva,
+                              layout.assemblyMarkDirtyBytes,
+                              "assembly MarkDirty slot") &&
+           ValidateVtableSlot(image, layout.assemblyVtable.rva,
+                              layout.renderModelCommitSlot,
+                              layout.renderModelCommitRva,
+                              layout.renderModelCommitBytes,
+                              "assembly Commit slot");
 }
 
 bool ValidateHookSignatures(const ExecutableImageLayout& image) {
@@ -5764,6 +5790,9 @@ struct SourceLevelDiagnostics {
     std::atomic<std::uint64_t> rendererFirstAfterFlush{0};
     std::atomic<std::uint64_t> rendererFirstBeforeFlush{0};
     std::atomic<std::uint64_t> rendererCallsDuringFlush{0};
+    std::atomic<std::uint64_t> assemblyMarkDirty{0};
+    std::atomic<std::uint64_t> assemblyMarkDirtyTransform{0};
+    std::atomic<std::uint64_t> partMarkDirtyTransform{0};
 };
 
 // Counters only touched by the flush thread.
@@ -5790,6 +5819,9 @@ struct SourceLevelCounters {
     std::uint64_t timeResets = 0;
     std::uint64_t nonRigid = 0;
     std::uint64_t activeTracks = 0;
+    std::uint64_t activePartTracks = 0;
+    std::uint64_t linkedCandidates = 0;
+    std::uint64_t linkedTracksCreated = 0;
 };
 
 SourceLevelDiagnostics g_sourceDiagnostics;
@@ -5804,6 +5836,9 @@ struct SourceLevelDiagnosticsSnapshot {
     std::uint64_t rendererFirstAfterFlush = 0;
     std::uint64_t rendererFirstBeforeFlush = 0;
     std::uint64_t rendererCallsDuringFlush = 0;
+    std::uint64_t assemblyMarkDirty = 0;
+    std::uint64_t assemblyMarkDirtyTransform = 0;
+    std::uint64_t partMarkDirtyTransform = 0;
     SourceLevelCounters plain{};
 };
 
@@ -5842,6 +5877,7 @@ struct SourceTrack {
     bool hasPair = false;
     bool dirty = false;
     bool fresh = false;
+    bool assemblyPart = false;
 };
 
 std::array<SourceTrack, kSourceTrackCapacity> g_sourceTracks{};
@@ -5914,7 +5950,7 @@ SourceTrack* CreateSourceTrack(void* model) {
 struct SourceWorldView {
     void* world = nullptr;
     void* const* models = nullptr;
-    std::uintptr_t readableEnd = 0;
+    std::uint32_t modelCount = 0;
 };
 
 bool SourceModelRegistered(const SourceWorldView& view, const void* model,
@@ -5922,8 +5958,7 @@ bool SourceModelRegistered(const SourceWorldView& view, const void* model,
     if (view.models == nullptr) {
         return false;
     }
-    const std::uintptr_t slot = reinterpret_cast<std::uintptr_t>(view.models + handle);
-    return slot + sizeof(void*) <= view.readableEnd && view.models[handle] == model;
+    return handle < view.modelCount && view.models[handle] == model;
 }
 
 void WriteSourceMatrices(SourceTrack& track, const Matrix4& matrix,
@@ -6006,35 +6041,35 @@ bool ResolveSourceWorldView(void* world, SourceWorldView& view) {
     }
     memcpy(&models, static_cast<unsigned char*>(world) + kRenderWorldModelArrayOffset,
            sizeof(models));
-    MEMORY_BASIC_INFORMATION information{};
-    if (!IsReadableMemory(models, sizeof(void*)) ||
-        VirtualQuery(models, &information, sizeof(information)) == 0) {
+    std::uint32_t packedCount = 0;
+    memcpy(&packedCount, static_cast<unsigned char*>(world) + kRenderWorldModelCountOffset,
+           sizeof(packedCount));
+    const std::uint32_t count =
+        std::min<std::uint32_t>(packedCount & 0x00FFFFFFU, 0x10000U);
+    if (count == 0 || !IsReadableMemory(models, sizeof(void*) * count)) {
         return false;
     }
-    // Handles are 16-bit; each lookup stays inside this readable region.
     view.models = models;
-    view.readableEnd = reinterpret_cast<std::uintptr_t>(information.BaseAddress) +
-                       information.RegionSize;
+    view.modelCount = count;
     return true;
 }
 
-void RegisterSourceDirtyModels(const SourceWorldView& view,
-                               const std::vector<void*>& dirty) {
-    for (void* model : dirty) {
-        SourceTrack* track = FindSourceTrack(model);
-        if (track != nullptr) {
-            track->dirty = true;
-            continue;
+SourceTrack* RegisterSourceDirtyModel(const SourceWorldView& view, void* model) {
+    {
+        SourceTrack* existing = FindSourceTrack(model);
+        if (existing != nullptr) {
+            existing->dirty = true;
+            return existing;
         }
         if (!IsReadableMemory(model, kRenderModelSize)) {
-            continue;
+            return nullptr;
         }
         std::uint16_t handle = 0;
         memcpy(&handle, static_cast<unsigned char*>(model) + kRenderModelHandleOffset,
                sizeof(handle));
         if (!SourceModelRegistered(view, model, handle)) {
             ++g_sourceCounters.ineligible;
-            continue;
+            return nullptr;
         }
         const void* owner = nullptr;
         const void* modelAsset = nullptr;
@@ -6042,12 +6077,12 @@ void RegisterSourceDirtyModels(const SourceWorldView& view,
         bool cinematic = false;
         if (!IsEligibleWorldRenderModel(model, owner, vtable, modelAsset, cinematic)) {
             ++g_sourceCounters.ineligible;
-            continue;
+            return nullptr;
         }
-        track = CreateSourceTrack(model);
+        SourceTrack* track = CreateSourceTrack(model);
         if (track == nullptr) {
             ++g_sourceCounters.capacityMisses;
-            continue;
+            return nullptr;
         }
         track->world = view.world;
         track->handle = handle;
@@ -6056,7 +6091,33 @@ void RegisterSourceDirtyModels(const SourceWorldView& view,
         track->modelAsset = modelAsset;
         track->fresh = true;
         track->dirty = true;
+        track->assemblyPart =
+            static_cast<const unsigned char*>(model)[kRenderModelAssemblyPartOffset] == 1;
         ++g_sourceCounters.tracksCreated;
+        return track;
+    }
+}
+
+void RegisterSourceDirtyModels(const SourceWorldView& view,
+                               const std::vector<void*>& dirty) {
+    for (void* model : dirty) {
+        if (RegisterSourceDirtyModel(view, model) == nullptr) {
+            continue;
+        }
+        // The flush commits the linked model with its owner's flags without
+        // a MarkDirty of its own, so it is offered here as a candidate. A
+        // linked model the engine did not recommit only produces a hold.
+        void* linked = nullptr;
+        memcpy(&linked, static_cast<unsigned char*>(model) + kRenderModelLinkedModelOffset,
+               sizeof(linked));
+        if (linked == nullptr || linked == model) {
+            continue;
+        }
+        ++g_sourceCounters.linkedCandidates;
+        const bool known = FindSourceTrack(linked) != nullptr;
+        if (RegisterSourceDirtyModel(view, linked) != nullptr && !known) {
+            ++g_sourceCounters.linkedTracksCreated;
+        }
     }
 }
 
@@ -6219,6 +6280,7 @@ void ProcessSourceLevelTracks(void* world, const PresentationContext& context,
     RegisterSourceDirtyModels(view, dirty);
     std::uint64_t writes = 0;
     std::uint64_t active = 0;
+    std::uint64_t activeParts = 0;
     for (SourceTrack& track : g_sourceTracks) {
         if (track.model == nullptr) {
             continue;
@@ -6260,9 +6322,13 @@ void ProcessSourceLevelTracks(void* world, const PresentationContext& context,
         UpdateSourceTrack(track, context, writes);
         if (track.model != nullptr) {
             ++active;
+            if (track.assemblyPart) {
+                ++activeParts;
+            }
         }
     }
     g_sourceCounters.activeTracks = active;
+    g_sourceCounters.activePartTracks = activeParts;
     if (writes != 0) {
         if (g_enableInterpolationAbProbe) {
             g_abSourceWrites.fetch_add(writes, std::memory_order_relaxed);
@@ -6293,6 +6359,12 @@ SourceLevelDiagnosticsSnapshot CaptureSourceLevelDiagnostics(std::uint64_t seria
         g_sourceDiagnostics.rendererFirstBeforeFlush.load(std::memory_order_relaxed);
     snapshot.rendererCallsDuringFlush =
         g_sourceDiagnostics.rendererCallsDuringFlush.load(std::memory_order_relaxed);
+    snapshot.assemblyMarkDirty =
+        g_sourceDiagnostics.assemblyMarkDirty.load(std::memory_order_relaxed);
+    snapshot.assemblyMarkDirtyTransform =
+        g_sourceDiagnostics.assemblyMarkDirtyTransform.load(std::memory_order_relaxed);
+    snapshot.partMarkDirtyTransform =
+        g_sourceDiagnostics.partMarkDirtyTransform.load(std::memory_order_relaxed);
     snapshot.plain = g_sourceCounters;
     return snapshot;
 }
@@ -6334,7 +6406,9 @@ void MaybeLogSourceLevelDiagnostics(std::uint64_t serial) {
         "engine=%.3fms plugin=%.3fms; tracks active=%llu created=%llu samples=%llu "
         "holds=%llu writes=%llu restores=%llu drops=%llu dead=%llu stale=%llu "
         "ineligible=%llu capMiss=%llu snaps[jump=%llu interval=%llu sameTime=%llu "
-        "timeReset=%llu nonRigid=%llu]; writes %s.",
+        "timeReset=%llu nonRigid=%llu]; assemblies markDirty=%llu transform=%llu "
+        "partTransform=%llu partTracks=%llu linked candidates=%llu created=%llu; "
+        "writes %s.",
         seconds, frames, flushes,
         frames != 0 ? static_cast<double>(flushes) / static_cast<double>(frames) : 0.0,
         delta(current.plain.flushesWithTick, last.plain.flushesWithTick),
@@ -6372,6 +6446,12 @@ void MaybeLogSourceLevelDiagnostics(std::uint64_t serial) {
         delta(current.plain.sameTimeSnaps, last.plain.sameTimeSnaps),
         delta(current.plain.timeResets, last.plain.timeResets),
         delta(current.plain.nonRigid, last.plain.nonRigid),
+        delta(current.assemblyMarkDirty, last.assemblyMarkDirty),
+        delta(current.assemblyMarkDirtyTransform, last.assemblyMarkDirtyTransform),
+        delta(current.partMarkDirtyTransform, last.partMarkDirtyTransform),
+        static_cast<unsigned long long>(current.plain.activePartTracks),
+        delta(current.plain.linkedCandidates, last.plain.linkedCandidates),
+        delta(current.plain.linkedTracksCreated, last.plain.linkedTracksCreated),
         SourceLevelWritesActive() ? "active" :
             (g_sourceLevelWrites ? "configured but inactive" : "disabled (Phase A)"));
     g_sourceLastLogSnapshot = current;
@@ -6385,6 +6465,9 @@ extern "C" void __fastcall HookRenderModelMarkDirty(void* model, std::uintptr_t 
         return;
     }
     g_sourceDiagnostics.markDirtyTransform.fetch_add(1, std::memory_order_relaxed);
+    if (static_cast<const unsigned char*>(model)[kRenderModelAssemblyPartOffset] == 1) {
+        g_sourceDiagnostics.partMarkDirtyTransform.fetch_add(1, std::memory_order_relaxed);
+    }
     if (GetCurrentThreadId() != g_sourceFlushThreadId.load(std::memory_order_relaxed)) {
         g_sourceDiagnostics.markDirtyOffFlushThread.fetch_add(
             1, std::memory_order_relaxed);
@@ -6397,6 +6480,19 @@ extern "C" void __fastcall HookRenderModelMarkDirty(void* model, std::uintptr_t 
         g_sourceDiagnostics.dirtyOverflows.fetch_add(1, std::memory_order_relaxed);
     }
     ReleaseSRWLockExclusive(&g_sourceDirtyLock);
+}
+
+RenderModelMarkDirtyFn g_originalAssemblyMarkDirty = nullptr;
+
+extern "C" void __fastcall HookAssemblyMarkDirty(void* model, std::uintptr_t flags) {
+    // The original propagates to every part through the part's (hooked)
+    // static MarkDirty slot, so parts reach the dirty list on their own.
+    g_originalAssemblyMarkDirty(model, flags);
+    g_sourceDiagnostics.assemblyMarkDirty.fetch_add(1, std::memory_order_relaxed);
+    if ((flags & kRenderModelDirtyTransform) != 0) {
+        g_sourceDiagnostics.assemblyMarkDirtyTransform.fetch_add(
+            1, std::memory_order_relaxed);
+    }
 }
 
 extern "C" void __fastcall HookRenderWorldFlush(void* world, std::uintptr_t argument) {
@@ -6534,6 +6630,20 @@ bool InstallSourceLevelHooks() {
         Log("Unable to replace the render-world flush vtable slot; source-level "
             "transforms were not installed.");
         return false;
+    }
+
+    // Diagnostic-only: parts are covered through their own static slot.
+    const std::uintptr_t assemblyTarget = g_executableBase + layout.assemblyMarkDirtyRva;
+    const std::uintptr_t assemblySlot = g_executableBase + layout.assemblyVtable.rva +
+                                        layout.renderModelMarkDirtySlot;
+    g_originalAssemblyMarkDirty = reinterpret_cast<RenderModelMarkDirtyFn>(assemblyTarget);
+    if (memcmp(reinterpret_cast<const void*>(assemblyTarget),
+               layout.assemblyMarkDirtyBytes.data(),
+               layout.assemblyMarkDirtyBytes.size()) != 0 ||
+        !ReplaceVtableSlot(assemblySlot, assemblyTarget,
+                           reinterpret_cast<const void*>(&HookAssemblyMarkDirty))) {
+        Log("Assembly MarkDirty diagnostics were not installed; assembly parts "
+            "remain covered through the static render-model slot.");
     }
 
     Log("Installed source-level transform hooks: render-world flush slot RVA 0x%llX "
