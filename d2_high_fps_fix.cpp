@@ -5975,6 +5975,7 @@ struct SourceLevelCounters {
     std::uint64_t linkedCandidates = 0;
     std::uint64_t linkedTracksCreated = 0;
     std::uint64_t handsDirty = 0;
+    std::uint64_t firstCommits = 0;
     std::uint64_t handsTracksCreated = 0;
     std::uint64_t handsWrites = 0;
     std::uint64_t activeHandsTracks = 0;
@@ -6262,12 +6263,41 @@ bool IsSourceExactModelType(const void* model, std::uintptr_t& vtable) {
            vtable == g_executableBase + g_layout->skinnedModelVtable.rva;
 }
 
+// A model is only tracked once it commits a second time within this many
+// flushes. Level loads commit every model once; without this they would fill
+// the track table for a few ticks and push moving models out.
+constexpr std::size_t kSourcePendingCapacity = 16384;
+constexpr std::uint64_t kSourcePendingWindowFlushes = 120;
+
+struct SourcePendingEntry {
+    const void* model = nullptr;
+    std::uint64_t flush = 0;
+};
+
+std::array<SourcePendingEntry, kSourcePendingCapacity> g_sourcePending{};
+std::uint64_t g_sourceFlushSerial = 0;
+
+// Returns true when the model has committed before within the window.
+bool SourceModelCommittedRecently(const void* model) {
+    SourcePendingEntry& entry =
+        g_sourcePending[SourceTrackHash(model) & (kSourcePendingCapacity - 1)];
+    const bool recent = entry.model == model &&
+                        g_sourceFlushSerial - entry.flush <= kSourcePendingWindowFlushes;
+    entry.model = model;
+    entry.flush = g_sourceFlushSerial;
+    return recent;
+}
+
 SourceTrack* RegisterSourceDirtyModel(const SourceWorldView& view, void* model,
                                       bool worldActive, bool handsActive) {
     SourceTrack* existing = FindSourceTrack(model);
     if (existing != nullptr) {
         existing->dirty = true;
         return existing;
+    }
+    if (!SourceModelCommittedRecently(model)) {
+        ++g_sourceCounters.firstCommits;
+        return nullptr;
     }
     if (!IsReadableMemory(model, kRenderModelSize)) {
         return nullptr;
@@ -6548,6 +6578,7 @@ void ProcessSourceLevelTracks(void* world, const PresentationContext& context,
     const bool worldActive = hasContext && SourceLevelWritesActive();
     const bool handsActive = hasContext && SourceHandsActive();
 
+    ++g_sourceFlushSerial;
     RegisterSourceDirtyModels(view, dirty, worldActive, handsActive);
     std::uint64_t writes = 0;
     std::uint64_t active = 0;
@@ -6684,7 +6715,8 @@ void MaybeLogSourceLevelDiagnostics(std::uint64_t serial) {
         "ineligible=%llu capMiss=%llu snaps[jump=%llu interval=%llu sameTime=%llu "
         "timeReset=%llu nonRigid=%llu]; assemblies markDirty=%llu transform=%llu "
         "partTransform=%llu partTracks=%llu linked candidates=%llu created=%llu; "
-        "hands dirty=%llu created=%llu tracks=%llu writes=%llu; per-draw hook %s; "
+        "hands dirty=%llu created=%llu tracks=%llu writes=%llu; firstCommits=%llu; "
+        "per-draw hook %s; "
         "writes %s.",
         seconds, frames, flushes,
         frames != 0 ? static_cast<double>(flushes) / static_cast<double>(frames) : 0.0,
@@ -6733,6 +6765,7 @@ void MaybeLogSourceLevelDiagnostics(std::uint64_t serial) {
         delta(current.plain.handsTracksCreated, last.plain.handsTracksCreated),
         static_cast<unsigned long long>(current.plain.activeHandsTracks),
         delta(current.plain.handsWrites, last.plain.handsWrites),
+        delta(current.plain.firstCommits, last.plain.firstCommits),
         g_renderModelGpuCopyHookSkipped ? "not installed" :
             (g_renderModelGpuCopyTrampoline != nullptr ? "installed" : "off"),
         SourceLevelWritesActive() ? "active" :
