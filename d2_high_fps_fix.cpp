@@ -742,6 +742,16 @@ struct OwnerlessSkeletalTrack {
 
 SkeletalDiagnostics g_skeletalDiagnostics;
 SRWLOCK g_skeletalObservationLock = SRWLOCK_INIT;
+std::atomic<std::uint64_t> g_skeletalLockContended{0};
+
+// Pose uploads run on several renderer worker threads; count how often the
+// shared observation lock is already held.
+void AcquireSkeletalObservationLock() {
+    if (!TryAcquireSRWLockExclusive(&g_skeletalObservationLock)) {
+        g_skeletalLockContended.fetch_add(1, std::memory_order_relaxed);
+        AcquireSRWLockExclusive(&g_skeletalObservationLock);
+    }
+}
 std::array<SkeletalObservationTrack, kSkeletalTrackCapacity>
     g_skeletalObservationTracks{};
 std::array<OwnerlessSkeletalTrack, kOwnerlessSkeletalTrackCapacity>
@@ -1649,6 +1659,64 @@ bool IsReadableMemory(const void* address, std::size_t size) {
     return readable && start + size <= regionEnd;
 }
 
+// Hot hook paths validate the same few heap regions on every call. Each
+// thread remembers recently validated committed, readable regions and accepts
+// addresses inside them for a short presentation-frame window instead of
+// issuing a VirtualQuery per check.
+constexpr std::size_t kReadableRegionCacheSize = 8;
+constexpr std::uint64_t kReadableRegionCacheFrames = 16;
+
+struct ReadableRegionCacheEntry {
+    std::uintptr_t start = 0;
+    std::uintptr_t end = 0;
+    std::uint64_t serial = 0;
+};
+
+thread_local std::array<ReadableRegionCacheEntry, kReadableRegionCacheSize>
+    t_readableRegions{};
+thread_local std::size_t t_readableRegionNext = 0;
+
+bool IsReadableMemoryCached(const void* address, std::size_t size) {
+    if (address == nullptr || size == 0) {
+        return false;
+    }
+    const std::uintptr_t start = reinterpret_cast<std::uintptr_t>(address);
+    if (start > std::numeric_limits<std::uintptr_t>::max() - size) {
+        return false;
+    }
+    const std::uintptr_t end = start + size;
+    const std::uint64_t serial = g_presentationSerial.load(std::memory_order_relaxed);
+    for (const ReadableRegionCacheEntry& entry : t_readableRegions) {
+        if (start >= entry.start && end <= entry.end &&
+            serial - entry.serial <= kReadableRegionCacheFrames) {
+            return true;
+        }
+    }
+    MEMORY_BASIC_INFORMATION information{};
+    if (VirtualQuery(address, &information, sizeof(information)) == 0 ||
+        information.State != MEM_COMMIT ||
+        (information.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0) {
+        return false;
+    }
+    const DWORD protection = information.Protect & 0xFF;
+    const bool readable = protection == PAGE_READONLY || protection == PAGE_READWRITE ||
+                          protection == PAGE_WRITECOPY || protection == PAGE_EXECUTE_READ ||
+                          protection == PAGE_EXECUTE_READWRITE ||
+                          protection == PAGE_EXECUTE_WRITECOPY;
+    const std::uintptr_t regionStart =
+        reinterpret_cast<std::uintptr_t>(information.BaseAddress);
+    const std::uintptr_t regionEnd = regionStart + information.RegionSize;
+    if (!readable || end > regionEnd) {
+        return false;
+    }
+    ReadableRegionCacheEntry& slot =
+        t_readableRegions[t_readableRegionNext++ % kReadableRegionCacheSize];
+    slot.start = regionStart;
+    slot.end = regionEnd;
+    slot.serial = serial;
+    return true;
+}
+
 bool IsExecutableMemory(const void* address) {
     MEMORY_BASIC_INFORMATION information{};
     if (address == nullptr || VirtualQuery(address, &information, sizeof(information)) == 0 ||
@@ -2325,7 +2393,7 @@ bool IsEligibleWorldRenderModel(const void* renderModel, const void*& owner,
                                  bool& cinematic) {
     cinematic = false;
     g_worldDiagnostics.candidates.fetch_add(1, std::memory_order_relaxed);
-    if (!IsReadableMemory(renderModel, kRenderModelSize)) {
+    if (!IsReadableMemoryCached(renderModel, kRenderModelSize)) {
         return false;
     }
     memcpy(&vtable, renderModel, sizeof(vtable));
@@ -2366,7 +2434,7 @@ bool IsEligibleWorldRenderModel(const void* renderModel, const void*& owner,
         if ((!(g_interpolateWorldTransforms &&
                 g_interpolateWorldSkeletons) &&
              !g_interpolateCinematicTransforms) ||
-            !IsReadableMemory(renderModel, kSkinnedModelSize)) {
+            !IsReadableMemoryCached(renderModel, kSkinnedModelSize)) {
             return false;
         }
         const auto* skinnedBytes =
@@ -2382,7 +2450,7 @@ bool IsEligibleWorldRenderModel(const void* renderModel, const void*& owner,
         const std::uint32_t paddedJointCount =
             packedPaddedJointCount & 0x00FFFFFFU;
         if (modelAsset == nullptr ||
-            !IsReadableMemory(modelAsset, sizeof(void*)) || jointCount == 0 ||
+            !IsReadableMemoryCached(modelAsset, sizeof(void*)) || jointCount == 0 ||
             jointCount > kMaximumJointCount ||
             paddedJointCount != ((jointCount + 7U) & ~7U) ||
             paddedJointCount > kMaximumJointCount) {
@@ -3380,14 +3448,21 @@ void MaybeLogWorldTransformDiagnostics(const PresentationContext& context) {
     }
 }
 
+// Change detection for joint palettes. Processes eight bytes per step (a
+// joint is 48 bytes) instead of one; only equality of hashes is ever used.
 std::uint64_t HashJointPalette(const d2_pose::JointMatrix* palette,
                                std::size_t jointCount) {
+    static_assert(sizeof(d2_pose::JointMatrix) % sizeof(std::uint64_t) == 0,
+                  "Joint palettes are hashed in 64-bit words");
     const auto* bytes = reinterpret_cast<const unsigned char*>(palette);
-    const std::size_t byteCount = jointCount * sizeof(d2_pose::JointMatrix);
-    std::uint64_t hash = 1469598103934665603ULL;
-    for (std::size_t index = 0; index < byteCount; ++index) {
-        hash ^= bytes[index];
-        hash *= 1099511628211ULL;
+    const std::size_t wordCount =
+        jointCount * sizeof(d2_pose::JointMatrix) / sizeof(std::uint64_t);
+    std::uint64_t hash = 1469598103934665603ULL ^ jointCount;
+    for (std::size_t index = 0; index < wordCount; ++index) {
+        std::uint64_t word = 0;
+        memcpy(&word, bytes + index * sizeof(word), sizeof(word));
+        hash = (hash ^ word) * 0x9E3779B97F4A7C15ULL;
+        hash ^= hash >> 29;
     }
     return hash;
 }
@@ -3484,7 +3559,7 @@ void ObserveOwnerlessSkeletalModel(
     const d2_pose::JointMatrix* palette, std::uint32_t jointCount,
     std::uint32_t paddedJointCount, signed char pending,
     const PresentationContext& context) {
-    AcquireSRWLockExclusive(&g_skeletalObservationLock);
+    AcquireSkeletalObservationLock();
     OwnerlessSkeletalTrack* track = FindOwnerlessSkeletalTrack(
         renderModel, modelAsset, context.serial, false);
     if (track == nullptr) {
@@ -3612,12 +3687,53 @@ SkeletalObservationTrack* FindSkeletalObservationTrack(
     return reusable;
 }
 
+constexpr std::size_t kPaletteRigidityCacheSize = 2048;
+
+struct PaletteRigidityCacheEntry {
+    const void* palette = nullptr;
+    std::uint64_t checksum = 0;
+    std::uint32_t jointCount = 0;
+    std::uint32_t firstNonRigidJoint = 0;
+    bool rigid = false;
+};
+
+SRWLOCK g_paletteRigidityLock = SRWLOCK_INIT;
+std::array<PaletteRigidityCacheEntry, kPaletteRigidityCacheSize> g_paletteRigidity{};
+
+bool PaletteIsRigid(const d2_pose::JointMatrix* palette, std::uint32_t jointCount,
+                    std::uint64_t checksum, std::uint32_t& firstNonRigidJoint) {
+    const std::size_t slot =
+        (static_cast<std::size_t>(reinterpret_cast<std::uintptr_t>(palette) >> 4) ^
+         static_cast<std::size_t>(checksum)) & (kPaletteRigidityCacheSize - 1);
+    AcquireSRWLockShared(&g_paletteRigidityLock);
+    const PaletteRigidityCacheEntry cached = g_paletteRigidity[slot];
+    ReleaseSRWLockShared(&g_paletteRigidityLock);
+    if (cached.palette == palette && cached.checksum == checksum &&
+        cached.jointCount == jointCount) {
+        firstNonRigidJoint = cached.firstNonRigidJoint;
+        return cached.rigid;
+    }
+    bool rigid = true;
+    firstNonRigidJoint = std::numeric_limits<std::uint32_t>::max();
+    for (std::uint32_t index = 0; index < jointCount; ++index) {
+        if (!d2_pose::IsRigid(palette[index])) {
+            rigid = false;
+            firstNonRigidJoint = index;
+            break;
+        }
+    }
+    AcquireSRWLockExclusive(&g_paletteRigidityLock);
+    g_paletteRigidity[slot] = {palette, checksum, jointCount, firstNonRigidJoint, rigid};
+    ReleaseSRWLockExclusive(&g_paletteRigidityLock);
+    return rigid;
+}
+
 bool PrepareSkeletalPose(
     void* renderModel,
     std::array<d2_pose::JointMatrix, kMaximumJointCount>& output,
     SkeletalPreparedUpload& prepared) {
     g_skeletalDiagnostics.calls.fetch_add(1, std::memory_order_relaxed);
-    if (!IsReadableMemory(renderModel, kSkinnedModelSize)) {
+    if (!IsReadableMemoryCached(renderModel, kSkinnedModelSize)) {
         g_skeletalDiagnostics.layoutRejected.fetch_add(1,
                                                        std::memory_order_relaxed);
         return false;
@@ -3672,19 +3788,19 @@ bool PrepareSkeletalPose(
         static_cast<std::size_t>(paddedJointCount) *
         sizeof(d2_pose::JointMatrix);
     if (modelAsset == nullptr ||
-        !IsReadableMemory(modelAsset, sizeof(void*)) || palette == nullptr ||
+        !IsReadableMemoryCached(modelAsset, sizeof(void*)) || palette == nullptr ||
         jointCount == 0 ||
         jointCount > kMaximumJointCount ||
         paddedJointCount != expectedPaddedJointCount ||
         paddedJointCount > kMaximumJointCount ||
-        !IsReadableMemory(palette, paletteBytes)) {
+        !IsReadableMemoryCached(palette, paletteBytes)) {
         g_skeletalDiagnostics.layoutRejected.fetch_add(1,
                                                        std::memory_order_relaxed);
         return false;
     }
 
     const bool ownerReadable =
-        owner != nullptr && IsReadableMemory(owner, sizeof(void*));
+        owner != nullptr && IsReadableMemoryCached(owner, sizeof(void*));
     const void* trackOwner = owner;
     bool cinematic = false;
     if (!ownerReadable) {
@@ -3739,18 +3855,11 @@ bool PrepareSkeletalPose(
     }
 
     const std::uint64_t checksum = HashJointPalette(palette, jointCount);
-    bool paletteRigid = true;
-    std::uint32_t firstNonRigidJoint =
-        std::numeric_limits<std::uint32_t>::max();
-    for (std::uint32_t index = 0; index < jointCount; ++index) {
-        if (!d2_pose::IsRigid(palette[index])) {
-            paletteRigid = false;
-            firstNonRigidJoint = index;
-            break;
-        }
-    }
+    std::uint32_t firstNonRigidJoint = 0;
+    const bool paletteRigid =
+        PaletteIsRigid(palette, jointCount, checksum, firstNonRigidJoint);
 
-    AcquireSRWLockExclusive(&g_skeletalObservationLock);
+    AcquireSkeletalObservationLock();
     SkeletalObservationTrack* track = FindSkeletalObservationTrack(
         renderModel, trackOwner, context.serial, false);
     if (track == nullptr) {
@@ -3911,9 +4020,10 @@ bool PrepareSkeletalPose(
             (context.scaledTime - track->previousTime) / pairInterval,
             kMinimumAlpha, kMaximumAlpha);
         memcpy(output.data(), palette, paletteBytes);
+        // Both stored palettes were accepted as rigid when they were sampled.
         adjusted = d2_pose::InterpolateJointPalettes(
             track->previousPalette.data(), track->currentPalette.data(),
-            jointCount, alpha, output.data());
+            jointCount, alpha, output.data(), false);
         if (adjusted) {
             prepared.renderModel = renderModel;
             prepared.owner = trackOwner;
@@ -3960,7 +4070,7 @@ void RecordSkeletalUpload(const SkeletalPreparedUpload& prepared) {
         }
     }
 
-    AcquireSRWLockExclusive(&g_skeletalObservationLock);
+    AcquireSkeletalObservationLock();
     SkeletalObservationTrack* track = FindSkeletalObservationTrack(
         prepared.renderModel, prepared.owner, prepared.presentationSerial,
         false);
@@ -4548,14 +4658,14 @@ void HookRenderModelGpuCopyBody(
         !SourceLevelWritesSelected();
     if ((!firstPersonHandsEnabled && !transformInterpolationEnabled) ||
         g_renderModelGpuCopyTrampoline == nullptr ||
-        !IsReadableMemory(drawSurface, 16)) {
+        !IsReadableMemoryCached(drawSurface, 16)) {
         CallOriginalRenderModelGpuCopy(state, renderContext, parameter, drawSurface);
         return;
     }
 
     void* renderModel = nullptr;
     memcpy(&renderModel, static_cast<unsigned char*>(drawSurface) + 8, sizeof(renderModel));
-    if (!IsReadableMemory(renderModel, kRenderModelSize)) {
+    if (!IsReadableMemoryCached(renderModel, kRenderModelSize)) {
         CallOriginalRenderModelGpuCopy(state, renderContext, parameter, drawSurface);
         return;
     }
@@ -4593,7 +4703,7 @@ void HookRenderModelGpuCopyBody(
 
     const std::size_t renderModelCloneSize =
         exactSkinned ? kSkinnedModelSize : kRenderModelSize;
-    if (!IsReadableMemory(renderModel, renderModelCloneSize)) {
+    if (!IsReadableMemoryCached(renderModel, renderModelCloneSize)) {
         CallOriginalRenderModelGpuCopy(state, renderContext, parameter,
                                      drawSurface);
         return;
@@ -6013,6 +6123,7 @@ struct SourceLevelDiagnostics {
     std::atomic<std::uint64_t> assemblyMarkDirty{0};
     std::atomic<std::uint64_t> assemblyMarkDirtyTransform{0};
     std::atomic<std::uint64_t> partMarkDirtyTransform{0};
+    std::atomic<std::uint64_t> dirtyLockContended{0};
 };
 
 // Counters only touched by the flush thread.
@@ -6064,6 +6175,8 @@ struct SourceLevelDiagnosticsSnapshot {
     std::uint64_t assemblyMarkDirty = 0;
     std::uint64_t assemblyMarkDirtyTransform = 0;
     std::uint64_t partMarkDirtyTransform = 0;
+    std::uint64_t dirtyLockContended = 0;
+    std::uint64_t poseLockContended = 0;
     SourceLevelCounters plain{};
 };
 
@@ -6740,6 +6853,9 @@ SourceLevelDiagnosticsSnapshot CaptureSourceLevelDiagnostics(std::uint64_t seria
         g_sourceDiagnostics.assemblyMarkDirtyTransform.load(std::memory_order_relaxed);
     snapshot.partMarkDirtyTransform =
         g_sourceDiagnostics.partMarkDirtyTransform.load(std::memory_order_relaxed);
+    snapshot.dirtyLockContended =
+        g_sourceDiagnostics.dirtyLockContended.load(std::memory_order_relaxed);
+    snapshot.poseLockContended = g_skeletalLockContended.load(std::memory_order_relaxed);
     snapshot.plain = g_sourceCounters;
     return snapshot;
 }
@@ -6776,7 +6892,7 @@ void MaybeLogSourceLevelDiagnostics(std::uint64_t serial) {
     const double perFlush = flushes != 0 ? 1.0 / static_cast<double>(flushes) : 0.0;
     Log("Source-level %.2fs: frames=%llu flushes=%llu (%.2f/frame, with tick=%llu) "
         "markDirty=%llu transform=%llu offFlushThread=%llu uniqueDirty/flush=%.1f "
-        "foreignWorld=%llu overflows=%llu; renderer first call after-flush=%llu "
+        "foreignWorld=%llu overflows=%llu lockContended=%llu poseLockContended=%llu; renderer first call after-flush=%llu "
         "before-flush=%llu during-flush=%llu; threads flush=%lu renderer=%lu; per flush "
         "engine=%.3fms plugin=%.3fms; tracks active=%llu created=%llu samples=%llu "
         "holds=%llu writes=%llu restores=%llu drops=%llu dead=%llu stale=%llu "
@@ -6796,6 +6912,8 @@ void MaybeLogSourceLevelDiagnostics(std::uint64_t serial) {
             perFlush,
         delta(current.plain.foreignWorldDirty, last.plain.foreignWorldDirty),
         delta(current.dirtyOverflows, last.dirtyOverflows),
+        delta(current.dirtyLockContended, last.dirtyLockContended),
+        delta(current.poseLockContended, last.poseLockContended),
         delta(current.rendererFirstAfterFlush, last.rendererFirstAfterFlush),
         delta(current.rendererFirstBeforeFlush, last.rendererFirstBeforeFlush),
         delta(current.rendererCallsDuringFlush, last.rendererCallsDuringFlush),
@@ -6856,10 +6974,13 @@ extern "C" void __fastcall HookRenderModelMarkDirty(void* model, std::uintptr_t 
         g_sourceDiagnostics.markDirtyOffFlushThread.fetch_add(
             1, std::memory_order_relaxed);
     }
-    AcquireSRWLockExclusive(&g_sourceDirtyLock);
     void* world = nullptr;
     memcpy(&world, static_cast<unsigned char*>(model) + kRenderModelWorldOffset,
            sizeof(world));
+    if (!TryAcquireSRWLockExclusive(&g_sourceDirtyLock)) {
+        g_sourceDiagnostics.dirtyLockContended.fetch_add(1, std::memory_order_relaxed);
+        AcquireSRWLockExclusive(&g_sourceDirtyLock);
+    }
     if (g_sourceDirty.size() < kSourceDirtyCapacity) {
         g_sourceDirty.push_back({model, world, 0});
     } else if (!g_sourceDirtyOverflowed) {

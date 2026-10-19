@@ -173,12 +173,15 @@ inline void WriteRotation(const Quaternion& quaternion, JointMatrix& matrix) {
 inline bool InterpolateJointPalettes(const JointMatrix* previous,
                                      const JointMatrix* current,
                                      std::size_t jointCount, double alpha,
-                                     JointMatrix* output) {
+                                     JointMatrix* output,
+                                     bool validateRigidity = true) {
     if (previous == nullptr || current == nullptr || output == nullptr ||
         jointCount == 0 || jointCount > 256 || !std::isfinite(alpha)) {
         return false;
     }
-    for (std::size_t index = 0; index < jointCount; ++index) {
+    // Callers that only store palettes already accepted as rigid may skip
+    // the per-joint re-validation.
+    for (std::size_t index = 0; validateRigidity && index < jointCount; ++index) {
         if (!IsRigid(previous[index]) || !IsRigid(current[index])) {
             return false;
         }
