@@ -329,12 +329,15 @@ bool g_enableTelemetry = false;
 bool g_enableInterpolationAbProbe = false;
 bool g_sourceLevelTransforms = false;
 bool g_sourceLevelWrites = false;
+bool g_sourceLevelHands = false;
+bool g_renderModelGpuCopyHookSkipped = false;
 bool g_sourceLevelInstalled = false;
 std::atomic<bool> g_sourceLevelRuntimeEnabled{true};
 std::atomic<std::uint64_t> g_abSourceFlushTicks{0};
 std::atomic<std::uint64_t> g_abSourceFlushOriginalTicks{0};
 std::atomic<std::uint64_t> g_abSourceWrites{0};
 bool SourceLevelWritesSelected();
+bool SourceHandsSelected();
 void ObserveSourceLevelRendererCall();
 std::atomic<bool> g_adaptiveInterpolationManualOverride{false};
 std::atomic<int> g_unlockState{0};
@@ -886,6 +889,8 @@ void LoadConfiguration() {
         L"Interpolation", L"SourceLevelTransforms", 0, path) != 0;
     g_sourceLevelWrites = g_sourceLevelTransforms &&
         GetPrivateProfileIntW(L"Interpolation", L"SourceLevelWrites", 0, path) != 0;
+    g_sourceLevelHands = g_sourceLevelWrites &&
+        GetPrivateProfileIntW(L"Interpolation", L"SourceLevelHands", 1, path) != 0;
     g_enableTelemetry = GetPrivateProfileIntW(
         L"Diagnostics", L"Telemetry", 0, path) != 0;
     g_enableInterpolationAbProbe = GetPrivateProfileIntW(
@@ -908,8 +913,10 @@ void LoadConfiguration() {
         g_enableAdaptiveInterpolation ? 1U : 0U,
         g_enableTelemetry ? 1U : 0U,
         g_enableInterpolationAbProbe ? 1U : 0U);
-    Log("Configuration: SourceLevelTransforms=%u, SourceLevelWrites=%u.",
-        g_sourceLevelTransforms ? 1U : 0U, g_sourceLevelWrites ? 1U : 0U);
+    Log("Configuration: SourceLevelTransforms=%u, SourceLevelWrites=%u, "
+        "SourceLevelHands=%u.",
+        g_sourceLevelTransforms ? 1U : 0U, g_sourceLevelWrites ? 1U : 0U,
+        g_sourceLevelHands ? 1U : 0U);
     if (g_enableInterpolationAbProbe) {
         Log("A/B controls: Ctrl+F11 starts/stops a clean measurement segment; "
             "F11 toggles all configured interpolation; Alt+F11 cycles all, "
@@ -1359,6 +1366,7 @@ bool VerifyExecutableLayout() {
     if (g_sourceLevelTransforms && !selected->sourceLevelSupported) {
         g_sourceLevelTransforms = false;
         g_sourceLevelWrites = false;
+        g_sourceLevelHands = false;
         Log("SourceLevelTransforms is not supported on the %s executable; the "
             "source-level layer was disabled and the per-draw path is used.",
             selected->name);
@@ -4459,7 +4467,9 @@ void HookRenderModelGpuCopyBody(
     if (g_sourceLevelInstalled) {
         ObserveSourceLevelRendererCall();
     }
-    const bool firstPersonHandsEnabled = RuntimeFirstPersonHandsEnabled();
+    // Source mode corrects first-person models after the render-world flush.
+    const bool firstPersonHandsEnabled =
+        RuntimeFirstPersonHandsEnabled() && !SourceHandsSelected();
     // The source-level layer already wrote presentation matrices into the
     // render models; the per-draw world path would treat them as raw input.
     const bool transformInterpolationEnabled =
@@ -5351,7 +5361,10 @@ void HandleInterpolationAbControls() {
         const bool shiftIsDown =
             (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
         if (controlIsDown && shiftIsDown) {
-            if (!g_sourceLevelInstalled || !g_sourceLevelWrites) {
+            if (g_renderModelGpuCopyHookSkipped) {
+                Log("Ctrl+Shift+F11: the per-draw hook is not installed in source "
+                    "mode; set Diagnostics/InterpolationABProbe=1 to compare methods.");
+            } else if (!g_sourceLevelInstalled || !g_sourceLevelWrites) {
                 Log("Ctrl+Shift+F11: the source-level transform method is not "
                     "available (requires SourceLevelTransforms=1 and "
                     "SourceLevelWrites=1 on a supported executable).");
@@ -5822,6 +5835,10 @@ struct SourceLevelCounters {
     std::uint64_t activePartTracks = 0;
     std::uint64_t linkedCandidates = 0;
     std::uint64_t linkedTracksCreated = 0;
+    std::uint64_t handsDirty = 0;
+    std::uint64_t handsTracksCreated = 0;
+    std::uint64_t handsWrites = 0;
+    std::uint64_t activeHandsTracks = 0;
 };
 
 SourceLevelDiagnostics g_sourceDiagnostics;
@@ -5878,6 +5895,8 @@ struct SourceTrack {
     bool dirty = false;
     bool fresh = false;
     bool assemblyPart = false;
+    // First-person (depth-hacked) model corrected to the predicted camera.
+    bool hands = false;
 };
 
 std::array<SourceTrack, kSourceTrackCapacity> g_sourceTracks{};
@@ -5932,17 +5951,40 @@ SourceTrack* FindSourceTrack(const void* model) {
     return nullptr;
 }
 
+// Occupied slots, so per-flush work scales with tracked models instead of the
+// table capacity. A slot is listed at most once; dropped tracks are removed
+// lazily by CompactSourceTrackList.
+std::vector<std::uint32_t> g_sourceActive;
+std::array<bool, kSourceTrackCapacity> g_sourceListed{};
+
 SourceTrack* CreateSourceTrack(void* model) {
     const std::size_t base = SourceTrackHash(model);
     for (std::size_t probe = 0; probe < kSourceTrackProbeLimit; ++probe) {
-        SourceTrack& track = g_sourceTracks[(base + probe) & (kSourceTrackCapacity - 1)];
+        const std::size_t index = (base + probe) & (kSourceTrackCapacity - 1);
+        SourceTrack& track = g_sourceTracks[index];
         if (track.model == nullptr) {
             track = {};
             track.model = model;
+            if (!g_sourceListed[index]) {
+                g_sourceListed[index] = true;
+                g_sourceActive.push_back(static_cast<std::uint32_t>(index));
+            }
             return &track;
         }
     }
     return nullptr;
+}
+
+void CompactSourceTrackList() {
+    std::size_t kept = 0;
+    for (std::uint32_t index : g_sourceActive) {
+        if (g_sourceTracks[index].model != nullptr) {
+            g_sourceActive[kept++] = index;
+        } else {
+            g_sourceListed[index] = false;
+        }
+    }
+    g_sourceActive.resize(kept);
 }
 
 // Resolves the world's model-pointer array once per flush. A model is alive
@@ -5973,27 +6015,28 @@ bool MatricesBitwiseEqual(const Matrix4& left, const Matrix4& right) {
     return memcmp(&left, &right, sizeof(left)) == 0;
 }
 
-// Restores the engine's committed matrices for every track of `world` and
-// forgets them. Used when the layer is switched off at runtime or the
-// presentation context is unavailable.
-void RestoreSourceTracks(const SourceWorldView& view) {
-    for (SourceTrack& track : g_sourceTracks) {
-        if (track.model == nullptr || track.world != view.world) {
-            continue;
+bool SourceHandsSelected() {
+    return SourceLevelWritesSelected() && g_sourceLevelHands;
+}
+
+bool SourceHandsActive() {
+    return SourceHandsSelected() && RuntimeFirstPersonHandsEnabled();
+}
+
+// Writes the engine's committed matrices back (when ours are still in place)
+// and forgets the track.
+void RestoreAndDropSourceTrack(SourceTrack& track, bool registered) {
+    if (registered && !track.fresh) {
+        const Matrix4 raw = ReadMatrix(static_cast<const unsigned char*>(track.model),
+                                       kRenderModelMatrixOffset);
+        if (MatricesBitwiseEqual(raw, track.expected) &&
+            !MatricesBitwiseEqual(raw, track.current)) {
+            WriteSourceMatrices(track, track.current, track.currentInverse);
+            ++g_sourceCounters.restores;
         }
-        if (SourceModelRegistered(view, track.model, track.handle) &&
-            !track.fresh) {
-            const Matrix4 raw = ReadMatrix(static_cast<const unsigned char*>(track.model),
-                                           kRenderModelMatrixOffset);
-            if (MatricesBitwiseEqual(raw, track.expected) &&
-                !MatricesBitwiseEqual(raw, track.current)) {
-                WriteSourceMatrices(track, track.current, track.currentInverse);
-                ++g_sourceCounters.restores;
-            }
-        }
-        track = {};
-        ++g_sourceCounters.drops;
     }
+    track = {};
+    ++g_sourceCounters.drops;
 }
 
 void CollectSourceDirtyModels(void* world, std::vector<void*>& output, bool& overflowed) {
@@ -6054,54 +6097,88 @@ bool ResolveSourceWorldView(void* world, SourceWorldView& view) {
     return true;
 }
 
-SourceTrack* RegisterSourceDirtyModel(const SourceWorldView& view, void* model) {
-    {
-        SourceTrack* existing = FindSourceTrack(model);
-        if (existing != nullptr) {
-            existing->dirty = true;
-            return existing;
-        }
-        if (!IsReadableMemory(model, kRenderModelSize)) {
-            return nullptr;
-        }
-        std::uint16_t handle = 0;
-        memcpy(&handle, static_cast<unsigned char*>(model) + kRenderModelHandleOffset,
-               sizeof(handle));
-        if (!SourceModelRegistered(view, model, handle)) {
-            ++g_sourceCounters.ineligible;
-            return nullptr;
-        }
-        const void* owner = nullptr;
-        const void* modelAsset = nullptr;
-        std::uintptr_t vtable = 0;
-        bool cinematic = false;
-        if (!IsEligibleWorldRenderModel(model, owner, vtable, modelAsset, cinematic)) {
-            ++g_sourceCounters.ineligible;
-            return nullptr;
-        }
-        SourceTrack* track = CreateSourceTrack(model);
-        if (track == nullptr) {
-            ++g_sourceCounters.capacityMisses;
-            return nullptr;
-        }
-        track->world = view.world;
-        track->handle = handle;
-        track->vtable = vtable;
-        track->owner = owner;
-        track->modelAsset = modelAsset;
-        track->fresh = true;
-        track->dirty = true;
-        track->assemblyPart =
-            static_cast<const unsigned char*>(model)[kRenderModelAssemblyPartOffset] == 1;
-        ++g_sourceCounters.tracksCreated;
-        return track;
+// Same test as IsPlayerDepthHackObject without the VirtualQuery; only used on
+// models known to be alive (registered or dirtied this tick).
+bool SourceModelIsFirstPerson(const void* model) {
+    float depthHack = 0.0f;
+    memcpy(&depthHack, static_cast<const unsigned char*>(model) + kRenderModelDepthHackOffset,
+           sizeof(depthHack));
+    return std::isfinite(depthHack) && depthHack > 0.0f && depthHack < 100.0f;
+}
+
+bool IsSourceExactModelType(const void* model, std::uintptr_t& vtable) {
+    memcpy(&vtable, model, sizeof(vtable));
+    return vtable == g_executableBase + g_layout->renderModelStaticVtable.rva ||
+           vtable == g_executableBase + g_layout->skinnedModelVtable.rva;
+}
+
+SourceTrack* RegisterSourceDirtyModel(const SourceWorldView& view, void* model,
+                                      bool worldActive, bool handsActive) {
+    SourceTrack* existing = FindSourceTrack(model);
+    if (existing != nullptr) {
+        existing->dirty = true;
+        return existing;
     }
+    if (!IsReadableMemory(model, kRenderModelSize)) {
+        return nullptr;
+    }
+    std::uint16_t handle = 0;
+    memcpy(&handle, static_cast<unsigned char*>(model) + kRenderModelHandleOffset,
+           sizeof(handle));
+    if (!SourceModelRegistered(view, model, handle)) {
+        ++g_sourceCounters.ineligible;
+        return nullptr;
+    }
+    const void* owner = nullptr;
+    const void* modelAsset = nullptr;
+    std::uintptr_t vtable = 0;
+    bool hands = false;
+    if (SourceModelIsFirstPerson(model)) {
+        // First-person (depth-hacked) models follow the predicted camera
+        // instead of being interpolated between ticks.
+        if (!handsActive || !IsSourceExactModelType(model, vtable)) {
+            ++g_sourceCounters.ineligible;
+            return nullptr;
+        }
+        hands = true;
+    } else {
+        bool cinematic = false;
+        if (!worldActive ||
+            !IsEligibleWorldRenderModel(model, owner, vtable, modelAsset, cinematic)) {
+            ++g_sourceCounters.ineligible;
+            return nullptr;
+        }
+    }
+    SourceTrack* track = CreateSourceTrack(model);
+    if (track == nullptr) {
+        ++g_sourceCounters.capacityMisses;
+        return nullptr;
+    }
+    track->world = view.world;
+    track->handle = handle;
+    track->vtable = vtable;
+    track->owner = owner;
+    track->modelAsset = modelAsset;
+    track->fresh = true;
+    track->dirty = true;
+    track->hands = hands;
+    track->assemblyPart =
+        static_cast<const unsigned char*>(model)[kRenderModelAssemblyPartOffset] == 1;
+    ++g_sourceCounters.tracksCreated;
+    if (hands) {
+        ++g_sourceCounters.handsTracksCreated;
+    }
+    return track;
 }
 
 void RegisterSourceDirtyModels(const SourceWorldView& view,
-                               const std::vector<void*>& dirty) {
+                               const std::vector<void*>& dirty,
+                               bool worldActive, bool handsActive) {
     for (void* model : dirty) {
-        if (RegisterSourceDirtyModel(view, model) == nullptr) {
+        if (SourceModelIsFirstPerson(model)) {
+            ++g_sourceCounters.handsDirty;
+        }
+        if (RegisterSourceDirtyModel(view, model, worldActive, handsActive) == nullptr) {
             continue;
         }
         // The flush commits the linked model with its owner's flags without
@@ -6115,7 +6192,8 @@ void RegisterSourceDirtyModels(const SourceWorldView& view,
         }
         ++g_sourceCounters.linkedCandidates;
         const bool known = FindSourceTrack(linked) != nullptr;
-        if (RegisterSourceDirtyModel(view, linked) != nullptr && !known) {
+        if (RegisterSourceDirtyModel(view, linked, worldActive, handsActive) != nullptr &&
+            !known) {
             ++g_sourceCounters.linkedTracksCreated;
         }
     }
@@ -6257,36 +6335,81 @@ void UpdateSourceTrack(SourceTrack& track, const PresentationContext& context,
     }
 }
 
+// First-person models: the committed matrix is attached to the raw camera of
+// the last tick; the camera-correction delta published by the view-copy hook
+// re-attaches it to the predicted camera, exactly as the per-draw path did.
+// The cull job then copies last frame's corrected matrix into +0x60.
+void UpdateSourceHandsTrack(SourceTrack& track, const PresentationContext& context,
+                            std::uint64_t& writes) {
+    auto* bytes = static_cast<unsigned char*>(track.model);
+    const Matrix4 raw = ReadMatrix(bytes, kRenderModelMatrixOffset);
+    const bool committed = track.dirty || track.fresh ||
+                           !MatricesBitwiseEqual(raw, track.expected);
+    track.dirty = false;
+    track.fresh = false;
+    track.lastFlushSerial = context.serial;
+    if (committed) {
+        track.current = raw;
+        track.currentInverse = ReadMatrix(bytes, kRenderModelInverseMatrixOffset);
+        track.expected = raw;
+    }
+
+    Matrix4 output = track.current;
+    Matrix4 outputInverse = track.currentInverse;
+    RenderCorrectionState correction{};
+    bool corrected = false;
+    if (ReadRenderCorrection(correction)) {
+        const Matrix4 candidate = MultiplyMatrices4(correction.currentDelta, track.current);
+        const Matrix4 candidateInverse =
+            MultiplyMatrices4(track.currentInverse, correction.currentInverseDelta);
+        if (IsFinite(candidate) && IsFinite(candidateInverse)) {
+            output = candidate;
+            outputInverse = candidateInverse;
+            corrected = true;
+        }
+    }
+    if (!MatricesBitwiseEqual(raw, output)) {
+        WriteSourceMatrices(track, output, outputInverse);
+        ++writes;
+        if (corrected) {
+            ++g_sourceCounters.handsWrites;
+        } else {
+            ++g_sourceCounters.restores;
+        }
+    }
+}
+
 void ProcessSourceLevelTracks(void* world, const PresentationContext& context,
                               bool hasContext, const std::vector<void*>& dirty) {
     SourceWorldView view{};
-    const bool viewValid = ResolveSourceWorldView(world, view);
-    if (!viewValid) {
+    if (!ResolveSourceWorldView(world, view)) {
         // Without the model array nothing can be validated; forget this
         // world's tracks without touching their models.
-        for (SourceTrack& track : g_sourceTracks) {
+        for (std::uint32_t index : g_sourceActive) {
+            SourceTrack& track = g_sourceTracks[index];
             if (track.model != nullptr && track.world == world) {
                 track = {};
                 ++g_sourceCounters.deadTracks;
             }
         }
+        CompactSourceTrackList();
         return;
     }
-    if (!hasContext || !SourceLevelWritesActive()) {
-        RestoreSourceTracks(view);
-        return;
-    }
+    const bool worldActive = hasContext && SourceLevelWritesActive();
+    const bool handsActive = hasContext && SourceHandsActive();
 
-    RegisterSourceDirtyModels(view, dirty);
+    RegisterSourceDirtyModels(view, dirty, worldActive, handsActive);
     std::uint64_t writes = 0;
     std::uint64_t active = 0;
     std::uint64_t activeParts = 0;
-    for (SourceTrack& track : g_sourceTracks) {
+    std::uint64_t activeHands = 0;
+    for (std::uint32_t index : g_sourceActive) {
+        SourceTrack& track = g_sourceTracks[index];
         if (track.model == nullptr) {
             continue;
         }
         if (track.world != world) {
-            if (track.lastFlushSerial != 0 &&
+            if (hasContext && track.lastFlushSerial != 0 &&
                 track.lastFlushSerial + kSourceStaleFrames < context.serial) {
                 track = {};
                 ++g_sourceCounters.staleTracks;
@@ -6301,42 +6424,45 @@ void ProcessSourceLevelTracks(void* world, const PresentationContext& context,
             ++g_sourceCounters.deadTracks;
             continue;
         }
-        float depthHack = 0.0f;
-        memcpy(&depthHack, static_cast<const unsigned char*>(track.model) +
-                               kRenderModelDepthHackOffset, sizeof(depthHack));
-        if (!std::isfinite(depthHack) || std::abs(depthHack) > 1.0e-6f) {
-            // Became a depth-hacked (first-person) model: hand it back.
-            const Matrix4 raw = ReadMatrix(
-                static_cast<const unsigned char*>(track.model), kRenderModelMatrixOffset);
-            if (!track.fresh && MatricesBitwiseEqual(raw, track.expected) &&
-                !MatricesBitwiseEqual(raw, track.current)) {
-                WriteSourceMatrices(track, track.current, track.currentInverse);
-                ++g_sourceCounters.restores;
-            }
-            track = {};
+        if (SourceModelIsFirstPerson(track.model) != track.hands) {
+            // Switched between first-person and world rendering.
+            RestoreAndDropSourceTrack(track, true);
             ++g_sourceCounters.ineligible;
             continue;
         }
+        if (!(track.hands ? handsActive : worldActive)) {
+            RestoreAndDropSourceTrack(track, true);
+            continue;
+        }
         // A lost dirty notification (overflow) is still caught by the
-        // expected-matrix comparison in UpdateSourceTrack.
-        UpdateSourceTrack(track, context, writes);
+        // expected-matrix comparison in the update.
+        if (track.hands) {
+            UpdateSourceHandsTrack(track, context, writes);
+        } else {
+            UpdateSourceTrack(track, context, writes);
+        }
         if (track.model != nullptr) {
             ++active;
             if (track.assemblyPart) {
                 ++activeParts;
             }
+            if (track.hands) {
+                ++activeHands;
+            }
         }
     }
+    CompactSourceTrackList();
     g_sourceCounters.activeTracks = active;
     g_sourceCounters.activePartTracks = activeParts;
+    g_sourceCounters.activeHandsTracks = activeHands;
     if (writes != 0) {
         if (g_enableInterpolationAbProbe) {
             g_abSourceWrites.fetch_add(writes, std::memory_order_relaxed);
         }
         int expected = 0;
         if (g_worldTransformRenderState.compare_exchange_strong(expected, 2)) {
-            Log("Applied source-level world-transform interpolation after the "
-                "render-world flush (presentation serial %llu).",
+            Log("Applied source-level transforms after the render-world flush "
+                "(presentation serial %llu).",
                 static_cast<unsigned long long>(context.serial));
         }
     }
@@ -6408,6 +6534,7 @@ void MaybeLogSourceLevelDiagnostics(std::uint64_t serial) {
         "ineligible=%llu capMiss=%llu snaps[jump=%llu interval=%llu sameTime=%llu "
         "timeReset=%llu nonRigid=%llu]; assemblies markDirty=%llu transform=%llu "
         "partTransform=%llu partTracks=%llu linked candidates=%llu created=%llu; "
+        "hands dirty=%llu created=%llu tracks=%llu writes=%llu; per-draw hook %s; "
         "writes %s.",
         seconds, frames, flushes,
         frames != 0 ? static_cast<double>(flushes) / static_cast<double>(frames) : 0.0,
@@ -6452,6 +6579,12 @@ void MaybeLogSourceLevelDiagnostics(std::uint64_t serial) {
         static_cast<unsigned long long>(current.plain.activePartTracks),
         delta(current.plain.linkedCandidates, last.plain.linkedCandidates),
         delta(current.plain.linkedTracksCreated, last.plain.linkedTracksCreated),
+        delta(current.plain.handsDirty, last.plain.handsDirty),
+        delta(current.plain.handsTracksCreated, last.plain.handsTracksCreated),
+        static_cast<unsigned long long>(current.plain.activeHandsTracks),
+        delta(current.plain.handsWrites, last.plain.handsWrites),
+        g_renderModelGpuCopyHookSkipped ? "not installed" :
+            (g_renderModelGpuCopyTrampoline != nullptr ? "installed" : "off"),
         SourceLevelWritesActive() ? "active" :
             (g_sourceLevelWrites ? "configured but inactive" : "disabled (Phase A)"));
     g_sourceLastLogSnapshot = current;
@@ -6931,10 +7064,22 @@ DWORD WINAPI InstallThread(void*) {
         InitializeTelemetry();
     }
     if (InstallHook()) {
-        InstallRenderModelGpuCopyHook();
+        InstallSourceLevelHooks();
+        // In source mode both the world and first-person layers run after the
+        // flush; the per-draw hook is kept only for the A/B comparison.
+        const bool perDrawNeeded =
+            !(g_sourceLevelInstalled && g_sourceLevelWrites &&
+              (g_sourceLevelHands || !g_stabilizeFirstPersonHands)) ||
+            g_enableInterpolationAbProbe;
+        if (perDrawNeeded) {
+            InstallRenderModelGpuCopyHook();
+        } else {
+            g_renderModelGpuCopyHookSkipped = true;
+            Log("Renderer model GPU-copy hook not installed: source-level world and "
+                "first-person transforms run after the render-world flush.");
+        }
         InstallSkinnedPoseUploadHook();
         InstallShadowCasterBuildHooks();
-        InstallSourceLevelHooks();
     }
     return 0;
 }
