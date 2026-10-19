@@ -327,6 +327,7 @@ bool g_interpolateCinematicSkeletons = false;
 bool g_enableAdaptiveInterpolation = false;
 bool g_enableTelemetry = false;
 bool g_enableInterpolationAbProbe = false;
+bool g_toggleSounds = true;
 bool g_sourceLevelTransforms = false;
 bool g_sourceLevelWrites = false;
 bool g_sourceLevelHands = false;
@@ -895,6 +896,8 @@ void LoadConfiguration() {
         L"Diagnostics", L"Telemetry", 0, path) != 0;
     g_enableInterpolationAbProbe = GetPrivateProfileIntW(
         L"Diagnostics", L"InterpolationABProbe", 0, path) != 0;
+    g_toggleSounds = GetPrivateProfileIntW(
+        L"Diagnostics", L"ToggleSounds", 1, path) != 0;
     Log("Configuration: UnlockAbove120=%u, MaxFPS=%d, StabilizeMouseSensitivity=%u, "
         "StabilizeFirstPersonHands=%u, WorldTransforms=%u, "
         "CinematicTransforms=%u, ShadowTransforms=%u, "
@@ -914,9 +917,9 @@ void LoadConfiguration() {
         g_enableTelemetry ? 1U : 0U,
         g_enableInterpolationAbProbe ? 1U : 0U);
     Log("Configuration: SourceLevelTransforms=%u, SourceLevelWrites=%u, "
-        "SourceLevelHands=%u.",
+        "SourceLevelHands=%u, ToggleSounds=%u.",
         g_sourceLevelTransforms ? 1U : 0U, g_sourceLevelWrites ? 1U : 0U,
-        g_sourceLevelHands ? 1U : 0U);
+        g_sourceLevelHands ? 1U : 0U, g_toggleSounds ? 1U : 0U);
     if (g_enableInterpolationAbProbe) {
         Log("A/B controls: Ctrl+F11 starts/stops a clean measurement segment; "
             "F11 toggles all configured interpolation; Alt+F11 cycles all, "
@@ -5351,6 +5354,124 @@ void RecordInterpolationAbFrame(const PresentationContext& context) {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// Audible toggle feedback (Diagnostics/ToggleSounds). Beep() blocks for the
+// tone's duration, so tones are queued to a dedicated worker thread and the
+// game thread only appends to the queue.
+// ---------------------------------------------------------------------------
+
+struct ToggleTone {
+    DWORD frequency;  // 0 = silence
+    DWORD milliseconds;
+};
+
+enum class ToggleCue {
+    On,
+    Off,
+    Unavailable,
+    SegmentStart,
+    SegmentStop,
+    MethodSource,
+    MethodPerDraw,
+};
+
+SRWLOCK g_toggleToneLock = SRWLOCK_INIT;
+CONDITION_VARIABLE g_toggleToneReady = CONDITION_VARIABLE_INIT;
+std::vector<ToggleTone> g_toggleTones;
+std::atomic<bool> g_toggleToneThreadStarted{false};
+
+DWORD WINAPI ToggleToneThread(void*) {
+    std::vector<ToggleTone> tones;
+    for (;;) {
+        AcquireSRWLockExclusive(&g_toggleToneLock);
+        while (g_toggleTones.empty()) {
+            SleepConditionVariableSRW(&g_toggleToneReady, &g_toggleToneLock,
+                                      INFINITE, 0);
+        }
+        tones.swap(g_toggleTones);
+        ReleaseSRWLockExclusive(&g_toggleToneLock);
+        for (const ToggleTone& tone : tones) {
+            if (tone.frequency == 0) {
+                Sleep(tone.milliseconds);
+            } else {
+                Beep(tone.frequency, tone.milliseconds);
+            }
+        }
+        tones.clear();
+    }
+}
+
+void QueueToggleTones(std::initializer_list<ToggleTone> tones) {
+    if (!g_toggleSounds) {
+        return;
+    }
+    if (!g_toggleToneThreadStarted.exchange(true, std::memory_order_acq_rel)) {
+        HANDLE thread = CreateThread(nullptr, 0, ToggleToneThread, nullptr, 0, nullptr);
+        if (thread == nullptr) {
+            g_toggleSounds = false;
+            return;
+        }
+        CloseHandle(thread);
+    }
+    AcquireSRWLockExclusive(&g_toggleToneLock);
+    // A held key or rapid presses must not build up a backlog.
+    if (g_toggleTones.size() < 32) {
+        g_toggleTones.insert(g_toggleTones.end(), tones.begin(), tones.end());
+    }
+    ReleaseSRWLockExclusive(&g_toggleToneLock);
+    WakeConditionVariable(&g_toggleToneReady);
+}
+
+// Rising = on, falling = off, a low buzz = not available, a single click =
+// segment start, a double click = segment stop, high two-tone = source-level
+// method, low two-tone = per-draw method.
+void PlayToggleCue(ToggleCue cue) {
+    switch (cue) {
+        case ToggleCue::On:
+            QueueToggleTones({{600, 70}, {900, 90}});
+            break;
+        case ToggleCue::Off:
+            QueueToggleTones({{900, 70}, {600, 90}});
+            break;
+        case ToggleCue::Unavailable:
+            QueueToggleTones({{220, 180}});
+            break;
+        case ToggleCue::SegmentStart:
+            QueueToggleTones({{1800, 25}});
+            break;
+        case ToggleCue::SegmentStop:
+            QueueToggleTones({{1800, 25}, {0, 60}, {1800, 25}});
+            break;
+        case ToggleCue::MethodSource:
+            QueueToggleTones({{1200, 80}, {1500, 110}});
+            break;
+        case ToggleCue::MethodPerDraw:
+            QueueToggleTones({{450, 80}, {330, 110}});
+            break;
+    }
+}
+
+// Alt+F11 profile index: 1 = all, 2 = transforms only, 3 = skeletons only,
+// 4 = off; one short beep per index.
+void PlayProfileCue(int index) {
+    switch (index) {
+        case 1:
+            QueueToggleTones({{800, 60}});
+            break;
+        case 2:
+            QueueToggleTones({{800, 60}, {0, 70}, {800, 60}});
+            break;
+        case 3:
+            QueueToggleTones({{800, 60}, {0, 70}, {800, 60}, {0, 70}, {800, 60}});
+            break;
+        default:
+            QueueToggleTones({{800, 60}, {0, 70}, {800, 60}, {0, 70}, {800, 60},
+                              {0, 70}, {800, 60}});
+            break;
+    }
+}
+
 void HandleInterpolationAbControls() {
     const bool f11IsDown = (GetAsyncKeyState(VK_F11) & 0x8000) != 0;
     if (f11IsDown && !g_f11WasDown) {
@@ -5362,9 +5483,11 @@ void HandleInterpolationAbControls() {
             (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
         if (controlIsDown && shiftIsDown) {
             if (g_renderModelGpuCopyHookSkipped) {
+                PlayToggleCue(ToggleCue::Unavailable);
                 Log("Ctrl+Shift+F11: the per-draw hook is not installed in source "
                     "mode; set Diagnostics/InterpolationABProbe=1 to compare methods.");
             } else if (!g_sourceLevelInstalled || !g_sourceLevelWrites) {
+                PlayToggleCue(ToggleCue::Unavailable);
                 Log("Ctrl+Shift+F11: the source-level transform method is not "
                     "available (requires SourceLevelTransforms=1 and "
                     "SourceLevelWrites=1 on a supported executable).");
@@ -5377,25 +5500,32 @@ void HandleInterpolationAbControls() {
                     std::memory_order_relaxed);
                 g_sourceLevelRuntimeEnabled.store(nowSource,
                                                   std::memory_order_relaxed);
-                Log("Ctrl+Shift+F11: world-transform method is now %s.",
-                    nowSource ? "source-level (render-world flush)" : "per-draw");
+                PlayToggleCue(nowSource ? ToggleCue::MethodSource
+                                        : ToggleCue::MethodPerDraw);
+                Log("Ctrl+Shift+F11: world-transform method is now %s%s.",
+                    nowSource ? "source-level (render-world flush)" : "per-draw",
+                    wasCapturing ? "; the running A/B segment was restarted" : "");
                 if (wasCapturing) {
                     StartInterpolationAbSegment();
                 }
             }
         } else if (controlIsDown) {
             if (!g_enableInterpolationAbProbe) {
+                PlayToggleCue(ToggleCue::Unavailable);
                 Log("Ctrl+F11: A/B measurement is unavailable because "
                     "Diagnostics/InterpolationABProbe is disabled.");
             } else if (g_interpolationAbProbe.capturing) {
+                PlayToggleCue(ToggleCue::SegmentStop);
                 StopInterpolationAbSegment("Ctrl+F11 stop");
                 Log("Ctrl+F11: A/B measurement stopped; travel frames will "
                     "not be sampled.");
             } else {
+                PlayToggleCue(ToggleCue::SegmentStart);
                 StartInterpolationAbSegment();
             }
         } else if (altIsDown) {
             if (!HasConfiguredInterpolationLayers()) {
+                PlayToggleCue(ToggleCue::Unavailable);
                 Log("Alt+F11: no interpolation layers are enabled by "
                     "configuration.");
             } else {
@@ -5426,9 +5556,13 @@ void HandleInterpolationAbControls() {
                     nextTransforms, std::memory_order_relaxed);
                 g_skeletalInterpolationRuntimeEnabled.store(
                     nextSkeletons, std::memory_order_relaxed);
-                Log("Alt+F11: interpolation profile transforms=%s "
+                const int profileIndex = nextTransforms
+                    ? (nextSkeletons ? 1 : 2)
+                    : (nextSkeletons ? 3 : 4);
+                PlayProfileCue(profileIndex);
+                Log("Alt+F11: interpolation profile %d/4 transforms=%s "
                     "skeletons=%s; first-person root remains unchanged.",
-                    nextTransforms ? "on" : "off",
+                    profileIndex, nextTransforms ? "on" : "off",
                     nextSkeletons ? "on" : "off");
                 if (wasCapturing) {
                     StartInterpolationAbSegment();
@@ -5436,6 +5570,7 @@ void HandleInterpolationAbControls() {
             }
         } else if (shiftIsDown) {
             if (!g_stabilizeFirstPersonHands) {
+                PlayToggleCue(ToggleCue::Unavailable);
                 Log("Shift+F11: first-person root stabilization is disabled "
                     "by configuration.");
             } else {
@@ -5448,6 +5583,7 @@ void HandleInterpolationAbControls() {
                 }
                 g_firstPersonHandsRuntimeEnabled.store(
                     nowEnabled, std::memory_order_relaxed);
+                PlayToggleCue(nowEnabled ? ToggleCue::On : ToggleCue::Off);
                 Log("Shift+F11: first-person root stabilization %s; camera "
                     "prediction remains unchanged.",
                     nowEnabled ? "enabled" : "disabled");
@@ -5456,6 +5592,7 @@ void HandleInterpolationAbControls() {
                 }
             }
         } else if (!HasConfiguredInterpolationLayers()) {
+            PlayToggleCue(ToggleCue::Unavailable);
             Log("F11: no interpolation layers are enabled by configuration.");
         } else {
             SuspendAdaptiveInterpolationForManualControl();
@@ -5473,6 +5610,7 @@ void HandleInterpolationAbControls() {
                 nowEnabled, std::memory_order_relaxed);
             g_skeletalInterpolationRuntimeEnabled.store(
                 nowEnabled, std::memory_order_relaxed);
+            PlayToggleCue(nowEnabled ? ToggleCue::On : ToggleCue::Off);
             Log("F11: configured world/skeletal/cinematic interpolation %s; "
                 "camera, mouse, unlock, and first-person root settings remain "
                 "unchanged.", nowEnabled ? "enabled" : "disabled");
@@ -5630,6 +5768,7 @@ void ApplyPrediction(void* destination, const void* source) {
         const bool nowEnabled = !g_enabled.load(std::memory_order_relaxed);
         g_enabled.store(nowEnabled, std::memory_order_relaxed);
         g_prediction.initialized = false;
+        PlayToggleCue(nowEnabled ? ToggleCue::On : ToggleCue::Off);
         Log("F10: high-FPS camera and first-person prediction %s.",
             nowEnabled ? "enabled" : "disabled");
     }
