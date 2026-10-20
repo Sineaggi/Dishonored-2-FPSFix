@@ -348,6 +348,7 @@ bool g_overlay = false;
 void TryInstallOverlayPresentHook();
 void ToggleDevGui();
 bool g_crashLog = false;
+int g_devGuiScale = 0;
 bool g_autoContinueLoadScreen = false;
 bool g_autoAbSchedule = false;
 int g_autoAbSegmentSeconds = 20;
@@ -940,6 +941,8 @@ void LoadConfiguration() {
         L"Diagnostics", L"Overlay", 0, path) != 0;
     g_crashLog = GetPrivateProfileIntW(
         L"Diagnostics", L"CrashLog", 0, path) != 0;
+    g_devGuiScale = std::max(0, std::min(4, static_cast<int>(
+        GetPrivateProfileIntW(L"Diagnostics", L"DevGuiScale", 0, path))));
     g_autoContinueLoadScreen = GetPrivateProfileIntW(
         L"Diagnostics", L"AutoContinueLoadScreen", 0, path) != 0;
     if (g_autoContinueLoadScreen && !g_sourceLevelTransforms) {
@@ -8235,51 +8238,63 @@ void DrawOverlayFrame(IDXGISwapChain* swapChain) {
                                         0, &mapped))) {
         vertices = static_cast<OverlayVertex*>(mapped.pData);
 
-        // Mod status box, top right.
+        // Mod status box, top right; hidden while DevGUI is open.
         const OverlayFont& status = renderer.statusFont;
-        char lines[4][160]{};
-        const int lineCount = FormatOverlayLines(lines);
-        const float cellWidth = static_cast<float>(status.cellWidth);
-        const float cellHeight = static_cast<float>(status.cellHeight);
-        const float margin = cellHeight * 0.5f;
-        std::size_t longest = 0;
-        for (int line = 0; line < lineCount; ++line) {
-            longest = std::max(longest, strlen(lines[line]));
+        if (devGui.empty()) {
+            char lines[4][160]{};
+            const int lineCount = FormatOverlayLines(lines);
+            const float cellWidth = static_cast<float>(status.cellWidth);
+            const float cellHeight = static_cast<float>(status.cellHeight);
+            const float margin = cellHeight * 0.5f;
+            std::size_t longest = 0;
+            for (int line = 0; line < lineCount; ++line) {
+                longest = std::max(longest, strlen(lines[line]));
+            }
+            const float boxWidth = static_cast<float>(longest) * cellWidth + 2.0f * margin;
+            const float boxHeight = static_cast<float>(lineCount) * cellHeight + 2.0f * margin;
+            const float boxLeft = width - boxWidth - margin * 2.0f;
+            const float boxTop = margin * 2.0f;
+            beginBatch(&status);
+            appendBox(status, boxLeft, boxTop, boxLeft + boxWidth, boxTop + boxHeight,
+                      0xB0000000u);
+            for (int line = 0; line < lineCount; ++line) {
+                appendText(status, boxLeft + margin,
+                           boxTop + margin + static_cast<float>(line) * cellHeight, lines[line],
+                           0xFF33D9FFu);  // ABGR: yellow
+            }
+            endBatch();
         }
-        const float boxWidth = static_cast<float>(longest) * cellWidth + 2.0f * margin;
-        const float boxHeight = static_cast<float>(lineCount) * cellHeight + 2.0f * margin;
-        const float boxLeft = width - boxWidth - margin * 2.0f;
-        const float boxTop = margin * 2.0f;
-        beginBatch(&status);
-        appendBox(status, boxLeft, boxTop, boxLeft + boxWidth, boxTop + boxHeight,
-                  0xB0000000u);
-        for (int line = 0; line < lineCount; ++line) {
-            appendText(status, boxLeft + margin,
-                       boxTop + margin + static_cast<float>(line) * cellHeight, lines[line],
-                       0xFF33D9FFu);  // ABGR: yellow
-        }
-        endBatch();
 
-        // DevGUI, at its own coordinates, scale and colors.
+        // DevGUI lays itself out in screen pixels at a fixed 12 px text size,
+        // which is tiny at high resolutions. It is enlarged by an integer factor
+        // (DevGuiScale, 0 = height / 720): entries in the left/top half grow
+        // from the top-left corner, the rest (the key legend) from the
+        // bottom-right corner, so both stay on screen.
+        const float devGuiScale = static_cast<float>(
+            g_devGuiScale > 0 ? g_devGuiScale
+                              : std::max(1, static_cast<int>(height / 720.0f + 0.25f)));
         for (const DevGuiTextEntry& entry : devGui) {
-            const OverlayFont* font = AcquireDevGuiFont(renderer, entry.scale);
+            const OverlayFont* font = AcquireDevGuiFont(renderer, entry.scale * devGuiScale);
             if (font == nullptr) {
                 continue;
             }
             beginBatch(font);
             const float textWidth =
                 static_cast<float>(strlen(entry.text)) * static_cast<float>(font->cellWidth);
-            float x = entry.x;
+            float x = entry.x < width * 0.5f ? entry.x * devGuiScale
+                                             : width - (width - entry.x) * devGuiScale;
+            const float y = entry.y < height * 0.5f ? entry.y * devGuiScale
+                                                    : height - (height - entry.y) * devGuiScale;
             if (entry.alignment == 1) {
                 x -= textWidth;
             } else if (entry.alignment == 2) {
                 x -= textWidth * 0.5f;
             }
             if (g_devGuiBacking) {
-                appendBox(*font, x - 2.0f, entry.y - 1.0f, x + textWidth + 2.0f,
-                          entry.y + static_cast<float>(font->cellHeight) + 1.0f, 0x90000000u);
+                appendBox(*font, x - 2.0f, y - 1.0f, x + textWidth + 2.0f,
+                          y + static_cast<float>(font->cellHeight) + 1.0f, 0x90000000u);
             }
-            appendText(*font, x, entry.y, entry.text, entry.color);
+            appendText(*font, x, y, entry.text, entry.color);
             endBatch();
         }
         renderer.context->Unmap(renderer.vertexBuffer, 0);
