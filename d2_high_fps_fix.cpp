@@ -347,6 +347,8 @@ bool g_toggleSounds = true;
 bool g_overlay = false;
 void TryInstallOverlayPresentHook();
 void ToggleDevGui();
+void NoteSimulationTime(double simulationTime);
+bool ClosePauseMenu();
 bool g_crashLog = false;
 int g_devGuiScale = 0;
 bool g_autoContinueLoadScreen = false;
@@ -6315,6 +6317,7 @@ extern "C" void* __fastcall HookCopyView(void* destination, const void* source) 
     PublishPresentationContext();
     PresentationContext probeContext{};
     if (ReadPresentationContext(probeContext)) {
+        NoteSimulationTime(probeContext.simulationTime);
         UpdateAdaptiveInterpolationGate(probeContext);
         RecordInterpolationAbFrame(probeContext);
         UpdateAutoAbSchedule(probeContext);
@@ -8858,6 +8861,9 @@ void ToggleDevGui() {
     LONG current = 0;
     memcpy(&current, cvar + kCVarIntegerOffset, sizeof(current));
     const LONG value = current > 0 ? 0 : 2;
+    if (value != 0 && ClosePauseMenu()) {
+        Log("Ctrl+F10: closed the pause menu for DevGUI.");
+    }
     *reinterpret_cast<volatile float*>(cvar + kCVarFloatOffset) = static_cast<float>(value);
     InterlockedExchange(reinterpret_cast<volatile LONG*>(cvar + kCVarIntegerOffset), value);
     PlayToggleCue(value != 0 ? ToggleCue::On : ToggleCue::Off);
@@ -8897,6 +8903,91 @@ bool InstallInlineHook(std::uintptr_t rva, const unsigned char* expected, std::s
     return true;
 }
 
+// Pause menu. Its DevGUI button is gone from the retail ActionScript, but the
+// exe's "DevGUI" callback (0x78F140) still closes the pause state and runs
+// devgui 1. The pause state's show method (vtable slot 0x1C61678 -> 0x78F170)
+// is wrapped to remember the state object, and the game counts as sitting in
+// the pause menu when it was shown after the last simulation tick. Ctrl+F10
+// there closes the pause menu the same way the callback does
+// (0x7885B0(state+8, 1)) and opens DevGUI.
+constexpr std::uintptr_t kSteamPauseShowSlotRva = 0x1C61678;
+constexpr std::uintptr_t kSteamPauseShowRva = 0x78F170;
+constexpr std::uintptr_t kSteamPauseCloseRva = 0x7885B0;
+constexpr unsigned char kSteamPauseDevGuiCallbackBytes[16] = {
+    0x48, 0x83, 0xEC, 0x28, 0x48, 0x8B, 0x49, 0x08,
+    0xBA, 0x01, 0x00, 0x00, 0x00, 0xE8, 0x5E, 0x94,
+};
+constexpr std::uintptr_t kSteamPauseDevGuiCallbackRva = 0x78F140;
+using PauseShowFn = std::uint64_t(__fastcall*)(void*, void*, void*, void*);
+using PauseCloseFn = void(__fastcall*)(void*, int);
+PauseShowFn g_originalPauseShow = nullptr;
+std::atomic<void*> g_pauseState{nullptr};
+std::atomic<std::uint64_t> g_pauseShownCounter{0};
+std::atomic<std::uint64_t> g_lastSimulationAdvanceCounter{0};
+double g_lastSimulationTime = 0.0;
+
+void NoteSimulationTime(double simulationTime) {
+    if (simulationTime != g_lastSimulationTime) {
+        g_lastSimulationTime = simulationTime;
+        g_lastSimulationAdvanceCounter.store(ReadPerformanceCounter(),
+                                             std::memory_order_relaxed);
+    }
+}
+
+extern "C" std::uint64_t __fastcall HookPauseShow(void* state, void* second, void* third,
+                                                  void* fourth) {
+    g_pauseState.store(state, std::memory_order_relaxed);
+    g_pauseShownCounter.store(ReadPerformanceCounter(), std::memory_order_relaxed);
+    return g_originalPauseShow(state, second, third, fourth);
+}
+
+bool PauseMenuIsOpen() {
+    LARGE_INTEGER frequency{};
+    QueryPerformanceFrequency(&frequency);
+    const std::uint64_t now = ReadPerformanceCounter();
+    const std::uint64_t lastTick = g_lastSimulationAdvanceCounter.load(std::memory_order_relaxed);
+    return g_originalPauseShow != nullptr &&
+           g_pauseState.load(std::memory_order_relaxed) != nullptr &&
+           g_pauseShownCounter.load(std::memory_order_relaxed) > lastTick &&
+           now - lastTick > static_cast<std::uint64_t>(frequency.QuadPart / 5);
+}
+
+bool ClosePauseMenu() {
+    if (!PauseMenuIsOpen()) {
+        return false;
+    }
+    auto* state = static_cast<unsigned char*>(g_pauseState.load(std::memory_order_relaxed));
+    void* owner = nullptr;
+    if (!IsReadableMemory(state + 8, sizeof(owner))) {
+        return false;
+    }
+    memcpy(&owner, state + 8, sizeof(owner));
+    if (owner == nullptr) {
+        return false;
+    }
+    reinterpret_cast<PauseCloseFn>(g_executableBase + kSteamPauseCloseRva)(owner, 1);
+    g_pauseShownCounter.store(0, std::memory_order_relaxed);
+    return true;
+}
+
+bool InstallPauseMenuHook() {
+    if (memcmp(reinterpret_cast<const void*>(g_executableBase + kSteamPauseDevGuiCallbackRva),
+               kSteamPauseDevGuiCallbackBytes, sizeof(kSteamPauseDevGuiCallbackBytes)) != 0) {
+        Log("Pause menu: DevGUI callback bytes do not match; Ctrl+F10 will not close it.");
+        return false;
+    }
+    g_originalPauseShow = reinterpret_cast<PauseShowFn>(g_executableBase + kSteamPauseShowRva);
+    if (!ReplaceVtableSlot(g_executableBase + kSteamPauseShowSlotRva,
+                           g_executableBase + kSteamPauseShowRva,
+                           reinterpret_cast<const void*>(&HookPauseShow))) {
+        g_originalPauseShow = nullptr;
+        Log("Pause menu: unable to replace the show slot; Ctrl+F10 will not close it.");
+        return false;
+    }
+    Log("Pause menu: Ctrl+F10 in the pause menu closes it and opens DevGUI.");
+    return true;
+}
+
 bool InstallDevGuiTextLogHook() {
     if (g_layout != &kSteamLayout) {
         return false;
@@ -8915,6 +9006,7 @@ bool InstallDevGuiTextLogHook() {
                           "DevGUI pass")) {
         g_originalDevGuiPass = reinterpret_cast<DevGuiPassFn>(original);
         Log("DevGUI: Ctrl+F10 opens/closes it; it is drawn by the D3D11 overlay.");
+        InstallPauseMenuHook();
     }
     return true;
 }
