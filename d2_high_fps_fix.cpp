@@ -1,6 +1,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <intrin.h>
 #include <bcrypt.h>
 
 #include <algorithm>
@@ -118,11 +119,8 @@ struct GameBuildLayout {
     // DevGUI 2D pass: the game view calls it every frame and queues the 2D draw
     // context it returns for rendering. It returns null unless the devgui cvar
     // is above 0, so the overlay hook returns its own context in that case,
-    // built with the same allocate/construct/state/begin/font-size calls.
+    // built with the same construct/state/begin/font-size calls.
     HookSiteLayout devGuiDraw;
-    std::uintptr_t engineAllocRva;
-    std::array<unsigned char, 16> engineAllocBytes;
-    std::uint32_t engineAllocTag;
     std::uintptr_t drawContextCtorRva;
     std::array<unsigned char, 16> drawContextCtorBytes;
     std::size_t drawContextSize;
@@ -266,10 +264,6 @@ constexpr GameBuildLayout kSteamLayout = {
         0x48, 0x81, 0xEC, 0x60, 0x05, 0x00, 0x00,
         0x48, 0xC7, 0x44, 0x24, 0x30, 0xFE, 0xFF, 0xFF, 0xFF,
     }},
-    0xF1450,
-    {0x48, 0x89, 0x5C, 0x24, 0x08, 0x57, 0x48, 0x83,
-     0xEC, 0x50, 0x8B, 0xDA, 0x48, 0x8B, 0xF9, 0xE8},
-    0x33,
     0x230A60,
     {0x48, 0x8B, 0xC4, 0x48, 0x89, 0x48, 0x08, 0x57,
      0x48, 0x83, 0xEC, 0x60, 0x48, 0xC7, 0x40, 0xC8},
@@ -420,6 +414,7 @@ bool g_enableTelemetry = false;
 bool g_enableInterpolationAbProbe = false;
 bool g_toggleSounds = true;
 bool g_overlay = false;
+bool g_crashLog = false;
 bool g_autoContinueLoadScreen = false;
 bool g_autoAbSchedule = false;
 int g_autoAbSegmentSeconds = 20;
@@ -1010,6 +1005,8 @@ void LoadConfiguration() {
         L"Diagnostics", L"ToggleSounds", 1, path) != 0;
     g_overlay = GetPrivateProfileIntW(
         L"Diagnostics", L"Overlay", 0, path) != 0;
+    g_crashLog = GetPrivateProfileIntW(
+        L"Diagnostics", L"CrashLog", 0, path) != 0;
     g_autoContinueLoadScreen = GetPrivateProfileIntW(
         L"Diagnostics", L"AutoContinueLoadScreen", 0, path) != 0;
     if (g_autoContinueLoadScreen && !g_sourceLevelTransforms) {
@@ -1346,8 +1343,6 @@ bool ValidateOverlayLayout(const ExecutableImageLayout& image,
            ValidateMutableDataRange(image, layout.debugFontHeightRva, sizeof(float),
                                     "debug font height") &&
            ValidateHookSite(image, layout.devGuiDraw, "DevGUI 2D pass") &&
-           ValidateCodeSignature(image, layout.engineAllocRva, layout.engineAllocBytes,
-                                 "engine allocator") &&
            ValidateCodeSignature(image, layout.drawContextCtorRva,
                                  layout.drawContextCtorBytes, "2D context constructor") &&
            ValidateCodeSignature(image, layout.drawContextSetStateRva,
@@ -7784,7 +7779,6 @@ float DrawOverlayLines(void* font, float* cursor) {
 // This hook then returns a context of our own with the status lines, prepared
 // exactly the way the DevGUI pass prepares its context.
 using DevGuiDrawFn = void*(__fastcall*)(void*);
-using EngineAllocFn = void*(__fastcall*)(std::size_t, std::uint32_t);
 using DrawContextCtorFn = void*(__fastcall*)(void*);
 using DrawContextSetStateFn = void(__fastcall*)(void*, const void*);
 using DrawContextBeginFn = void(__fastcall*)(void*, int, int, int, int);
@@ -7803,20 +7797,33 @@ void* DrawOverlayContext() {
         return nullptr;
     }
     if (g_overlayContext == nullptr) {
-        const auto allocate = reinterpret_cast<EngineAllocFn>(
-            g_executableBase + g_layout->engineAllocRva);
+        // Create it only once gameplay frames are being presented, not on a
+        // load screen.
+        static std::uint64_t firstSerial = 0;
+        const std::uint64_t serial = g_presentationSerial.load(std::memory_order_acquire);
+        if (firstSerial == 0 || serial < firstSerial) {
+            firstSerial = serial + 1;
+            return nullptr;
+        }
+        if (serial - firstSerial < 240) {
+            return nullptr;
+        }
         const auto construct = reinterpret_cast<DrawContextCtorFn>(
             g_executableBase + g_layout->drawContextCtorRva);
-        void* memory = allocate(g_layout->drawContextSize, g_layout->engineAllocTag);
+        // Our own allocation, never freed: a context from the engine allocator
+        // made during a load screen was reclaimed when gameplay started.
+        void* memory = VirtualAlloc(nullptr, g_layout->drawContextSize,
+                                    MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
         if (memory == nullptr) {
             g_overlayContextFailed = true;
-            Log("Diagnostics overlay: the engine allocator returned null; the overlay "
+            Log("Diagnostics overlay: unable to allocate the 2D draw context; the overlay "
                 "is off.");
             return nullptr;
         }
         construct(memory);
         g_overlayContext = memory;
-        Log("Diagnostics overlay: created a 2D draw context for the DevGUI pass.");
+        Log("Diagnostics overlay: created a 2D draw context at %p for the DevGUI pass.",
+            memory);
     }
     const auto vtable = *reinterpret_cast<std::uintptr_t**>(renderSystem);
     const auto screenWidth = reinterpret_cast<RenderSystemIntFn>(
@@ -7844,6 +7851,28 @@ void* DrawOverlayContext() {
 }
 
 extern "C" void* __fastcall HookDevGuiDraw(void* self) {
+    static std::atomic<int> logged{0};
+    if (logged.load(std::memory_order_relaxed) < 12) {
+        static std::uintptr_t seenCallers[12]{};
+        static DWORD seenThreads[12]{};
+        const auto caller = reinterpret_cast<std::uintptr_t>(_ReturnAddress());
+        const DWORD thread = GetCurrentThreadId();
+        bool seen = false;
+        const int count = logged.load(std::memory_order_relaxed);
+        for (int index = 0; index < count; ++index) {
+            seen = seen || (seenCallers[index] == caller && seenThreads[index] == thread);
+        }
+        if (!seen) {
+            const int slot = logged.fetch_add(1, std::memory_order_relaxed);
+            if (slot < 12) {
+                seenCallers[slot] = caller;
+                seenThreads[slot] = thread;
+                Log("Diagnostics overlay: DevGUI pass called from RVA 0x%llX on thread %lu "
+                    "(self %p).", static_cast<unsigned long long>(caller - g_executableBase),
+                    thread, self);
+            }
+        }
+    }
     void* context = g_originalDevGuiDraw(self);
     if (context != nullptr || !g_overlay) {
         return context;  // DevGUI is on: leave its pass alone.
@@ -8141,6 +8170,90 @@ bool InstallHook() {
     return true;
 }
 
+// Diagnostics/CrashLog: a first-chance vectored handler that logs fatal-looking
+// exceptions (access violations and similar) with the faulting module offset,
+// the argument registers, and return addresses found on the stack. It never
+// handles the exception; the game's own handling continues unchanged.
+std::atomic<int> g_crashLogCount{0};
+
+void DescribeCodeAddress(std::uintptr_t address, char* output, std::size_t capacity) {
+    HMODULE module = nullptr;
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCWSTR>(address), &module) &&
+        module != nullptr) {
+        char path[MAX_PATH]{};
+        GetModuleFileNameA(module, path, MAX_PATH);
+        const char* name = strrchr(path, '\\');
+        name = name != nullptr ? name + 1 : path;
+        sprintf_s(output, capacity, "%s+0x%llX", name,
+                  static_cast<unsigned long long>(
+                      address - reinterpret_cast<std::uintptr_t>(module)));
+        return;
+    }
+    sprintf_s(output, capacity, "0x%llX", static_cast<unsigned long long>(address));
+}
+
+bool IsInLoadedImage(std::uintptr_t address) {
+    HMODULE module = nullptr;
+    return GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                  GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                              reinterpret_cast<LPCWSTR>(address), &module) &&
+           (module == reinterpret_cast<HMODULE>(g_executableBase) ||
+            module == g_pluginModule);
+}
+
+LONG CALLBACK CrashLogHandler(EXCEPTION_POINTERS* info) {
+    const DWORD code = info->ExceptionRecord->ExceptionCode;
+    if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_ILLEGAL_INSTRUCTION &&
+        code != EXCEPTION_PRIV_INSTRUCTION && code != EXCEPTION_INT_DIVIDE_BY_ZERO &&
+        code != EXCEPTION_STACK_OVERFLOW && code != EXCEPTION_IN_PAGE_ERROR &&
+        code != 0xC0000409) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    if (g_crashLogCount.fetch_add(1, std::memory_order_relaxed) >= 6) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    const CONTEXT& context = *info->ContextRecord;
+    char where[MAX_PATH + 32]{};
+    DescribeCodeAddress(reinterpret_cast<std::uintptr_t>(
+                            info->ExceptionRecord->ExceptionAddress), where, sizeof(where));
+    char access[96]{};
+    if (code == EXCEPTION_ACCESS_VIOLATION &&
+        info->ExceptionRecord->NumberParameters >= 2) {
+        const ULONG_PTR kind = info->ExceptionRecord->ExceptionInformation[0];
+        sprintf_s(access, " (%s 0x%llX)",
+                  kind == 0 ? "read" : kind == 1 ? "write" : "execute",
+                  static_cast<unsigned long long>(
+                      info->ExceptionRecord->ExceptionInformation[1]));
+    }
+    Log("CrashLog: exception 0x%08lX at %s%s on thread %lu.", code, where, access,
+        GetCurrentThreadId());
+    Log("CrashLog:   rax=%llX rbx=%llX rcx=%llX rdx=%llX rsi=%llX rdi=%llX",
+        context.Rax, context.Rbx, context.Rcx, context.Rdx, context.Rsi, context.Rdi);
+    Log("CrashLog:   r8=%llX r9=%llX r10=%llX r11=%llX rsp=%llX rbp=%llX",
+        context.R8, context.R9, context.R10, context.R11, context.Rsp, context.Rbp);
+    if (code == EXCEPTION_STACK_OVERFLOW) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    const auto* stack = reinterpret_cast<const std::uintptr_t*>(context.Rsp);
+    int found = 0;
+    for (int slot = 0; slot < 256 && found < 16; ++slot) {
+        if (!IsReadableMemory(stack + slot, sizeof(std::uintptr_t))) {
+            break;
+        }
+        const std::uintptr_t value = stack[slot];
+        if (value < 0x10000 || !IsInLoadedImage(value)) {
+            continue;
+        }
+        char frame[MAX_PATH + 32]{};
+        DescribeCodeAddress(value, frame, sizeof(frame));
+        Log("CrashLog:   stack[+0x%X] %s", slot * 8, frame);
+        ++found;
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 DWORD WINAPI InstallThread(void*) {
     g_executableBase = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
     if (!ValidateWorldTransformInterpolationMath()) {
@@ -8151,6 +8264,9 @@ DWORD WINAPI InstallThread(void*) {
         return 0;
     }
     LoadConfiguration();
+    if (g_crashLog && AddVectoredExceptionHandler(1, CrashLogHandler) != nullptr) {
+        Log("CrashLog: first-chance exception logging is on.");
+    }
     if (!VerifyExecutableLayout()) {
         return 0;
     }
