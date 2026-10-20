@@ -345,6 +345,7 @@ bool g_enableTelemetry = false;
 bool g_enableInterpolationAbProbe = false;
 bool g_toggleSounds = true;
 bool g_overlay = false;
+void TryInstallOverlayPresentHook();
 bool g_crashLog = false;
 bool g_autoContinueLoadScreen = false;
 bool g_autoAbSchedule = false;
@@ -5940,6 +5941,7 @@ void ApplyPrediction(void* destination, const void* source) {
     TryApplyEngineFrameLimiter();
     TryUnlockAbove120();
     TryStabilizeMouseSensitivity();
+    TryInstallOverlayPresentHook();
     const bool f10IsDown = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
     if (f10IsDown && !g_f10WasDown) {
         const bool nowEnabled = !g_enabled.load(std::memory_order_relaxed);
@@ -7923,6 +7925,8 @@ bool InitializeOverlayRenderer(OverlayRenderer& renderer, IDXGISwapChain* swapCh
     }
     renderer.swapChain = swapChain;
     renderer.ready = true;
+    Log("Diagnostics overlay: bound to swap chain %p on device %p.",
+        static_cast<void*>(swapChain), static_cast<void*>(device));
     Log("Diagnostics overlay: D3D11 renderer ready (back buffer %ux%u format %u, font "
         "cell %dx%d).", swapDescription.BufferDesc.Width, swapDescription.BufferDesc.Height,
         static_cast<unsigned>(swapDescription.BufferDesc.Format), renderer.cellWidth,
@@ -7944,7 +7948,21 @@ void AppendOverlayQuad(OverlayVertex* vertices, UINT& count, float x0, float y0,
     count += 6;
 }
 
+void DrawOverlayFrame(IDXGISwapChain* swapChain);
+
 void DrawOverlay(IDXGISwapChain* swapChain) {
+    static thread_local bool inside = false;
+    if (inside) {
+        return;  // Present1 may forward to Present.
+    }
+    inside = true;
+    DrawOverlayFrame(swapChain);
+    inside = false;
+}
+
+#define OVERLAY_TRACE(step)                                                            do {                                                                                   if (g_overlayRenderer.frames < 3) {                                                    Log("Diagnostics overlay: frame %llu %s.",                                             static_cast<unsigned long long>(g_overlayRenderer.frames), step);          }                                                                              } while (false)
+
+void DrawOverlayFrame(IDXGISwapChain* swapChain) {
     OverlayRenderer& renderer = g_overlayRenderer;
     if (!g_overlay || renderer.failed) {
         return;
@@ -8046,7 +8064,9 @@ void DrawOverlay(IDXGISwapChain* swapChain) {
 
     D3D11_MAPPED_SUBRESOURCE mapped{};
     ID3DDeviceContextState* previous = nullptr;
+    OVERLAY_TRACE("swapping in the overlay state");
     renderer.context->SwapDeviceContextState(renderer.state, &previous);
+    OVERLAY_TRACE("mapping vertices");
     if (SUCCEEDED(renderer.context->Map(renderer.vertexBuffer, 0, D3D11_MAP_WRITE_DISCARD,
                                         0, &mapped))) {
         auto* vertices = static_cast<OverlayVertex*>(mapped.pData);
@@ -8090,13 +8110,16 @@ void DrawOverlay(IDXGISwapChain* swapChain) {
         renderer.context->PSSetShader(renderer.pixelShader, nullptr, 0);
         renderer.context->PSSetShaderResources(0, 1, &renderer.font);
         renderer.context->PSSetSamplers(0, 1, &renderer.sampler);
+        OVERLAY_TRACE("drawing");
         renderer.context->Draw(count, 0);
         ID3D11RenderTargetView* none = nullptr;
         renderer.context->OMSetRenderTargets(1, &none, nullptr);
     }
+    OVERLAY_TRACE("restoring the game state");
     renderer.context->SwapDeviceContextState(previous, nullptr);
     ReleaseOverlayObject(previous);
     target->Release();
+    OVERLAY_TRACE("done");
     if (renderer.frames++ == 0) {
         Log("Diagnostics overlay: first frame drawn with D3D11.");
     }
@@ -8107,7 +8130,12 @@ HRESULT STDMETHODCALLTYPE HookPresent(IDXGISwapChain* swapChain, UINT syncInterv
     if ((flags & DXGI_PRESENT_TEST) == 0) {
         DrawOverlay(swapChain);
     }
-    return g_originalPresent(swapChain, syncInterval, flags);
+    const HRESULT result = g_originalPresent(swapChain, syncInterval, flags);
+    static std::atomic<int> failures{0};
+    if (FAILED(result) && failures.fetch_add(1) < 4) {
+        Log("Diagnostics overlay: Present returned 0x%08lX.", static_cast<unsigned long>(result));
+    }
+    return result;
 }
 
 HRESULT STDMETHODCALLTYPE HookPresent1(IDXGISwapChain1* swapChain, UINT syncInterval,
@@ -8129,6 +8157,24 @@ bool ReplaceSwapChainSlot(void** vtable, std::size_t slot, const void* replaceme
     DWORD ignored = 0;
     VirtualProtect(&vtable[slot], sizeof(void*), oldProtection, &ignored);
     return true;
+}
+
+// Startup recreates the device, so the Present hook (and its probe device) is
+// installed only once the game has presented rendered views for a while; it
+// runs on its own thread so the frame that triggers it is not delayed.
+DWORD WINAPI OverlayPresentHookThread(void*);
+
+void TryInstallOverlayPresentHook() {
+    static bool started = false;
+    if (!g_overlay || started ||
+        g_presentationSerial.load(std::memory_order_acquire) < 240) {
+        return;
+    }
+    started = true;
+    HANDLE thread = CreateThread(nullptr, 0, OverlayPresentHookThread, nullptr, 0, nullptr);
+    if (thread != nullptr) {
+        CloseHandle(thread);
+    }
 }
 
 // Creates a throwaway device and swap chain to find the DXGI swap-chain vtable,
@@ -8202,6 +8248,11 @@ bool InstallOverlayPresentHook() {
     Log("Diagnostics overlay: hooked IDXGISwapChain::Present%s; the status box is drawn "
         "at the top right.", g_originalPresent1 != nullptr ? " and Present1" : "");
     return true;
+}
+
+DWORD WINAPI OverlayPresentHookThread(void*) {
+    InstallOverlayPresentHook();
+    return 0;
 }
 
 bool InstallShadowCasterBuildHooks() {
@@ -8451,6 +8502,87 @@ bool InstallHook() {
     return true;
 }
 
+// Diagnostics: DevGUI keeps its own text drawer (0x784A0: this, x, y, scale,
+// const float* color, const char* text, int alignment), separate from the stripped debug
+// DrawString. While the overlay is on, the first distinct strings it is asked
+// to draw are logged, to see whether DevGUI's menu data exists.
+constexpr std::uintptr_t kSteamDevGuiTextRva = 0x784A0;
+constexpr std::size_t kSteamDevGuiTextHookLength = 18;
+constexpr unsigned char kSteamDevGuiTextBytes[kSteamDevGuiTextHookLength] = {
+    0x48, 0x8B, 0xC4,
+    0xF3, 0x0F, 0x11, 0x50, 0x18,
+    0x55, 0x56, 0x57,
+    0x48, 0x81, 0xEC, 0x20, 0x01, 0x00, 0x00,
+};
+// Two extra stack arguments are forwarded untouched in case a caller passes more.
+using DevGuiTextFn = std::uint64_t(__fastcall*)(void*, float, float, float, const float*,
+                                                const char*, std::uint64_t, std::uint64_t,
+                                                std::uint64_t);
+DevGuiTextFn g_originalDevGuiText = nullptr;
+std::atomic<int> g_devGuiTextLogged{0};
+
+extern "C" std::uint64_t __fastcall HookDevGuiText(void* self, float x, float y, float scale,
+                                                   const float* color, const char* text,
+                                                   std::uint64_t seventh, std::uint64_t eighth,
+                                                   std::uint64_t ninth) {
+    if (g_devGuiTextLogged.load(std::memory_order_relaxed) < 80) {
+        char sample[96]{};
+        if (text != nullptr && IsReadableMemory(text, 1)) {
+            std::size_t length = 0;
+            while (length + 1 < sizeof(sample) && IsReadableMemory(text + length, 1) &&
+                   text[length] != '\0') {
+                const char character = text[length];
+                sample[length] = (character >= 32 && character < 127) ? character : '?';
+                ++length;
+            }
+        }
+        static char last[96]{};
+        if (strcmp(sample, last) != 0) {
+            strcpy_s(last, sample);
+            g_devGuiTextLogged.fetch_add(1, std::memory_order_relaxed);
+            Log("DevGUI text: (%.0f, %.0f) scale %.2f \"%s\"", x, y, scale, sample);
+        }
+    }
+    return g_originalDevGuiText(self, x, y, scale, color, text, seventh, eighth, ninth);
+}
+
+bool InstallDevGuiTextLogHook() {
+    if (g_layout != &kSteamLayout) {
+        return false;
+    }
+    auto* entry = reinterpret_cast<unsigned char*>(g_executableBase + kSteamDevGuiTextRva);
+    if (memcmp(entry, kSteamDevGuiTextBytes, kSteamDevGuiTextHookLength) != 0) {
+        Log("DevGUI text-log hook bytes do not match; not installed.");
+        return false;
+    }
+    auto* trampoline = static_cast<unsigned char*>(
+        VirtualAlloc(nullptr, 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE));
+    if (trampoline == nullptr) {
+        return false;
+    }
+    memcpy(trampoline, entry, kSteamDevGuiTextHookLength);
+    WriteAbsoluteIndirectJump(trampoline + kSteamDevGuiTextHookLength,
+                              entry + kSteamDevGuiTextHookLength);
+    FlushInstructionCache(GetCurrentProcess(), trampoline, kSteamDevGuiTextHookLength + 14);
+    unsigned char patch[kSteamDevGuiTextHookLength];
+    memset(patch, 0x90, sizeof(patch));
+    WriteAbsoluteIndirectJump(patch, reinterpret_cast<const void*>(&HookDevGuiText));
+    DWORD oldProtection = 0;
+    if (!VirtualProtect(entry, sizeof(patch), PAGE_EXECUTE_READWRITE, &oldProtection)) {
+        VirtualFree(trampoline, 0, MEM_RELEASE);
+        return false;
+    }
+    g_originalDevGuiText = reinterpret_cast<DevGuiTextFn>(trampoline);
+    memcpy(entry, patch, sizeof(patch));
+    FlushInstructionCache(GetCurrentProcess(), entry, sizeof(patch));
+    DWORD ignored = 0;
+    VirtualProtect(entry, sizeof(patch), oldProtection, &ignored);
+    Log("Installed the DevGUI text-log hook at RVA 0x%llX.",
+        static_cast<unsigned long long>(kSteamDevGuiTextRva));
+    return true;
+}
+
+
 // Diagnostics/CrashLog: a first-chance vectored handler that logs fatal-looking
 // exceptions (access violations and similar) with the faulting module offset,
 // the argument registers, and return addresses found on the stack. It never
@@ -8489,10 +8621,11 @@ LONG CALLBACK CrashLogHandler(EXCEPTION_POINTERS* info) {
     if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_ILLEGAL_INSTRUCTION &&
         code != EXCEPTION_PRIV_INSTRUCTION && code != EXCEPTION_INT_DIVIDE_BY_ZERO &&
         code != EXCEPTION_STACK_OVERFLOW && code != EXCEPTION_IN_PAGE_ERROR &&
-        code != 0xC0000409) {
+        code != 0xC0000409 && code != 0xE06D7363 && code != 0x80000003 &&
+        code != 0xC0000374 && code != 0xC000041D) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
-    if (g_crashLogCount.fetch_add(1, std::memory_order_relaxed) >= 6) {
+    if (g_crashLogCount.fetch_add(1, std::memory_order_relaxed) >= 12) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
     const CONTEXT& context = *info->ContextRecord;
@@ -8572,7 +8705,7 @@ DWORD WINAPI InstallThread(void*) {
         InstallSkinnedPoseUploadHook();
         InstallShadowCasterBuildHooks();
         if (g_overlay) {
-            InstallOverlayPresentHook();
+            InstallDevGuiTextLogHook();
         }
     }
     return 0;
