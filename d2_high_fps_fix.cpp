@@ -8897,6 +8897,72 @@ bool InstallInlineHook(std::uintptr_t rva, const unsigned char* expected, std::s
     return true;
 }
 
+// Pause-menu DevGUI entry. The pause menu's Flash file still has a DevGUI
+// button (PauseMenuData reads pauseData.devGUI, label ui_pause_devGUI) and the
+// exe still registers its "DevGUI" callback (closes the menu, runs devgui 1);
+// retail just never sets pauseData.devGUI. When the pause menu resolves its
+// "statsEntryAvailable" data path (0x78F6B4), pauseData.devGUI is also resolved
+// and queued as true with the same Iggy calls (path resolve 0x296C0, set bool
+// 0x2A640).
+constexpr std::uintptr_t kSteamIggyResolvePathRva = 0x296C0;
+constexpr std::size_t kSteamIggyResolvePathHookLength = 15;
+constexpr unsigned char kSteamIggyResolvePathBytes[kSteamIggyResolvePathHookLength] = {
+    0x48, 0x89, 0x5C, 0x24, 0x08,
+    0x57,
+    0x48, 0x83, 0xEC, 0x20,
+    0x48, 0x8B, 0xD9,
+    0x33, 0xC9,
+};
+constexpr std::uintptr_t kSteamIggySetBoolRva = 0x2A640;
+constexpr unsigned char kSteamIggySetBoolBytes[16] = {
+    0x40, 0x57, 0x48, 0x83, 0xEC, 0x50, 0x48, 0xC7,
+    0x44, 0x24, 0x20, 0xFE, 0xFF, 0xFF, 0xFF, 0x48,
+};
+constexpr std::uintptr_t kSteamStatsEntryAvailableStringRva = 0x1C61900;
+constexpr char kStatsEntryAvailable[] = "statsEntryAvailable";
+using IggyResolvePathFn = void*(__fastcall*)(void*, void*, const char*);
+using IggySetBoolFn = void(__fastcall*)(void*, const bool*, const void*);
+IggyResolvePathFn g_originalIggyResolvePath = nullptr;
+std::atomic<int> g_pauseDevGuiLogged{0};
+
+extern "C" void* __fastcall HookIggyResolvePath(void* context, void* path, const char* name) {
+    void* result = g_originalIggyResolvePath(context, path, name);
+    if (g_overlay &&
+        reinterpret_cast<std::uintptr_t>(name) ==
+            g_executableBase + kSteamStatsEntryAvailableStringRva) {
+        static const char kDevGuiPath[] = "pauseData.devGUI";
+        alignas(16) unsigned char devGuiPath[16]{};
+        g_originalIggyResolvePath(context, devGuiPath, kDevGuiPath);
+        static const bool kTrue = true;
+        reinterpret_cast<IggySetBoolFn>(g_executableBase + kSteamIggySetBoolRva)(
+            context, &kTrue, devGuiPath);
+        if (g_pauseDevGuiLogged.fetch_add(1, std::memory_order_relaxed) == 0) {
+            Log("Pause menu: set pauseData.devGUI so the DevGUI entry is shown.");
+        }
+    }
+    return result;
+}
+
+bool InstallPauseMenuDevGuiHook() {
+    if (memcmp(reinterpret_cast<const void*>(g_executableBase + kSteamIggySetBoolRva),
+               kSteamIggySetBoolBytes, sizeof(kSteamIggySetBoolBytes)) != 0 ||
+        memcmp(reinterpret_cast<const void*>(g_executableBase +
+                                             kSteamStatsEntryAvailableStringRva),
+               kStatsEntryAvailable, sizeof(kStatsEntryAvailable)) != 0) {
+        Log("Pause-menu DevGUI entry: layout mismatch; not installed.");
+        return false;
+    }
+    void* original = nullptr;
+    if (!InstallInlineHook(kSteamIggyResolvePathRva, kSteamIggyResolvePathBytes,
+                           kSteamIggyResolvePathHookLength,
+                           reinterpret_cast<const void*>(&HookIggyResolvePath), &original,
+                           "Iggy path resolve (pause-menu DevGUI entry)")) {
+        return false;
+    }
+    g_originalIggyResolvePath = reinterpret_cast<IggyResolvePathFn>(original);
+    return true;
+}
+
 bool InstallDevGuiTextLogHook() {
     if (g_layout != &kSteamLayout) {
         return false;
@@ -8915,6 +8981,7 @@ bool InstallDevGuiTextLogHook() {
                           "DevGUI pass")) {
         g_originalDevGuiPass = reinterpret_cast<DevGuiPassFn>(original);
         Log("DevGUI: Ctrl+F10 opens/closes it; it is drawn by the D3D11 overlay.");
+        InstallPauseMenuDevGuiHook();
     }
     return true;
 }
