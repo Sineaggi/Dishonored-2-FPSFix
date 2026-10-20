@@ -26,7 +26,7 @@ if not exist "build" mkdir "build"
 cl.exe /nologo /std:c++17 /O2 /EHsc /W4 /LD /DUNICODE /D_UNICODE ^
   /Fo:"build\d2-high-fps-fix.obj" ^
   "d2_high_fps_fix.cpp" ^
-  /link /OUT:"build\Dishonored2HighFPSFix.asi" bcrypt.lib user32.lib
+  /link /OUT:"build\Dishonored2HighFPSFix.asi" bcrypt.lib user32.lib gdi32.lib
 
 if errorlevel 1 (
   echo.

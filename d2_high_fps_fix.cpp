@@ -2,6 +2,8 @@
 #define NOMINMAX
 #include <windows.h>
 #include <intrin.h>
+#include <d3d11_1.h>
+#include <dxgi1_2.h>
 #include <bcrypt.h>
 
 #include <algorithm>
@@ -91,23 +93,6 @@ struct GameBuildLayout {
     VtableLayout assemblyVtable;
     std::uintptr_t assemblyMarkDirtyRva;
     std::array<unsigned char, 16> assemblyMarkDirtyBytes;
-    // Diagnostics overlay. The com_showFPS/con_noPrint cvars and the console
-    // FPS drawer are only validated: the console never draws during gameplay.
-    // The status lines use the engine's own DrawString and text width.
-    bool overlaySupported;
-    std::uintptr_t showFpsCvarRva;
-    // con_noPrint (default 1) makes idConsoleLocal::Draw skip every on-screen
-    // debug line, com_showFPS included.
-    std::uintptr_t conNoPrintCvarRva;
-    HookSiteLayout fpsOverlayDrawer;
-    std::uintptr_t drawStringRva;
-    std::array<unsigned char, 16> drawStringBytes;
-    std::uintptr_t textWidthRva;
-    std::array<unsigned char, 16> textWidthBytes;
-    // idRenderSystem* global; vtable +0x238 returns the screen width.
-    std::uintptr_t renderSystemPointerRva;
-    // Debug font height (float, set at runtime) used by the drawer.
-    std::uintptr_t debugFontHeightRva;
     // Load-screen "press a key" gate: the static idCommonLocal object, its
     // vtable, the prompt callback handle (-1 when no prompt is armed) and the
     // flag byte whose bit 1 (value 2) lets the loading loop continue.
@@ -116,21 +101,6 @@ struct GameBuildLayout {
     std::uintptr_t commonVtableRva;
     std::size_t commonLoadPromptHandleOffset;
     std::size_t commonLoadFlagsOffset;
-    // DevGUI 2D pass: the game view calls it every frame and queues the 2D draw
-    // context it returns for rendering. It returns null unless the devgui cvar
-    // is above 0, so the overlay hook returns its own context in that case,
-    // built with the same construct/state/begin/font-size calls.
-    HookSiteLayout devGuiDraw;
-    std::uintptr_t drawContextCtorRva;
-    std::array<unsigned char, 16> drawContextCtorBytes;
-    std::size_t drawContextSize;
-    std::uintptr_t drawContextSetStateRva;
-    std::array<unsigned char, 16> drawContextSetStateBytes;
-    std::uintptr_t drawContextDefaultStateRva;
-    std::uintptr_t drawContextBeginRva;
-    std::array<unsigned char, 16> drawContextBeginBytes;
-    std::uintptr_t drawContextFontSizeRva;
-    std::array<unsigned char, 16> drawContextFontSizeBytes;
 };
 
 constexpr GameBuildLayout kGogLayout = {
@@ -235,49 +205,10 @@ constexpr GameBuildLayout kSteamLayout = {
     {0x48, 0x89, 0x5C, 0x24, 0x10, 0x48, 0x89, 0x6C,
      0x24, 0x18, 0x48, 0x89, 0x74, 0x24, 0x20, 0x41},
     true,
-    0x25B2DD0,
-    0x2BC2770,
-    {0x4D840, 17, {
-        0x48, 0x8B, 0xC4,
-        0x55,
-        0x41, 0x54,
-        0x41, 0x55,
-        0x41, 0x56,
-        0x41, 0x57,
-        0x48, 0x8D, 0x6C, 0x24, 0x80,
-    }},
-    0x230FD0,
-    {0x48, 0x89, 0x5C, 0x24, 0x18, 0x48, 0x89, 0x6C,
-     0x24, 0x20, 0x57, 0x48, 0x83, 0xEC, 0x30, 0x48},
-    0x231180,
-    {0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x74,
-     0x24, 0x10, 0x57, 0x48, 0x83, 0xEC, 0x30, 0x33},
-    0x22FCD70,
-    0x2BC2A9C,
-    true,
     0x25AF110,
     0x1AC4D88,
     0x12D8,
     0x19A0,
-    {0x8989F0, 18, {
-        0x40, 0x57,
-        0x48, 0x81, 0xEC, 0x60, 0x05, 0x00, 0x00,
-        0x48, 0xC7, 0x44, 0x24, 0x30, 0xFE, 0xFF, 0xFF, 0xFF,
-    }},
-    0x230A60,
-    {0x48, 0x8B, 0xC4, 0x48, 0x89, 0x48, 0x08, 0x57,
-     0x48, 0x83, 0xEC, 0x60, 0x48, 0xC7, 0x40, 0xC8},
-    0x4FC80,
-    0x230DE0,
-    {0xC7, 0x81, 0x68, 0x1C, 0x00, 0x00, 0x00, 0x00,
-     0x00, 0x00, 0x8B, 0x02, 0x89, 0x81, 0x44, 0x1C},
-    0x32CFBE0,
-    0x231350,
-    {0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x74,
-     0x24, 0x10, 0x57, 0x48, 0x83, 0xEC, 0x30, 0x8B},
-    0x231420,
-    {0x40, 0x53, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B,
-     0x0D, 0x1B, 0x79, 0x06, 0x02, 0xBA, 0x41, 0x00},
 };
 
 constexpr std::array<const GameBuildLayout*, 2> kKnownLayouts = {
@@ -1326,35 +1257,6 @@ bool ValidateCodeSignature(const ExecutableImageLayout& image, std::uintptr_t rv
                   bytes.size()) == 0;
 }
 
-bool ValidateOverlayLayout(const ExecutableImageLayout& image,
-                           const GameBuildLayout& layout) {
-    return layout.overlaySupported &&
-           ValidateHookSite(image, layout.fpsOverlayDrawer, "FPS overlay drawer") &&
-           ValidateCodeSignature(image, layout.drawStringRva, layout.drawStringBytes,
-                                 "debug DrawString") &&
-           ValidateCodeSignature(image, layout.textWidthRva, layout.textWidthBytes,
-                                 "debug text width") &&
-           ValidateMutableDataRange(image, layout.showFpsCvarRva, 0x40,
-                                    "com_showFPS cvar") &&
-           ValidateMutableDataRange(image, layout.conNoPrintCvarRva, 0x40,
-                                    "con_noPrint cvar") &&
-           ValidateMutableDataRange(image, layout.renderSystemPointerRva,
-                                    sizeof(void*), "render system pointer") &&
-           ValidateMutableDataRange(image, layout.debugFontHeightRva, sizeof(float),
-                                    "debug font height") &&
-           ValidateHookSite(image, layout.devGuiDraw, "DevGUI 2D pass") &&
-           ValidateCodeSignature(image, layout.drawContextCtorRva,
-                                 layout.drawContextCtorBytes, "2D context constructor") &&
-           ValidateCodeSignature(image, layout.drawContextSetStateRva,
-                                 layout.drawContextSetStateBytes, "2D context state") &&
-           ValidateMutableDataRange(image, layout.drawContextDefaultStateRva, 0x24,
-                                    "2D context default state") &&
-           ValidateCodeSignature(image, layout.drawContextBeginRva,
-                                 layout.drawContextBeginBytes, "2D context begin") &&
-           ValidateCodeSignature(image, layout.drawContextFontSizeRva,
-                                 layout.drawContextFontSizeBytes, "2D context font size");
-}
-
 bool ValidateSourceLevelLayout(const ExecutableImageLayout& image) {
     const GameBuildLayout& layout = *g_layout;
     if (!ValidateVtable(image, layout.renderWorldVtable, "render-world vtable") ||
@@ -1532,12 +1434,6 @@ bool VerifyExecutableLayout() {
         g_interpolateShadowTransforms = false;
         Log("ShadowTransforms is not yet supported on the %s executable; "
             "shadow-transform interpolation was disabled.", selected->name);
-    }
-    if (g_overlay && !ValidateOverlayLayout(image, *selected)) {
-        g_overlay = false;
-        Log("The diagnostics overlay is not available on the %s executable "
-            "(unsupported or layout mismatch); Overlay was disabled.",
-            selected->name);
     }
     if (g_autoContinueLoadScreen &&
         (!selected->autoContinueSupported || !g_sourceLevelTransforms ||
@@ -7624,18 +7520,62 @@ bool InstallSourceLevelHooks() {
 
 
 // ---------------------------------------------------------------------------
-// Diagnostics overlay (Diagnostics/Overlay). A few status lines drawn with the
-// engine's debug DrawString into a 2D context that the game view queues for
-// rendering every frame (see HookDevGuiDraw).
+// Diagnostics overlay (Diagnostics/Overlay). The retail engine's debug text is
+// compiled out (its DrawString only parses color codes), so the status lines
+// are drawn with Direct3D 11 right before the game presents: the
+// IDXGISwapChain::Present vtable slot is replaced, and each frame the lines are
+// drawn into the back buffer under a private device-context state
+// (SwapDeviceContextState), so none of the game's pipeline state is touched.
+// The font atlas is rendered once from Consolas with GDI.
 // ---------------------------------------------------------------------------
 
-constexpr std::size_t kRenderSystemWidthSlot = 0x238;
+constexpr std::size_t kSwapChainPresentSlot = 8;
+constexpr std::size_t kSwapChainPresent1Slot = 22;
+constexpr int kOverlayFirstChar = 32;
+constexpr int kOverlayCharCount = 96;  // 32..127; 127 is a solid cell
+constexpr int kOverlayAtlasColumns = 16;
+constexpr int kOverlayAtlasRows = kOverlayCharCount / kOverlayAtlasColumns;
+constexpr UINT kOverlayMaxVertices = 6 * 1024;
 
-using DrawStringFn = void(__fastcall*)(void*, float, float, const char*,
-                                       const float*, bool, float);
-using TextWidthFn = int(__fastcall*)(void*, const char*, float);
-using RenderSystemIntFn = int(__fastcall*)(void*);
+using PresentFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT);
+using Present1Fn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain1*, UINT, UINT,
+                                               const DXGI_PRESENT_PARAMETERS*);
+using D3D11CreateDeviceAndSwapChainFn = decltype(&D3D11CreateDeviceAndSwapChain);
+using D3DCompileFn = HRESULT(WINAPI*)(LPCVOID, SIZE_T, LPCSTR, const void*, void*,
+                                      LPCSTR, LPCSTR, UINT, UINT, ID3DBlob**, ID3DBlob**);
 
+PresentFn g_originalPresent = nullptr;
+Present1Fn g_originalPresent1 = nullptr;
+
+struct OverlayVertex {
+    float x, y, u, v;
+    std::uint32_t color;
+};
+
+struct OverlayRenderer {
+    bool failed = false;
+    bool ready = false;
+    IDXGISwapChain* swapChain = nullptr;  // not owned; the one being drawn on
+    ID3D11Device* device = nullptr;
+    ID3D11DeviceContext1* context = nullptr;
+    ID3DDeviceContextState* state = nullptr;
+    ID3D11VertexShader* vertexShader = nullptr;
+    ID3D11PixelShader* pixelShader = nullptr;
+    ID3D11InputLayout* inputLayout = nullptr;
+    ID3D11Buffer* vertexBuffer = nullptr;
+    ID3D11ShaderResourceView* font = nullptr;
+    ID3D11SamplerState* sampler = nullptr;
+    ID3D11BlendState* blend = nullptr;
+    ID3D11RasterizerState* rasterizer = nullptr;
+    ID3D11DepthStencilState* depth = nullptr;
+    int cellWidth = 0;
+    int cellHeight = 0;
+    std::uint64_t frames = 0;
+    std::uint64_t lastBoundPresent = 0;
+    bool targetFailureLogged = false;
+};
+
+OverlayRenderer g_overlayRenderer;
 
 struct OverlayStatistics {
     bool initialized = false;
@@ -7702,27 +7642,13 @@ void UpdateOverlayStatistics() {
     stats.lastCounters = counters;
 }
 
-float DrawOverlayLines(void* font, float* cursor) {
-    void* renderSystem = *reinterpret_cast<void**>(
-        g_executableBase + g_layout->renderSystemPointerRva);
-    if (font == nullptr || renderSystem == nullptr || cursor == nullptr) {
-        return 0.0f;
-    }
-    const auto drawString = reinterpret_cast<DrawStringFn>(
-        g_executableBase + g_layout->drawStringRva);
-    const auto textWidth = reinterpret_cast<TextWidthFn>(
-        g_executableBase + g_layout->textWidthRva);
-    const auto screenWidth = reinterpret_cast<RenderSystemIntFn>(
-        (*reinterpret_cast<std::uintptr_t**>(renderSystem))[kRenderSystemWidthSlot /
-                                                             sizeof(std::uintptr_t)]);
-
+int FormatOverlayLines(char (&lines)[4][160]) {
     UpdateOverlayStatistics();
     const OverlayStatistics& stats = g_overlayStatistics;
     const bool transforms = RuntimeTransformInterpolationEnabled();
     const bool skeletons = RuntimeSkeletalInterpolationEnabled();
     const bool hands = RuntimeFirstPersonHandsEnabled();
     const bool camera = g_enabled.load(std::memory_order_relaxed);
-    char lines[5][160]{};
     sprintf_s(lines[0], "FPSFix  camera %s  transforms %s%s  skeletons %s  hands %s",
               camera ? "on" : "OFF", transforms ? "on" : "OFF",
               transforms ? (SourceLevelWritesSelected() ? " (source)" : " (per-draw)") : "",
@@ -7749,177 +7675,532 @@ float DrawOverlayLines(void* font, float* cursor) {
     sprintf_s(lines[3], "frames/s %.0f  source tracks %llu  writes/frame %.1f",
               stats.fps, static_cast<unsigned long long>(g_sourceCounters.activeTracks),
               stats.writesPerFrame);
-
-    const float fontHeight = *reinterpret_cast<const float*>(
-        g_executableBase + g_layout->debugFontHeightRva);
-    const float lineHeight = (std::isfinite(fontHeight) && fontHeight > 0.0f &&
-                              fontHeight < 200.0f ? fontHeight : 16.0f) + 4.0f;
-    const float margin = lineHeight;
-    const float width = static_cast<float>(screenWidth(renderSystem));
-    static const float color[4] = {1.0f, 0.85f, 0.2f, 1.0f};
-    float blockWidth = 0.0f;
-    for (const char* line : {lines[0], lines[1], lines[2], lines[3]}) {
-        if (line[0] == '\0') {
-            continue;
-        }
-        const float lineWidth = static_cast<float>(textWidth(font, line, 1.0f));
-        drawString(font, width - margin - lineWidth, *cursor + 2.0f, line, color, false,
-                   1.0f);
-        *cursor += lineHeight;
-        blockWidth = std::max(blockWidth, lineWidth + margin);
-    }
-    return blockWidth;
+    return 4;
 }
 
-
-// The shipped game never calls idConsoleLocal::Draw during gameplay (only the
-// load screen and the screenshot command do), so com_showFPS and the console's
-// debug text never appear in play. The game view instead calls the DevGUI 2D pass every
-// frame and queues the context it returns; with devgui at 0 it returns null.
-// This hook then returns a context of our own with the status lines, prepared
-// exactly the way the DevGUI pass prepares its context.
-using DevGuiDrawFn = void*(__fastcall*)(void*);
-using DrawContextCtorFn = void*(__fastcall*)(void*);
-using DrawContextSetStateFn = void(__fastcall*)(void*, const void*);
-using DrawContextBeginFn = void(__fastcall*)(void*, int, int, int, int);
-using DrawContextFontSizeFn = void(__fastcall*)(void*, float);
-constexpr std::size_t kRenderSystemHeightSlot = 0x240;
-
-DevGuiDrawFn g_originalDevGuiDraw = nullptr;
-void* g_overlayContext = nullptr;
-bool g_overlayContextFailed = false;
-bool g_overlayDrawLogged = false;
-
-void* DrawOverlayContext() {
-    void* renderSystem = *reinterpret_cast<void**>(
-        g_executableBase + g_layout->renderSystemPointerRva);
-    if (renderSystem == nullptr || g_overlayContextFailed) {
-        return nullptr;
+template <typename T>
+void ReleaseOverlayObject(T*& object) {
+    if (object != nullptr) {
+        object->Release();
+        object = nullptr;
     }
-    if (g_overlayContext == nullptr) {
-        // Create it only once gameplay frames are being presented, not on a
-        // load screen.
-        static std::uint64_t firstSerial = 0;
-        const std::uint64_t serial = g_presentationSerial.load(std::memory_order_acquire);
-        if (firstSerial == 0 || serial < firstSerial) {
-            firstSerial = serial + 1;
-            return nullptr;
-        }
-        if (serial - firstSerial < 240) {
-            return nullptr;
-        }
-        const auto construct = reinterpret_cast<DrawContextCtorFn>(
-            g_executableBase + g_layout->drawContextCtorRva);
-        // Our own allocation, never freed: a context from the engine allocator
-        // made during a load screen was reclaimed when gameplay started.
-        void* memory = VirtualAlloc(nullptr, g_layout->drawContextSize,
-                                    MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-        if (memory == nullptr) {
-            g_overlayContextFailed = true;
-            Log("Diagnostics overlay: unable to allocate the 2D draw context; the overlay "
-                "is off.");
-            return nullptr;
-        }
-        construct(memory);
-        g_overlayContext = memory;
-        Log("Diagnostics overlay: created a 2D draw context at %p for the DevGUI pass.",
-            memory);
-    }
-    const auto vtable = *reinterpret_cast<std::uintptr_t**>(renderSystem);
-    const auto screenWidth = reinterpret_cast<RenderSystemIntFn>(
-        vtable[kRenderSystemWidthSlot / sizeof(std::uintptr_t)]);
-    const auto screenHeight = reinterpret_cast<RenderSystemIntFn>(
-        vtable[kRenderSystemHeightSlot / sizeof(std::uintptr_t)]);
-    const auto setState = reinterpret_cast<DrawContextSetStateFn>(
-        g_executableBase + g_layout->drawContextSetStateRva);
-    const auto begin = reinterpret_cast<DrawContextBeginFn>(
-        g_executableBase + g_layout->drawContextBeginRva);
-    const auto fontSize = reinterpret_cast<DrawContextFontSizeFn>(
-        g_executableBase + g_layout->drawContextFontSizeRva);
-    setState(g_overlayContext, reinterpret_cast<const void*>(
-        g_executableBase + g_layout->drawContextDefaultStateRva));
-    begin(g_overlayContext, 0, 0, screenWidth(renderSystem), screenHeight(renderSystem));
-    fontSize(g_overlayContext, *reinterpret_cast<const float*>(
-        g_executableBase + g_layout->debugFontHeightRva));
-    float cursor = 8.0f;
-    DrawOverlayLines(g_overlayContext, &cursor);
-    if (!g_overlayDrawLogged) {
-        g_overlayDrawLogged = true;
-        Log("Diagnostics overlay: first frame drawn through the DevGUI 2D pass.");
-    }
-    return g_overlayContext;
 }
 
-extern "C" void* __fastcall HookDevGuiDraw(void* self) {
-    static std::atomic<int> logged{0};
-    if (logged.load(std::memory_order_relaxed) < 12) {
-        static std::uintptr_t seenCallers[12]{};
-        static DWORD seenThreads[12]{};
-        const auto caller = reinterpret_cast<std::uintptr_t>(_ReturnAddress());
-        const DWORD thread = GetCurrentThreadId();
-        bool seen = false;
-        const int count = logged.load(std::memory_order_relaxed);
-        for (int index = 0; index < count; ++index) {
-            seen = seen || (seenCallers[index] == caller && seenThreads[index] == thread);
+void ReleaseOverlayRenderer(OverlayRenderer& renderer) {
+    ReleaseOverlayObject(renderer.depth);
+    ReleaseOverlayObject(renderer.rasterizer);
+    ReleaseOverlayObject(renderer.blend);
+    ReleaseOverlayObject(renderer.sampler);
+    ReleaseOverlayObject(renderer.font);
+    ReleaseOverlayObject(renderer.vertexBuffer);
+    ReleaseOverlayObject(renderer.inputLayout);
+    ReleaseOverlayObject(renderer.pixelShader);
+    ReleaseOverlayObject(renderer.vertexShader);
+    ReleaseOverlayObject(renderer.state);
+    ReleaseOverlayObject(renderer.context);
+    ReleaseOverlayObject(renderer.device);
+    renderer.ready = false;
+}
+
+constexpr char kOverlayShaderSource[] = R"(
+struct VertexInput { float2 position : POSITION; float2 uv : TEXCOORD; float4 color : COLOR; };
+struct PixelInput { float4 position : SV_Position; float2 uv : TEXCOORD; float4 color : COLOR; };
+PixelInput VSMain(VertexInput input) {
+    PixelInput output;
+    output.position = float4(input.position, 0.0, 1.0);
+    output.uv = input.uv;
+    output.color = input.color;
+    return output;
+}
+Texture2D fontTexture : register(t0);
+SamplerState fontSampler : register(s0);
+float4 PSMain(PixelInput input) : SV_Target {
+    return float4(input.color.rgb, input.color.a * fontTexture.Sample(fontSampler, input.uv).r);
+}
+)";
+
+// Renders characters 32..126 of a monospaced font into an R8 atlas; cell 127
+// is filled solid for background quads.
+bool CreateOverlayFontAtlas(OverlayRenderer& renderer, int pixelHeight) {
+    HDC dc = CreateCompatibleDC(nullptr);
+    if (dc == nullptr) {
+        return false;
+    }
+    HFONT font = CreateFontW(-pixelHeight, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+                             DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
+                             ANTIALIASED_QUALITY, FIXED_PITCH | FF_MODERN, L"Consolas");
+    HGDIOBJ previousFont = SelectObject(dc, font);
+    SIZE glyph{};
+    GetTextExtentPoint32W(dc, L"M", 1, &glyph);
+    renderer.cellWidth = std::max(1, static_cast<int>(glyph.cx));
+    renderer.cellHeight = std::max(1, static_cast<int>(glyph.cy));
+    const int width = renderer.cellWidth * kOverlayAtlasColumns;
+    const int height = renderer.cellHeight * kOverlayAtlasRows;
+
+    BITMAPINFO info{};
+    info.bmiHeader.biSize = sizeof(info.bmiHeader);
+    info.bmiHeader.biWidth = width;
+    info.bmiHeader.biHeight = -height;
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    HBITMAP bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
+    bool created = false;
+    if (bitmap != nullptr && bits != nullptr) {
+        HGDIOBJ previousBitmap = SelectObject(dc, bitmap);
+        memset(bits, 0, static_cast<std::size_t>(width) * height * 4);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, RGB(255, 255, 255));
+        for (int index = 0; index < kOverlayCharCount - 1; ++index) {
+            const char character = static_cast<char>(kOverlayFirstChar + index);
+            TextOutA(dc, (index % kOverlayAtlasColumns) * renderer.cellWidth,
+                     (index / kOverlayAtlasColumns) * renderer.cellHeight, &character, 1);
         }
-        if (!seen) {
-            const int slot = logged.fetch_add(1, std::memory_order_relaxed);
-            if (slot < 12) {
-                seenCallers[slot] = caller;
-                seenThreads[slot] = thread;
-                Log("Diagnostics overlay: DevGUI pass called from RVA 0x%llX on thread %lu "
-                    "(self %p).", static_cast<unsigned long long>(caller - g_executableBase),
-                    thread, self);
+        GdiFlush();
+        std::vector<unsigned char> alpha(static_cast<std::size_t>(width) * height);
+        const auto* pixels = static_cast<const std::uint32_t*>(bits);
+        for (std::size_t pixel = 0; pixel < alpha.size(); ++pixel) {
+            alpha[pixel] = static_cast<unsigned char>((pixels[pixel] >> 16) & 0xFF);
+        }
+        const int solid = kOverlayCharCount - 1;
+        for (int y = 0; y < renderer.cellHeight; ++y) {
+            for (int x = 0; x < renderer.cellWidth; ++x) {
+                alpha[static_cast<std::size_t>((solid / kOverlayAtlasColumns) *
+                                               renderer.cellHeight + y) * width +
+                      (solid % kOverlayAtlasColumns) * renderer.cellWidth + x] = 0xFF;
+            }
+        }
+        SelectObject(dc, previousBitmap);
+
+        D3D11_TEXTURE2D_DESC description{};
+        description.Width = static_cast<UINT>(width);
+        description.Height = static_cast<UINT>(height);
+        description.MipLevels = 1;
+        description.ArraySize = 1;
+        description.Format = DXGI_FORMAT_R8_UNORM;
+        description.SampleDesc.Count = 1;
+        description.Usage = D3D11_USAGE_IMMUTABLE;
+        description.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        D3D11_SUBRESOURCE_DATA data{};
+        data.pSysMem = alpha.data();
+        data.SysMemPitch = static_cast<UINT>(width);
+        ID3D11Texture2D* texture = nullptr;
+        if (SUCCEEDED(renderer.device->CreateTexture2D(&description, &data, &texture))) {
+            created = SUCCEEDED(renderer.device->CreateShaderResourceView(
+                texture, nullptr, &renderer.font));
+            texture->Release();
+        }
+    }
+    if (bitmap != nullptr) {
+        DeleteObject(bitmap);
+    }
+    SelectObject(dc, previousFont);
+    DeleteObject(font);
+    DeleteDC(dc);
+    return created;
+}
+
+bool InitializeOverlayRenderer(OverlayRenderer& renderer, IDXGISwapChain* swapChain) {
+    DXGI_SWAP_CHAIN_DESC swapDescription{};
+    ID3D11Device* device = nullptr;
+    if (FAILED(swapChain->GetDesc(&swapDescription)) ||
+        FAILED(swapChain->GetDevice(__uuidof(ID3D11Device),
+                                    reinterpret_cast<void**>(&device)))) {
+        Log("Diagnostics overlay: the presenting swap chain has no D3D11 device; the "
+            "overlay is off.");
+        return false;
+    }
+    renderer.device = device;
+    ID3D11DeviceContext* immediate = nullptr;
+    device->GetImmediateContext(&immediate);
+    const HRESULT contextResult = immediate->QueryInterface(
+        __uuidof(ID3D11DeviceContext1), reinterpret_cast<void**>(&renderer.context));
+    immediate->Release();
+    const D3D_FEATURE_LEVEL level = device->GetFeatureLevel();
+    ID3D11Device1* device1 = nullptr;
+    if (FAILED(contextResult) ||
+        FAILED(device->QueryInterface(__uuidof(ID3D11Device1),
+                                      reinterpret_cast<void**>(&device1)))) {
+        Log("Diagnostics overlay: D3D11.1 is unavailable; the overlay is off.");
+        return false;
+    }
+    const HRESULT stateResult = device1->CreateDeviceContextState(
+        0, &level, 1, D3D11_SDK_VERSION, __uuidof(ID3D11Device), nullptr,
+        &renderer.state);
+    device1->Release();
+    if (FAILED(stateResult)) {
+        Log("Diagnostics overlay: CreateDeviceContextState failed (0x%08lX); the overlay "
+            "is off.", static_cast<unsigned long>(stateResult));
+        return false;
+    }
+
+    HMODULE compiler = LoadLibraryW(L"d3dcompiler_47.dll");
+    const auto compile = compiler != nullptr
+        ? reinterpret_cast<D3DCompileFn>(GetProcAddress(compiler, "D3DCompile"))
+        : nullptr;
+    if (compile == nullptr) {
+        Log("Diagnostics overlay: d3dcompiler_47.dll is unavailable; the overlay is off.");
+        return false;
+    }
+    ID3DBlob* vertexCode = nullptr;
+    ID3DBlob* pixelCode = nullptr;
+    ID3DBlob* errors = nullptr;
+    HRESULT result = compile(kOverlayShaderSource, sizeof(kOverlayShaderSource) - 1,
+                             "overlay", nullptr, nullptr, "VSMain", "vs_4_0", 0, 0,
+                             &vertexCode, &errors);
+    ReleaseOverlayObject(errors);
+    if (SUCCEEDED(result)) {
+        result = compile(kOverlayShaderSource, sizeof(kOverlayShaderSource) - 1, "overlay",
+                         nullptr, nullptr, "PSMain", "ps_4_0", 0, 0, &pixelCode, &errors);
+        ReleaseOverlayObject(errors);
+    }
+    bool ok = SUCCEEDED(result);
+    if (ok) {
+        static const D3D11_INPUT_ELEMENT_DESC elements[] = {
+            {"POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
+            {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 8, D3D11_INPUT_PER_VERTEX_DATA, 0},
+            {"COLOR", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 0, 16, D3D11_INPUT_PER_VERTEX_DATA, 0},
+        };
+        ok = SUCCEEDED(device->CreateVertexShader(vertexCode->GetBufferPointer(),
+                                                  vertexCode->GetBufferSize(), nullptr,
+                                                  &renderer.vertexShader)) &&
+             SUCCEEDED(device->CreatePixelShader(pixelCode->GetBufferPointer(),
+                                                 pixelCode->GetBufferSize(), nullptr,
+                                                 &renderer.pixelShader)) &&
+             SUCCEEDED(device->CreateInputLayout(elements, 3,
+                                                 vertexCode->GetBufferPointer(),
+                                                 vertexCode->GetBufferSize(),
+                                                 &renderer.inputLayout));
+    }
+    ReleaseOverlayObject(vertexCode);
+    ReleaseOverlayObject(pixelCode);
+    if (!ok) {
+        Log("Diagnostics overlay: shader setup failed; the overlay is off.");
+        return false;
+    }
+
+    D3D11_BUFFER_DESC bufferDescription{};
+    bufferDescription.ByteWidth = kOverlayMaxVertices * sizeof(OverlayVertex);
+    bufferDescription.Usage = D3D11_USAGE_DYNAMIC;
+    bufferDescription.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+    bufferDescription.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    D3D11_SAMPLER_DESC samplerDescription{};
+    samplerDescription.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+    samplerDescription.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+    samplerDescription.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+    samplerDescription.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    samplerDescription.MaxLOD = D3D11_FLOAT32_MAX;
+    D3D11_BLEND_DESC blendDescription{};
+    blendDescription.RenderTarget[0].BlendEnable = TRUE;
+    blendDescription.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA;
+    blendDescription.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+    blendDescription.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+    blendDescription.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+    blendDescription.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
+    blendDescription.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+    blendDescription.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    D3D11_RASTERIZER_DESC rasterizerDescription{};
+    rasterizerDescription.FillMode = D3D11_FILL_SOLID;
+    rasterizerDescription.CullMode = D3D11_CULL_NONE;
+    rasterizerDescription.DepthClipEnable = TRUE;
+    D3D11_DEPTH_STENCIL_DESC depthDescription{};
+    depthDescription.DepthEnable = FALSE;
+    depthDescription.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
+    depthDescription.DepthFunc = D3D11_COMPARISON_ALWAYS;
+    const int fontHeight = std::max(14, static_cast<int>(swapDescription.BufferDesc.Height) / 60);
+    ok = SUCCEEDED(device->CreateBuffer(&bufferDescription, nullptr,
+                                        &renderer.vertexBuffer)) &&
+         SUCCEEDED(device->CreateSamplerState(&samplerDescription, &renderer.sampler)) &&
+         SUCCEEDED(device->CreateBlendState(&blendDescription, &renderer.blend)) &&
+         SUCCEEDED(device->CreateRasterizerState(&rasterizerDescription,
+                                                 &renderer.rasterizer)) &&
+         SUCCEEDED(device->CreateDepthStencilState(&depthDescription, &renderer.depth)) &&
+         CreateOverlayFontAtlas(renderer, fontHeight);
+    if (!ok) {
+        Log("Diagnostics overlay: resource setup failed; the overlay is off.");
+        return false;
+    }
+    renderer.swapChain = swapChain;
+    renderer.ready = true;
+    Log("Diagnostics overlay: D3D11 renderer ready (back buffer %ux%u format %u, font "
+        "cell %dx%d).", swapDescription.BufferDesc.Width, swapDescription.BufferDesc.Height,
+        static_cast<unsigned>(swapDescription.BufferDesc.Format), renderer.cellWidth,
+        renderer.cellHeight);
+    return true;
+}
+
+void AppendOverlayQuad(OverlayVertex* vertices, UINT& count, float x0, float y0, float x1,
+                       float y1, float u0, float v0, float u1, float v1,
+                       std::uint32_t color) {
+    if (count + 6 > kOverlayMaxVertices) {
+        return;
+    }
+    const OverlayVertex quad[6] = {
+        {x0, y0, u0, v0, color}, {x1, y0, u1, v0, color}, {x0, y1, u0, v1, color},
+        {x0, y1, u0, v1, color}, {x1, y0, u1, v0, color}, {x1, y1, u1, v1, color},
+    };
+    memcpy(vertices + count, quad, sizeof(quad));
+    count += 6;
+}
+
+void DrawOverlay(IDXGISwapChain* swapChain) {
+    OverlayRenderer& renderer = g_overlayRenderer;
+    if (!g_overlay || renderer.failed) {
+        return;
+    }
+    if (!renderer.ready) {
+        if (!InitializeOverlayRenderer(renderer, swapChain)) {
+            ReleaseOverlayRenderer(renderer);
+            renderer.failed = true;
+            return;
+        }
+    }
+    if (swapChain != renderer.swapChain) {
+        // Another swap chain: a capture tool, or the game recreated its own. Move
+        // to it once the bound one has not presented for two seconds.
+        const std::uint64_t now = ReadPerformanceCounter();
+        LARGE_INTEGER frequency{};
+        QueryPerformanceFrequency(&frequency);
+        if (now - renderer.lastBoundPresent < static_cast<std::uint64_t>(frequency.QuadPart) * 2) {
+            return;
+        }
+        ID3D11Device* device = nullptr;
+        const bool sameDevice =
+            SUCCEEDED(swapChain->GetDevice(__uuidof(ID3D11Device),
+                                           reinterpret_cast<void**>(&device))) &&
+            device == renderer.device;
+        ReleaseOverlayObject(device);
+        if (!sameDevice) {
+            ReleaseOverlayRenderer(renderer);
+            return;  // Re-initialized on the next Present.
+        }
+        renderer.swapChain = swapChain;
+        Log("Diagnostics overlay: moved to a new swap chain on the same device.");
+    }
+    renderer.lastBoundPresent = ReadPerformanceCounter();
+    ID3D11Texture2D* backBuffer = nullptr;
+    if (FAILED(swapChain->GetBuffer(0, __uuidof(ID3D11Texture2D),
+                                    reinterpret_cast<void**>(&backBuffer)))) {
+        return;
+    }
+    D3D11_TEXTURE2D_DESC backDescription{};
+    backBuffer->GetDesc(&backDescription);
+    ID3D11RenderTargetView* target = nullptr;
+    HRESULT targetResult =
+        renderer.device->CreateRenderTargetView(backBuffer, nullptr, &target);
+    if (FAILED(targetResult)) {
+        // Typeless back buffers need an explicit view format.
+        D3D11_RENDER_TARGET_VIEW_DESC view{};
+        view.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+        switch (backDescription.Format) {
+            case DXGI_FORMAT_R8G8B8A8_TYPELESS: view.Format = DXGI_FORMAT_R8G8B8A8_UNORM; break;
+            case DXGI_FORMAT_B8G8R8A8_TYPELESS: view.Format = DXGI_FORMAT_B8G8R8A8_UNORM; break;
+            case DXGI_FORMAT_R10G10B10A2_TYPELESS:
+                view.Format = DXGI_FORMAT_R10G10B10A2_UNORM;
+                break;
+            case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+                view.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+                break;
+            default: break;
+        }
+        if (view.Format != DXGI_FORMAT_UNKNOWN) {
+            targetResult = renderer.device->CreateRenderTargetView(backBuffer, &view, &target);
+        }
+    }
+    backBuffer->Release();
+    if (FAILED(targetResult)) {
+        if (!renderer.targetFailureLogged) {
+            renderer.targetFailureLogged = true;
+            Log("Diagnostics overlay: unable to create a render target for back-buffer "
+                "format %u; nothing is drawn.", static_cast<unsigned>(backDescription.Format));
+        }
+        return;
+    }
+
+    char lines[4][160]{};
+    const int lineCount = FormatOverlayLines(lines);
+    const float width = static_cast<float>(backDescription.Width);
+    const float height = static_cast<float>(backDescription.Height);
+    const float cellWidth = static_cast<float>(renderer.cellWidth);
+    const float cellHeight = static_cast<float>(renderer.cellHeight);
+    const float margin = cellHeight * 0.5f;
+    std::size_t longest = 0;
+    for (int line = 0; line < lineCount; ++line) {
+        longest = std::max(longest, strlen(lines[line]));
+    }
+    const float boxWidth = static_cast<float>(longest) * cellWidth + 2.0f * margin;
+    const float boxHeight = static_cast<float>(lineCount) * cellHeight + 2.0f * margin;
+    const float boxLeft = width - boxWidth - margin * 2.0f;
+    const float boxTop = margin * 2.0f;
+    const auto ndcX = [&](float x) { return x / width * 2.0f - 1.0f; };
+    const auto ndcY = [&](float y) { return 1.0f - y / height * 2.0f; };
+    const float atlasWidth = cellWidth * kOverlayAtlasColumns;
+    const float atlasHeight = cellHeight * kOverlayAtlasRows;
+    const auto cellUv = [&](int index, float& u0, float& v0, float& u1, float& v1) {
+        u0 = (index % kOverlayAtlasColumns) * cellWidth / atlasWidth;
+        v0 = (index / kOverlayAtlasColumns) * cellHeight / atlasHeight;
+        u1 = u0 + cellWidth / atlasWidth;
+        v1 = v0 + cellHeight / atlasHeight;
+    };
+
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    ID3DDeviceContextState* previous = nullptr;
+    renderer.context->SwapDeviceContextState(renderer.state, &previous);
+    if (SUCCEEDED(renderer.context->Map(renderer.vertexBuffer, 0, D3D11_MAP_WRITE_DISCARD,
+                                        0, &mapped))) {
+        auto* vertices = static_cast<OverlayVertex*>(mapped.pData);
+        UINT count = 0;
+        float u0 = 0, v0 = 0, u1 = 0, v1 = 0;
+        cellUv(kOverlayCharCount - 1, u0, v0, u1, v1);
+        const float su = (u0 + u1) * 0.5f;
+        const float sv = (v0 + v1) * 0.5f;
+        AppendOverlayQuad(vertices, count, ndcX(boxLeft), ndcY(boxTop),
+                          ndcX(boxLeft + boxWidth), ndcY(boxTop + boxHeight), su, sv, su,
+                          sv, 0xB0000000u);
+        const std::uint32_t textColor = 0xFF33D9FFu;  // ABGR: yellow
+        for (int line = 0; line < lineCount; ++line) {
+            const float y = boxTop + margin + static_cast<float>(line) * cellHeight;
+            float x = boxLeft + margin;
+            for (const char* character = lines[line]; *character != '\0'; ++character) {
+                const int code = static_cast<unsigned char>(*character);
+                if (code > kOverlayFirstChar && code < kOverlayFirstChar + kOverlayCharCount - 1) {
+                    cellUv(code - kOverlayFirstChar, u0, v0, u1, v1);
+                    AppendOverlayQuad(vertices, count, ndcX(x), ndcY(y), ndcX(x + cellWidth),
+                                      ndcY(y + cellHeight), u0, v0, u1, v1, textColor);
+                }
+                x += cellWidth;
+            }
+        }
+        renderer.context->Unmap(renderer.vertexBuffer, 0);
+
+        D3D11_VIEWPORT viewport{0.0f, 0.0f, width, height, 0.0f, 1.0f};
+        const UINT stride = sizeof(OverlayVertex);
+        const UINT offset = 0;
+        const float blendFactor[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        renderer.context->OMSetRenderTargets(1, &target, nullptr);
+        renderer.context->OMSetBlendState(renderer.blend, blendFactor, 0xFFFFFFFFu);
+        renderer.context->OMSetDepthStencilState(renderer.depth, 0);
+        renderer.context->RSSetState(renderer.rasterizer);
+        renderer.context->RSSetViewports(1, &viewport);
+        renderer.context->IASetInputLayout(renderer.inputLayout);
+        renderer.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        renderer.context->IASetVertexBuffers(0, 1, &renderer.vertexBuffer, &stride, &offset);
+        renderer.context->VSSetShader(renderer.vertexShader, nullptr, 0);
+        renderer.context->PSSetShader(renderer.pixelShader, nullptr, 0);
+        renderer.context->PSSetShaderResources(0, 1, &renderer.font);
+        renderer.context->PSSetSamplers(0, 1, &renderer.sampler);
+        renderer.context->Draw(count, 0);
+        ID3D11RenderTargetView* none = nullptr;
+        renderer.context->OMSetRenderTargets(1, &none, nullptr);
+    }
+    renderer.context->SwapDeviceContextState(previous, nullptr);
+    ReleaseOverlayObject(previous);
+    target->Release();
+    if (renderer.frames++ == 0) {
+        Log("Diagnostics overlay: first frame drawn with D3D11.");
+    }
+}
+
+HRESULT STDMETHODCALLTYPE HookPresent(IDXGISwapChain* swapChain, UINT syncInterval,
+                                      UINT flags) {
+    if ((flags & DXGI_PRESENT_TEST) == 0) {
+        DrawOverlay(swapChain);
+    }
+    return g_originalPresent(swapChain, syncInterval, flags);
+}
+
+HRESULT STDMETHODCALLTYPE HookPresent1(IDXGISwapChain1* swapChain, UINT syncInterval,
+                                       UINT flags,
+                                       const DXGI_PRESENT_PARAMETERS* parameters) {
+    if ((flags & DXGI_PRESENT_TEST) == 0) {
+        DrawOverlay(swapChain);
+    }
+    return g_originalPresent1(swapChain, syncInterval, flags, parameters);
+}
+
+bool ReplaceSwapChainSlot(void** vtable, std::size_t slot, const void* replacement,
+                          void** original) {
+    DWORD oldProtection = 0;
+    if (!VirtualProtect(&vtable[slot], sizeof(void*), PAGE_READWRITE, &oldProtection)) {
+        return false;
+    }
+    *original = InterlockedExchangePointer(&vtable[slot], const_cast<void*>(replacement));
+    DWORD ignored = 0;
+    VirtualProtect(&vtable[slot], sizeof(void*), oldProtection, &ignored);
+    return true;
+}
+
+// Creates a throwaway device and swap chain to find the DXGI swap-chain vtable,
+// which every swap chain in the process shares, and replaces Present/Present1.
+bool InstallOverlayPresentHook() {
+    HMODULE d3d11 = LoadLibraryW(L"d3d11.dll");
+    const auto create = d3d11 != nullptr
+        ? reinterpret_cast<D3D11CreateDeviceAndSwapChainFn>(
+              GetProcAddress(d3d11, "D3D11CreateDeviceAndSwapChain"))
+        : nullptr;
+    if (create == nullptr) {
+        Log("Diagnostics overlay: d3d11.dll is unavailable; the overlay was not installed.");
+        return false;
+    }
+    HWND window = CreateWindowExW(0, L"STATIC", L"d2-high-fps-fix overlay probe",
+                                  WS_POPUP, 0, 0, 64, 64, nullptr, nullptr, nullptr,
+                                  nullptr);
+    if (window == nullptr) {
+        Log("Diagnostics overlay: unable to create the probe window; the overlay was not "
+            "installed.");
+        return false;
+    }
+    DXGI_SWAP_CHAIN_DESC description{};
+    description.BufferDesc.Width = 64;
+    description.BufferDesc.Height = 64;
+    description.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    description.SampleDesc.Count = 1;
+    description.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    description.BufferCount = 1;
+    description.OutputWindow = window;
+    description.Windowed = TRUE;
+    description.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+    IDXGISwapChain* swapChain = nullptr;
+    ID3D11Device* device = nullptr;
+    ID3D11DeviceContext* context = nullptr;
+    const HRESULT result = create(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0,
+                                  D3D11_SDK_VERSION, &description, &swapChain, &device,
+                                  nullptr, &context);
+    bool installed = false;
+    if (SUCCEEDED(result) && swapChain != nullptr) {
+        void** vtable = *reinterpret_cast<void***>(swapChain);
+        void* original = nullptr;
+        installed = ReplaceSwapChainSlot(vtable, kSwapChainPresentSlot,
+                                         reinterpret_cast<const void*>(&HookPresent),
+                                         &original);
+        if (installed) {
+            g_originalPresent = reinterpret_cast<PresentFn>(original);
+            IDXGISwapChain1* swapChain1 = nullptr;
+            if (SUCCEEDED(swapChain->QueryInterface(__uuidof(IDXGISwapChain1),
+                                                    reinterpret_cast<void**>(&swapChain1)))) {
+                void** vtable1 = *reinterpret_cast<void***>(swapChain1);
+                void* original1 = nullptr;
+                if (ReplaceSwapChainSlot(vtable1, kSwapChainPresent1Slot,
+                                         reinterpret_cast<const void*>(&HookPresent1),
+                                         &original1)) {
+                    g_originalPresent1 = reinterpret_cast<Present1Fn>(original1);
+                }
+                swapChain1->Release();
             }
         }
     }
-    void* context = g_originalDevGuiDraw(self);
-    if (context != nullptr || !g_overlay) {
-        return context;  // DevGUI is on: leave its pass alone.
-    }
-    return DrawOverlayContext();
-}
-
-bool InstallDevGuiOverlayHook() {
-    const HookSiteLayout& site = g_layout->devGuiDraw;
-    auto* entry = reinterpret_cast<unsigned char*>(g_executableBase + site.rva);
-    if (memcmp(entry, site.bytes.data(), site.length) != 0) {
-        g_overlay = false;
-        Log("DevGUI 2D pass bytes do not match; the diagnostics overlay was not "
-            "installed.");
+    ReleaseOverlayObject(context);
+    ReleaseOverlayObject(device);
+    ReleaseOverlayObject(swapChain);
+    DestroyWindow(window);
+    if (!installed) {
+        Log("Diagnostics overlay: unable to hook IDXGISwapChain::Present (0x%08lX); the "
+            "overlay was not installed.", static_cast<unsigned long>(result));
         return false;
     }
-    constexpr std::size_t kAbsoluteJumpLength = 14;
-    auto* trampoline = static_cast<unsigned char*>(
-        VirtualAlloc(nullptr, 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE));
-    if (trampoline == nullptr) {
-        g_overlay = false;
-        Log("Unable to allocate the DevGUI trampoline; the diagnostics overlay was not "
-            "installed.");
-        return false;
-    }
-    memcpy(trampoline, entry, site.length);
-    WriteAbsoluteIndirectJump(trampoline + site.length, entry + site.length);
-    FlushInstructionCache(GetCurrentProcess(), trampoline, site.length + kAbsoluteJumpLength);
-
-    unsigned char patch[kMaximumHookLength]{};
-    memset(patch, 0x90, sizeof(patch));
-    WriteAbsoluteIndirectJump(patch, reinterpret_cast<const void*>(&HookDevGuiDraw));
-    DWORD oldProtection = 0;
-    if (!VirtualProtect(entry, site.length, PAGE_EXECUTE_READWRITE, &oldProtection)) {
-        VirtualFree(trampoline, 0, MEM_RELEASE);
-        g_overlay = false;
-        Log("VirtualProtect failed at the DevGUI 2D pass; the diagnostics overlay was "
-            "not installed.");
-        return false;
-    }
-    g_originalDevGuiDraw = reinterpret_cast<DevGuiDrawFn>(trampoline);
-    memcpy(entry, patch, site.length);
-    FlushInstructionCache(GetCurrentProcess(), entry, site.length);
-    DWORD ignored = 0;
-    VirtualProtect(entry, site.length, oldProtection, &ignored);
-    Log("Installed diagnostics overlay at the DevGUI 2D pass RVA 0x%llX (drawn while "
-        "devgui is 0).", static_cast<unsigned long long>(site.rva));
+    Log("Diagnostics overlay: hooked IDXGISwapChain::Present%s; the status box is drawn "
+        "at the top right.", g_originalPresent1 != nullptr ? " and Present1" : "");
     return true;
 }
 
@@ -8291,7 +8572,7 @@ DWORD WINAPI InstallThread(void*) {
         InstallSkinnedPoseUploadHook();
         InstallShadowCasterBuildHooks();
         if (g_overlay) {
-            InstallDevGuiOverlayHook();
+            InstallOverlayPresentHook();
         }
     }
     return 0;
