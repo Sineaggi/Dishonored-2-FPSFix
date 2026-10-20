@@ -7583,7 +7583,6 @@ struct OverlayRenderer {
     ID3D11PixelShader* pixelShader = nullptr;
     ID3D11InputLayout* inputLayout = nullptr;
     ID3D11Buffer* vertexBuffer = nullptr;
-    OverlayFont statusFont;
     std::array<OverlayFont, kDevGuiFontSlots> devGuiFonts{};
     ID3D11SamplerState* sampler = nullptr;
     ID3D11BlendState* blend = nullptr;
@@ -7661,17 +7660,32 @@ void UpdateOverlayStatistics() {
     stats.lastCounters = counters;
 }
 
-int FormatOverlayLines(char (&lines)[4][160]) {
+// Rows of the FPSFix column added to DevGUI: {label, value}. Labels name the
+// hotkey that changes each state.
+struct FpsFixColumnRow {
+    char label[64];
+    char value[48];
+};
+
+int FormatFpsFixColumn(FpsFixColumnRow (&rows)[12]) {
     UpdateOverlayStatistics();
     const OverlayStatistics& stats = g_overlayStatistics;
     const bool transforms = RuntimeTransformInterpolationEnabled();
-    const bool skeletons = RuntimeSkeletalInterpolationEnabled();
-    const bool hands = RuntimeFirstPersonHandsEnabled();
-    const bool camera = g_enabled.load(std::memory_order_relaxed);
-    sprintf_s(lines[0], "FPSFix  camera %s  transforms %s%s  skeletons %s  hands %s",
-              camera ? "on" : "OFF", transforms ? "on" : "OFF",
-              transforms ? (SourceLevelWritesSelected() ? " (source)" : " (per-draw)") : "",
-              skeletons ? "on" : "OFF", hands ? "on" : "OFF");
+    int count = 0;
+    const auto row = [&](const char* label, const char* format, auto... values) {
+        if (count < 12) {
+            strcpy_s(rows[count].label, label);
+            sprintf_s(rows[count].value, format, values...);
+            ++count;
+        }
+    };
+    const auto box = [](bool on) { return on ? "[X]" : "[ ]"; };
+    row("Camera Prediction (F10)", "%s", box(g_enabled.load(std::memory_order_relaxed)));
+    row("World Transforms (Alt+F11)", "%s", box(transforms));
+    row("Transform Method (Ctrl+Shift+F11)", "%s",
+        SourceLevelWritesSelected() ? "<source>" : "<per-draw>");
+    row("Skeletons (Alt+F11)", "%s", box(RuntimeSkeletalInterpolationEnabled()));
+    row("First-Person Hands (Shift+F11)", "%s", box(RuntimeFirstPersonHandsEnabled()));
     if (g_enableInterpolationAbProbe) {
         if (g_interpolationAbProbe.capturing) {
             LARGE_INTEGER now{};
@@ -7679,22 +7693,19 @@ int FormatOverlayLines(char (&lines)[4][160]) {
             const double elapsed = static_cast<double>(
                 now.QuadPart - g_interpolationAbProbe.segmentStartCounter.QuadPart) /
                 static_cast<double>(g_interpolationAbProbe.frequency.QuadPart);
-            sprintf_s(lines[1], "A/B segment %llu RECORDING %.1fs%s",
-                      static_cast<unsigned long long>(g_interpolationAbProbe.segmentId),
-                      elapsed, elapsed < kAbProbeWarmupSeconds ? " (warm-up)" : "");
+            row("A/B Recording (Ctrl+F11)", "[X] %.0fs%s", elapsed,
+                elapsed < kAbProbeWarmupSeconds ? " warm-up" : "");
         } else {
-            sprintf_s(lines[1], "A/B idle (Ctrl+F11 to record)");
+            row("A/B Recording (Ctrl+F11)", "%s", "[ ]");
         }
-        sprintf_s(lines[2], "plugin ms/frame  model %.2f  pose %.2f  flush %.2f",
-                  stats.modelMs, stats.poseMs, stats.flushMs);
-    } else {
-        sprintf_s(lines[1], "A/B probe off");
-        sprintf_s(lines[2], "plugin timing needs InterpolationABProbe=1");
+        row("Plugin ms/frame: model", "%.2f", stats.modelMs);
+        row("Plugin ms/frame: pose", "%.2f", stats.poseMs);
+        row("Plugin ms/frame: flush", "%.2f", stats.flushMs);
     }
-    sprintf_s(lines[3], "frames/s %.0f  source tracks %llu  writes/frame %.1f",
-              stats.fps, static_cast<unsigned long long>(g_sourceCounters.activeTracks),
-              stats.writesPerFrame);
-    return 4;
+    row("Frames/s", "%.0f", stats.fps);
+    row("Source Tracks", "%llu", static_cast<unsigned long long>(g_sourceCounters.activeTracks));
+    row("Source Writes/frame", "%.1f", stats.writesPerFrame);
+    return count;
 }
 
 template <typename T>
@@ -7710,7 +7721,6 @@ void ReleaseOverlayRenderer(OverlayRenderer& renderer) {
     ReleaseOverlayObject(renderer.rasterizer);
     ReleaseOverlayObject(renderer.blend);
     ReleaseOverlayObject(renderer.sampler);
-    ReleaseOverlayObject(renderer.statusFont.atlas);
     for (OverlayFont& font : renderer.devGuiFonts) {
         ReleaseOverlayObject(font.atlas);
         font = OverlayFont{};
@@ -7933,16 +7943,13 @@ bool InitializeOverlayRenderer(OverlayRenderer& renderer, IDXGISwapChain* swapCh
     depthDescription.DepthEnable = FALSE;
     depthDescription.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
     depthDescription.DepthFunc = D3D11_COMPARISON_ALWAYS;
-    const int fontHeight = std::max(14, static_cast<int>(swapDescription.BufferDesc.Height) / 60);
     ok = SUCCEEDED(device->CreateBuffer(&bufferDescription, nullptr,
                                         &renderer.vertexBuffer)) &&
          SUCCEEDED(device->CreateSamplerState(&samplerDescription, &renderer.sampler)) &&
          SUCCEEDED(device->CreateBlendState(&blendDescription, &renderer.blend)) &&
          SUCCEEDED(device->CreateRasterizerState(&rasterizerDescription,
                                                  &renderer.rasterizer)) &&
-         SUCCEEDED(device->CreateDepthStencilState(&depthDescription, &renderer.depth)) &&
-         CreateOverlayFontAtlas(device, L"Consolas", FW_SEMIBOLD, fontHeight,
-                                renderer.statusFont);
+         SUCCEEDED(device->CreateDepthStencilState(&depthDescription, &renderer.depth));
     if (!ok) {
         Log("Diagnostics overlay: resource setup failed; the overlay is off.");
         return false;
@@ -7951,10 +7958,9 @@ bool InitializeOverlayRenderer(OverlayRenderer& renderer, IDXGISwapChain* swapCh
     renderer.ready = true;
     Log("Diagnostics overlay: bound to swap chain %p on device %p.",
         static_cast<void*>(swapChain), static_cast<void*>(device));
-    Log("Diagnostics overlay: D3D11 renderer ready (back buffer %ux%u format %u, font "
-        "cell %dx%d).", swapDescription.BufferDesc.Width, swapDescription.BufferDesc.Height,
-        static_cast<unsigned>(swapDescription.BufferDesc.Format),
-        renderer.statusFont.cellWidth, renderer.statusFont.cellHeight);
+    Log("Diagnostics overlay: D3D11 renderer ready (back buffer %ux%u format %u).",
+        swapDescription.BufferDesc.Width, swapDescription.BufferDesc.Height,
+        static_cast<unsigned>(swapDescription.BufferDesc.Format));
     return true;
 }
 
@@ -8034,7 +8040,87 @@ void RecordDevGuiText(float x, float y, float scale, const float* color, const c
     g_devGuiCapture.push_back(entry);
 }
 
+// Adds an "- FPSFIX -" block at DevGUI's bottom-left (the key legend is at the
+// bottom-right), in DevGUI's own colors (the most common header and row colors
+// this frame), text scale, left margin, and row spacing.
+std::atomic<int> g_overlayBackBufferHeight{0};
+void AppendFpsFixColumn(std::vector<DevGuiTextEntry>& entries) {
+    float scale = 0.0f;
+    float left = 1.0e9f;
+    std::uint32_t headerColor = 0xFFFFFFFFu;
+    std::uint32_t rowColor = 0xFFFFFFFFu;
+    std::vector<std::pair<std::uint32_t, int>> headerColors;
+    std::vector<std::pair<std::uint32_t, int>> rowColors;
+    const auto tally = [](std::vector<std::pair<std::uint32_t, int>>& tallies,
+                          std::uint32_t color) {
+        for (auto& tallyEntry : tallies) {
+            if (tallyEntry.first == color) {
+                ++tallyEntry.second;
+                return;
+            }
+        }
+        tallies.emplace_back(color, 1);
+    };
+    for (const DevGuiTextEntry& entry : entries) {
+        const std::size_t length = strlen(entry.text);
+        if (length > 4 && entry.text[0] == '-' && entry.text[length - 1] == '-') {
+            scale = entry.scale;
+            left = std::min(left, entry.x);
+            tally(headerColors, entry.color);
+        } else {
+            tally(rowColors, entry.color);
+        }
+    }
+    const int screenHeight = g_overlayBackBufferHeight.load(std::memory_order_relaxed);
+    if (scale <= 0.0f || screenHeight <= 0) {
+        return;
+    }
+    const auto mostCommon = [](const std::vector<std::pair<std::uint32_t, int>>& tallies,
+                               std::uint32_t fallback) {
+        int best = 0;
+        for (const auto& tallyEntry : tallies) {
+            if (tallyEntry.second > best) {
+                best = tallyEntry.second;
+                fallback = tallyEntry.first;
+            }
+        }
+        return fallback;
+    };
+    headerColor = mostCommon(headerColors, headerColor);
+    rowColor = mostCommon(rowColors, rowColor);
+    // Courier advance is 0.6 em of the 48 px font.
+    const float lineHeight = 48.0f * scale;
+    const float x = left;
+    const float valueX = x + 36.0f * 28.8f * scale;
+    const auto add = [&](float atX, float atY, std::uint32_t color, const char* text) {
+        if (entries.size() >= kDevGuiMaxEntries) {
+            return;
+        }
+        DevGuiTextEntry entry{};
+        entry.x = atX;
+        entry.y = atY;
+        entry.scale = scale;
+        entry.color = color;
+        strncpy_s(entry.text, text, _TRUNCATE);
+        entries.push_back(entry);
+    };
+    FpsFixColumnRow rows[12]{};
+    const int count = FormatFpsFixColumn(rows);
+    const float headerY = static_cast<float>(screenHeight) -
+                          lineHeight * (2.0f + 1.4f + static_cast<float>(count));
+    add(x, headerY, headerColor, "- FPSFIX -");
+    float y = headerY + lineHeight * 1.4f;
+    for (int index = 0; index < count; ++index) {
+        add(x, y, rowColor, rows[index].label);
+        add(valueX, y, rowColor, rows[index].value);
+        y += lineHeight;
+    }
+}
+
 void PublishDevGuiText() {
+    if (!g_devGuiCapture.empty()) {
+        AppendFpsFixColumn(g_devGuiCapture);
+    }
     AcquireSRWLockExclusive(&g_devGuiTextLock);
     g_devGuiPublished.swap(g_devGuiCapture);
     g_devGuiPublishedCounter = ReadPerformanceCounter();
@@ -8167,6 +8253,8 @@ void DrawOverlayFrame(IDXGISwapChain* swapChain) {
 
     const float width = static_cast<float>(backDescription.Width);
     const float height = static_cast<float>(backDescription.Height);
+    g_overlayBackBufferHeight.store(static_cast<int>(backDescription.Height),
+                                    std::memory_order_relaxed);
     const auto ndcX = [&](float x) { return x / width * 2.0f - 1.0f; };
     const auto ndcY = [&](float y) { return 1.0f - y / height * 2.0f; };
 
@@ -8237,33 +8325,6 @@ void DrawOverlayFrame(IDXGISwapChain* swapChain) {
     if (SUCCEEDED(renderer.context->Map(renderer.vertexBuffer, 0, D3D11_MAP_WRITE_DISCARD,
                                         0, &mapped))) {
         vertices = static_cast<OverlayVertex*>(mapped.pData);
-
-        // Mod status box, top right; hidden while DevGUI is open.
-        const OverlayFont& status = renderer.statusFont;
-        if (devGui.empty()) {
-            char lines[4][160]{};
-            const int lineCount = FormatOverlayLines(lines);
-            const float cellWidth = static_cast<float>(status.cellWidth);
-            const float cellHeight = static_cast<float>(status.cellHeight);
-            const float margin = cellHeight * 0.5f;
-            std::size_t longest = 0;
-            for (int line = 0; line < lineCount; ++line) {
-                longest = std::max(longest, strlen(lines[line]));
-            }
-            const float boxWidth = static_cast<float>(longest) * cellWidth + 2.0f * margin;
-            const float boxHeight = static_cast<float>(lineCount) * cellHeight + 2.0f * margin;
-            const float boxLeft = width - boxWidth - margin * 2.0f;
-            const float boxTop = margin * 2.0f;
-            beginBatch(&status);
-            appendBox(status, boxLeft, boxTop, boxLeft + boxWidth, boxTop + boxHeight,
-                      0xB0000000u);
-            for (int line = 0; line < lineCount; ++line) {
-                appendText(status, boxLeft + margin,
-                           boxTop + margin + static_cast<float>(line) * cellHeight, lines[line],
-                           0xFF33D9FFu);  // ABGR: yellow
-            }
-            endBatch();
-        }
 
         // DevGUI lays itself out in screen pixels at a fixed 12 px text size,
         // which is tiny at high resolutions. It is enlarged by an integer factor
@@ -8455,8 +8516,8 @@ bool InstallOverlayPresentHook() {
             "overlay was not installed.", static_cast<unsigned long>(result));
         return false;
     }
-    Log("Diagnostics overlay: hooked IDXGISwapChain::Present%s; the status box is drawn "
-        "at the top right.", g_originalPresent1 != nullptr ? " and Present1" : "");
+    Log("Diagnostics overlay: hooked IDXGISwapChain::Present%s; DevGUI is drawn "
+        "through it.", g_originalPresent1 != nullptr ? " and Present1" : "");
     return true;
 }
 
