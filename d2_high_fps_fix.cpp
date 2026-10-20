@@ -90,8 +90,9 @@ struct GameBuildLayout {
     VtableLayout assemblyVtable;
     std::uintptr_t assemblyMarkDirtyRva;
     std::array<unsigned char, 16> assemblyMarkDirtyBytes;
-    // Diagnostics overlay: the engine's com_showFPS drawer is hooked and our
-    // status lines are appended with the engine's own DrawString.
+    // Diagnostics overlay. The com_showFPS/con_noPrint cvars and the console
+    // FPS drawer are only validated: the console never draws during gameplay.
+    // The status lines use the engine's own DrawString and text width.
     bool overlaySupported;
     std::uintptr_t showFpsCvarRva;
     // con_noPrint (default 1) makes idConsoleLocal::Draw skip every on-screen
@@ -114,6 +115,24 @@ struct GameBuildLayout {
     std::uintptr_t commonVtableRva;
     std::size_t commonLoadPromptHandleOffset;
     std::size_t commonLoadFlagsOffset;
+    // DevGUI 2D pass: the game view calls it every frame and queues the 2D draw
+    // context it returns for rendering. It returns null unless the devgui cvar
+    // is above 0, so the overlay hook returns its own context in that case,
+    // built with the same allocate/construct/state/begin/font-size calls.
+    HookSiteLayout devGuiDraw;
+    std::uintptr_t engineAllocRva;
+    std::array<unsigned char, 16> engineAllocBytes;
+    std::uint32_t engineAllocTag;
+    std::uintptr_t drawContextCtorRva;
+    std::array<unsigned char, 16> drawContextCtorBytes;
+    std::size_t drawContextSize;
+    std::uintptr_t drawContextSetStateRva;
+    std::array<unsigned char, 16> drawContextSetStateBytes;
+    std::uintptr_t drawContextDefaultStateRva;
+    std::uintptr_t drawContextBeginRva;
+    std::array<unsigned char, 16> drawContextBeginBytes;
+    std::uintptr_t drawContextFontSizeRva;
+    std::array<unsigned char, 16> drawContextFontSizeBytes;
 };
 
 constexpr GameBuildLayout kGogLayout = {
@@ -242,6 +261,29 @@ constexpr GameBuildLayout kSteamLayout = {
     0x1AC4D88,
     0x12D8,
     0x19A0,
+    {0x8989F0, 18, {
+        0x40, 0x57,
+        0x48, 0x81, 0xEC, 0x60, 0x05, 0x00, 0x00,
+        0x48, 0xC7, 0x44, 0x24, 0x30, 0xFE, 0xFF, 0xFF, 0xFF,
+    }},
+    0xF1450,
+    {0x48, 0x89, 0x5C, 0x24, 0x08, 0x57, 0x48, 0x83,
+     0xEC, 0x50, 0x8B, 0xDA, 0x48, 0x8B, 0xF9, 0xE8},
+    0x33,
+    0x230A60,
+    {0x48, 0x8B, 0xC4, 0x48, 0x89, 0x48, 0x08, 0x57,
+     0x48, 0x83, 0xEC, 0x60, 0x48, 0xC7, 0x40, 0xC8},
+    0x4FC80,
+    0x230DE0,
+    {0xC7, 0x81, 0x68, 0x1C, 0x00, 0x00, 0x00, 0x00,
+     0x00, 0x00, 0x8B, 0x02, 0x89, 0x81, 0x44, 0x1C},
+    0x32CFBE0,
+    0x231350,
+    {0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x74,
+     0x24, 0x10, 0x57, 0x48, 0x83, 0xEC, 0x30, 0x8B},
+    0x231420,
+    {0x40, 0x53, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B,
+     0x0D, 0x1B, 0x79, 0x06, 0x02, 0xBA, 0x41, 0x00},
 };
 
 constexpr std::array<const GameBuildLayout*, 2> kKnownLayouts = {
@@ -383,7 +425,6 @@ bool g_autoAbSchedule = false;
 int g_autoAbSegmentSeconds = 20;
 int g_autoAbRounds = 2;
 bool g_autoAbQuitWhenDone = false;
-void TryEnableOverlayCvar();
 bool g_sourceLevelTransforms = false;
 bool g_sourceLevelWrites = false;
 bool g_sourceLevelHands = false;
@@ -1303,7 +1344,20 @@ bool ValidateOverlayLayout(const ExecutableImageLayout& image,
            ValidateMutableDataRange(image, layout.renderSystemPointerRva,
                                     sizeof(void*), "render system pointer") &&
            ValidateMutableDataRange(image, layout.debugFontHeightRva, sizeof(float),
-                                    "debug font height");
+                                    "debug font height") &&
+           ValidateHookSite(image, layout.devGuiDraw, "DevGUI 2D pass") &&
+           ValidateCodeSignature(image, layout.engineAllocRva, layout.engineAllocBytes,
+                                 "engine allocator") &&
+           ValidateCodeSignature(image, layout.drawContextCtorRva,
+                                 layout.drawContextCtorBytes, "2D context constructor") &&
+           ValidateCodeSignature(image, layout.drawContextSetStateRva,
+                                 layout.drawContextSetStateBytes, "2D context state") &&
+           ValidateMutableDataRange(image, layout.drawContextDefaultStateRva, 0x24,
+                                    "2D context default state") &&
+           ValidateCodeSignature(image, layout.drawContextBeginRva,
+                                 layout.drawContextBeginBytes, "2D context begin") &&
+           ValidateCodeSignature(image, layout.drawContextFontSizeRva,
+                                 layout.drawContextFontSizeBytes, "2D context font size");
 }
 
 bool ValidateSourceLevelLayout(const ExecutableImageLayout& image) {
@@ -5993,7 +6047,6 @@ void TryStabilizeMouseSensitivity() {
 void ApplyPrediction(void* destination, const void* source) {
     g_lastAlpha = std::numeric_limits<double>::quiet_NaN();
     TryApplyEngineFrameLimiter();
-    TryEnableOverlayCvar();
     TryUnlockAbove120();
     TryStabilizeMouseSensitivity();
     const bool f10IsDown = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
@@ -7576,45 +7629,18 @@ bool InstallSourceLevelHooks() {
 
 
 // ---------------------------------------------------------------------------
-// Diagnostics overlay (Diagnostics/Overlay). com_showFPS makes the engine draw
-// its FPS block every frame through 0x4D840; the hook calls it and then
-// appends a few status lines with the engine's DrawString, in the same 2D
-// pass and font.
+// Diagnostics overlay (Diagnostics/Overlay). A few status lines drawn with the
+// engine's debug DrawString into a 2D context that the game view queues for
+// rendering every frame (see HookDevGuiDraw).
 // ---------------------------------------------------------------------------
 
-constexpr char kShowFpsCvarName[] = "com_showFPS";
-constexpr char kConNoPrintCvarName[] = "con_noPrint";
-
-// Writes an integer cvar after checking its name; returns false when the
-// object does not look like the named cvar.
-bool SetIntegerCvar(std::uintptr_t rva, const char* expectedName, std::size_t nameSize,
-                    LONG value, LONG& previous) {
-    auto* cvar = reinterpret_cast<unsigned char*>(g_executableBase + rva);
-    const char* name = nullptr;
-    memcpy(&name, cvar + kCVarNameOffset, sizeof(name));
-    if (name == nullptr || !IsReadableMemory(name, nameSize) ||
-        memcmp(name, expectedName, nameSize) != 0 ||
-        !IsWritableMemory(cvar + kCVarIntegerOffset, 2 * sizeof(LONG))) {
-        return false;
-    }
-    memcpy(&previous, cvar + kCVarIntegerOffset, sizeof(previous));
-    *reinterpret_cast<volatile float*>(cvar + kCVarFloatOffset) = static_cast<float>(value);
-    InterlockedExchange(reinterpret_cast<volatile LONG*>(cvar + kCVarIntegerOffset), value);
-    return true;
-}
-constexpr std::size_t kCommonDebugFontOffset = 0x340;
 constexpr std::size_t kRenderSystemWidthSlot = 0x238;
 
-// Returns the width of the drawn block (text width plus margin).
-using FpsOverlayDrawerFn = float(__fastcall*)(void*, void*, float*, void*);
 using DrawStringFn = void(__fastcall*)(void*, float, float, const char*,
                                        const float*, bool, float);
 using TextWidthFn = int(__fastcall*)(void*, const char*, float);
 using RenderSystemIntFn = int(__fastcall*)(void*);
 
-FpsOverlayDrawerFn g_originalFpsOverlayDrawer = nullptr;
-void* g_fpsOverlayTrampoline = nullptr;
-std::atomic<int> g_overlayCvarState{0};
 
 struct OverlayStatistics {
     bool initialized = false;
@@ -7629,43 +7655,6 @@ struct OverlayStatistics {
 };
 
 OverlayStatistics g_overlayStatistics;
-
-void TryEnableOverlayCvar() {
-    if (!g_overlay || g_overlayCvarState.load(std::memory_order_relaxed) != 0) {
-        return;
-    }
-    auto* cvar = reinterpret_cast<unsigned char*>(g_executableBase + g_layout->showFpsCvarRva);
-    const char* name = nullptr;
-    memcpy(&name, cvar + kCVarNameOffset, sizeof(name));
-    if (name == nullptr) {
-        return;  // The cvar constructor has not run yet.
-    }
-    if (!IsReadableMemory(name, sizeof(kShowFpsCvarName)) ||
-        memcmp(name, kShowFpsCvarName, sizeof(kShowFpsCvarName)) != 0 ||
-        !IsWritableMemory(cvar + kCVarIntegerOffset, 2 * sizeof(LONG))) {
-        g_overlayCvarState.store(2, std::memory_order_relaxed);
-        Log("%s was not found; the diagnostics overlay stays hidden.", kShowFpsCvarName);
-        return;
-    }
-    g_overlayCvarState.store(1, std::memory_order_relaxed);
-    LONG current = 0;
-    memcpy(&current, cvar + kCVarIntegerOffset, sizeof(current));
-    if (current == 0) {
-        *reinterpret_cast<volatile float*>(cvar + kCVarFloatOffset) = 1.0f;
-        InterlockedExchange(reinterpret_cast<volatile LONG*>(cvar + kCVarIntegerOffset), 1);
-    }
-    LONG previousNoPrint = 0;
-    if (SetIntegerCvar(g_layout->conNoPrintCvarRva, kConNoPrintCvarName,
-                       sizeof(kConNoPrintCvarName), 0, previousNoPrint)) {
-        Log("Diagnostics overlay: %s %ld -> 0 so the engine draws its debug text "
-            "(console notify lines may also appear).", kConNoPrintCvarName,
-            static_cast<long>(previousNoPrint));
-    } else {
-        Log("%s was not found; the engine may hide the overlay.", kConNoPrintCvarName);
-    }
-    Log("Diagnostics overlay: %s=%ld; status lines are appended to the engine FPS "
-        "block.", kShowFpsCvarName, current == 0 ? 1L : static_cast<long>(current));
-}
 
 void UpdateOverlayStatistics() {
     OverlayStatistics& stats = g_overlayStatistics;
@@ -7718,10 +7707,7 @@ void UpdateOverlayStatistics() {
     stats.lastCounters = counters;
 }
 
-float DrawOverlayLines(void* common, float* cursor) {
-    void* font = nullptr;
-    memcpy(&font, static_cast<unsigned char*>(common) + kCommonDebugFontOffset,
-           sizeof(font));
+float DrawOverlayLines(void* font, float* cursor) {
     void* renderSystem = *reinterpret_cast<void**>(
         g_executableBase + g_layout->renderSystemPointerRva);
     if (font == nullptr || renderSystem == nullptr || cursor == nullptr) {
@@ -7790,25 +7776,87 @@ float DrawOverlayLines(void* common, float* cursor) {
     return blockWidth;
 }
 
-extern "C" float __fastcall HookFpsOverlayDrawer(void* common, void* second, float* cursor,
-                                                 void* fourth) {
-    const float engineWidth = g_originalFpsOverlayDrawer(common, second, cursor, fourth);
-    if (!g_overlay) {
-        return engineWidth;
+
+// The shipped game never calls idConsoleLocal::Draw during gameplay (only the
+// load screen and the screenshot command do), so com_showFPS and the console's
+// debug text never appear in play. The game view instead calls the DevGUI 2D pass every
+// frame and queues the context it returns; with devgui at 0 it returns null.
+// This hook then returns a context of our own with the status lines, prepared
+// exactly the way the DevGUI pass prepares its context.
+using DevGuiDrawFn = void*(__fastcall*)(void*);
+using EngineAllocFn = void*(__fastcall*)(std::size_t, std::uint32_t);
+using DrawContextCtorFn = void*(__fastcall*)(void*);
+using DrawContextSetStateFn = void(__fastcall*)(void*, const void*);
+using DrawContextBeginFn = void(__fastcall*)(void*, int, int, int, int);
+using DrawContextFontSizeFn = void(__fastcall*)(void*, float);
+constexpr std::size_t kRenderSystemHeightSlot = 0x240;
+
+DevGuiDrawFn g_originalDevGuiDraw = nullptr;
+void* g_overlayContext = nullptr;
+bool g_overlayContextFailed = false;
+bool g_overlayDrawLogged = false;
+
+void* DrawOverlayContext() {
+    void* renderSystem = *reinterpret_cast<void**>(
+        g_executableBase + g_layout->renderSystemPointerRva);
+    if (renderSystem == nullptr || g_overlayContextFailed) {
+        return nullptr;
     }
-    // The caller lays out the next debug block from the returned width.
-    return std::max(engineWidth, DrawOverlayLines(common, cursor));
+    if (g_overlayContext == nullptr) {
+        const auto allocate = reinterpret_cast<EngineAllocFn>(
+            g_executableBase + g_layout->engineAllocRva);
+        const auto construct = reinterpret_cast<DrawContextCtorFn>(
+            g_executableBase + g_layout->drawContextCtorRva);
+        void* memory = allocate(g_layout->drawContextSize, g_layout->engineAllocTag);
+        if (memory == nullptr) {
+            g_overlayContextFailed = true;
+            Log("Diagnostics overlay: the engine allocator returned null; the overlay "
+                "is off.");
+            return nullptr;
+        }
+        construct(memory);
+        g_overlayContext = memory;
+        Log("Diagnostics overlay: created a 2D draw context for the DevGUI pass.");
+    }
+    const auto vtable = *reinterpret_cast<std::uintptr_t**>(renderSystem);
+    const auto screenWidth = reinterpret_cast<RenderSystemIntFn>(
+        vtable[kRenderSystemWidthSlot / sizeof(std::uintptr_t)]);
+    const auto screenHeight = reinterpret_cast<RenderSystemIntFn>(
+        vtable[kRenderSystemHeightSlot / sizeof(std::uintptr_t)]);
+    const auto setState = reinterpret_cast<DrawContextSetStateFn>(
+        g_executableBase + g_layout->drawContextSetStateRva);
+    const auto begin = reinterpret_cast<DrawContextBeginFn>(
+        g_executableBase + g_layout->drawContextBeginRva);
+    const auto fontSize = reinterpret_cast<DrawContextFontSizeFn>(
+        g_executableBase + g_layout->drawContextFontSizeRva);
+    setState(g_overlayContext, reinterpret_cast<const void*>(
+        g_executableBase + g_layout->drawContextDefaultStateRva));
+    begin(g_overlayContext, 0, 0, screenWidth(renderSystem), screenHeight(renderSystem));
+    fontSize(g_overlayContext, *reinterpret_cast<const float*>(
+        g_executableBase + g_layout->debugFontHeightRva));
+    float cursor = 8.0f;
+    DrawOverlayLines(g_overlayContext, &cursor);
+    if (!g_overlayDrawLogged) {
+        g_overlayDrawLogged = true;
+        Log("Diagnostics overlay: first frame drawn through the DevGUI 2D pass.");
+    }
+    return g_overlayContext;
 }
 
-bool InstallFpsOverlayHook() {
-    if (!g_overlay) {
-        return false;
+extern "C" void* __fastcall HookDevGuiDraw(void* self) {
+    void* context = g_originalDevGuiDraw(self);
+    if (context != nullptr || !g_overlay) {
+        return context;  // DevGUI is on: leave its pass alone.
     }
-    const HookSiteLayout& site = g_layout->fpsOverlayDrawer;
+    return DrawOverlayContext();
+}
+
+bool InstallDevGuiOverlayHook() {
+    const HookSiteLayout& site = g_layout->devGuiDraw;
     auto* entry = reinterpret_cast<unsigned char*>(g_executableBase + site.rva);
     if (memcmp(entry, site.bytes.data(), site.length) != 0) {
         g_overlay = false;
-        Log("FPS overlay drawer bytes do not match; the diagnostics overlay was not "
+        Log("DevGUI 2D pass bytes do not match; the diagnostics overlay was not "
             "installed.");
         return false;
     }
@@ -7817,7 +7865,7 @@ bool InstallFpsOverlayHook() {
         VirtualAlloc(nullptr, 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE));
     if (trampoline == nullptr) {
         g_overlay = false;
-        Log("Unable to allocate the overlay trampoline; the diagnostics overlay was not "
+        Log("Unable to allocate the DevGUI trampoline; the diagnostics overlay was not "
             "installed.");
         return false;
     }
@@ -7827,23 +7875,22 @@ bool InstallFpsOverlayHook() {
 
     unsigned char patch[kMaximumHookLength]{};
     memset(patch, 0x90, sizeof(patch));
-    WriteAbsoluteIndirectJump(patch, reinterpret_cast<const void*>(&HookFpsOverlayDrawer));
+    WriteAbsoluteIndirectJump(patch, reinterpret_cast<const void*>(&HookDevGuiDraw));
     DWORD oldProtection = 0;
     if (!VirtualProtect(entry, site.length, PAGE_EXECUTE_READWRITE, &oldProtection)) {
         VirtualFree(trampoline, 0, MEM_RELEASE);
         g_overlay = false;
-        Log("VirtualProtect failed at the FPS overlay drawer; the diagnostics overlay "
-            "was not installed.");
+        Log("VirtualProtect failed at the DevGUI 2D pass; the diagnostics overlay was "
+            "not installed.");
         return false;
     }
-    g_originalFpsOverlayDrawer = reinterpret_cast<FpsOverlayDrawerFn>(trampoline);
-    g_fpsOverlayTrampoline = trampoline;
+    g_originalDevGuiDraw = reinterpret_cast<DevGuiDrawFn>(trampoline);
     memcpy(entry, patch, site.length);
     FlushInstructionCache(GetCurrentProcess(), entry, site.length);
     DWORD ignored = 0;
     VirtualProtect(entry, site.length, oldProtection, &ignored);
-    Log("Installed diagnostics overlay at the engine FPS drawer RVA 0x%llX.",
-        static_cast<unsigned long long>(site.rva));
+    Log("Installed diagnostics overlay at the DevGUI 2D pass RVA 0x%llX (drawn while "
+        "devgui is 0).", static_cast<unsigned long long>(site.rva));
     return true;
 }
 
@@ -8127,7 +8174,9 @@ DWORD WINAPI InstallThread(void*) {
         }
         InstallSkinnedPoseUploadHook();
         InstallShadowCasterBuildHooks();
-        InstallFpsOverlayHook();
+        if (g_overlay) {
+            InstallDevGuiOverlayHook();
+        }
     }
     return 0;
 }
