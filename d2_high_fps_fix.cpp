@@ -94,6 +94,9 @@ struct GameBuildLayout {
     // status lines are appended with the engine's own DrawString.
     bool overlaySupported;
     std::uintptr_t showFpsCvarRva;
+    // con_noPrint (default 1) makes idConsoleLocal::Draw skip every on-screen
+    // debug line, com_showFPS included.
+    std::uintptr_t conNoPrintCvarRva;
     HookSiteLayout fpsOverlayDrawer;
     std::uintptr_t drawStringRva;
     std::array<unsigned char, 16> drawStringBytes;
@@ -216,6 +219,7 @@ constexpr GameBuildLayout kSteamLayout = {
      0x24, 0x18, 0x48, 0x89, 0x74, 0x24, 0x20, 0x41},
     true,
     0x25B2DD0,
+    0x2BC2770,
     {0x4D840, 17, {
         0x48, 0x8B, 0xC4,
         0x55,
@@ -1294,6 +1298,8 @@ bool ValidateOverlayLayout(const ExecutableImageLayout& image,
                                  "debug text width") &&
            ValidateMutableDataRange(image, layout.showFpsCvarRva, 0x40,
                                     "com_showFPS cvar") &&
+           ValidateMutableDataRange(image, layout.conNoPrintCvarRva, 0x40,
+                                    "con_noPrint cvar") &&
            ValidateMutableDataRange(image, layout.renderSystemPointerRva,
                                     sizeof(void*), "render system pointer") &&
            ValidateMutableDataRange(image, layout.debugFontHeightRva, sizeof(float),
@@ -7577,6 +7583,25 @@ bool InstallSourceLevelHooks() {
 // ---------------------------------------------------------------------------
 
 constexpr char kShowFpsCvarName[] = "com_showFPS";
+constexpr char kConNoPrintCvarName[] = "con_noPrint";
+
+// Writes an integer cvar after checking its name; returns false when the
+// object does not look like the named cvar.
+bool SetIntegerCvar(std::uintptr_t rva, const char* expectedName, std::size_t nameSize,
+                    LONG value, LONG& previous) {
+    auto* cvar = reinterpret_cast<unsigned char*>(g_executableBase + rva);
+    const char* name = nullptr;
+    memcpy(&name, cvar + kCVarNameOffset, sizeof(name));
+    if (name == nullptr || !IsReadableMemory(name, nameSize) ||
+        memcmp(name, expectedName, nameSize) != 0 ||
+        !IsWritableMemory(cvar + kCVarIntegerOffset, 2 * sizeof(LONG))) {
+        return false;
+    }
+    memcpy(&previous, cvar + kCVarIntegerOffset, sizeof(previous));
+    *reinterpret_cast<volatile float*>(cvar + kCVarFloatOffset) = static_cast<float>(value);
+    InterlockedExchange(reinterpret_cast<volatile LONG*>(cvar + kCVarIntegerOffset), value);
+    return true;
+}
 constexpr std::size_t kCommonDebugFontOffset = 0x340;
 constexpr std::size_t kRenderSystemWidthSlot = 0x238;
 
@@ -7628,6 +7653,15 @@ void TryEnableOverlayCvar() {
     if (current == 0) {
         *reinterpret_cast<volatile float*>(cvar + kCVarFloatOffset) = 1.0f;
         InterlockedExchange(reinterpret_cast<volatile LONG*>(cvar + kCVarIntegerOffset), 1);
+    }
+    LONG previousNoPrint = 0;
+    if (SetIntegerCvar(g_layout->conNoPrintCvarRva, kConNoPrintCvarName,
+                       sizeof(kConNoPrintCvarName), 0, previousNoPrint)) {
+        Log("Diagnostics overlay: %s %ld -> 0 so the engine draws its debug text "
+            "(console notify lines may also appear).", kConNoPrintCvarName,
+            static_cast<long>(previousNoPrint));
+    } else {
+        Log("%s was not found; the engine may hide the overlay.", kConNoPrintCvarName);
     }
     Log("Diagnostics overlay: %s=%ld; status lines are appended to the engine FPS "
         "block.", kShowFpsCvarName, current == 0 ? 1L : static_cast<long>(current));
