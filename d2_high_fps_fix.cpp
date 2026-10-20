@@ -8901,9 +8901,9 @@ bool InstallInlineHook(std::uintptr_t rva, const unsigned char* expected, std::s
 // button (PauseMenuData reads pauseData.devGUI, label ui_pause_devGUI) and the
 // exe still registers its "DevGUI" callback (closes the menu, runs devgui 1);
 // retail just never sets pauseData.devGUI. When the pause menu resolves its
-// "statsEntryAvailable" data path (0x78F6B4), pauseData.devGUI is also resolved
-// and queued as true with the same Iggy calls (path resolve 0x296C0, set bool
-// 0x2A640).
+// "statsEntryAvailable" field in the data context bound to pauseData (0x78F6B4),
+// "devGUI" is also resolved in that context and queued as true with the same
+// Iggy calls (field resolve 0x296C0, set bool 0x2A640).
 constexpr std::uintptr_t kSteamIggyResolvePathRva = 0x296C0;
 constexpr std::size_t kSteamIggyResolvePathHookLength = 15;
 constexpr unsigned char kSteamIggyResolvePathBytes[kSteamIggyResolvePathHookLength] = {
@@ -8930,7 +8930,7 @@ extern "C" void* __fastcall HookIggyResolvePath(void* context, void* path, const
     if (g_overlay &&
         reinterpret_cast<std::uintptr_t>(name) ==
             g_executableBase + kSteamStatsEntryAvailableStringRva) {
-        static const char kDevGuiPath[] = "pauseData.devGUI";
+        static const char kDevGuiPath[] = "devGUI";
         alignas(16) unsigned char devGuiPath[16]{};
         g_originalIggyResolvePath(context, devGuiPath, kDevGuiPath);
         static const bool kTrue = true;
