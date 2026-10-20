@@ -346,6 +346,7 @@ bool g_enableInterpolationAbProbe = false;
 bool g_toggleSounds = true;
 bool g_overlay = false;
 void TryInstallOverlayPresentHook();
+void ToggleDevGui();
 bool g_crashLog = false;
 bool g_autoContinueLoadScreen = false;
 bool g_autoAbSchedule = false;
@@ -5943,7 +5944,10 @@ void ApplyPrediction(void* destination, const void* source) {
     TryStabilizeMouseSensitivity();
     TryInstallOverlayPresentHook();
     const bool f10IsDown = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
-    if (f10IsDown && !g_f10WasDown) {
+    const bool controlIsDown = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+    if (f10IsDown && !g_f10WasDown && controlIsDown && g_overlay) {
+        ToggleDevGui();
+    } else if (f10IsDown && !g_f10WasDown) {
         const bool nowEnabled = !g_enabled.load(std::memory_order_relaxed);
         g_enabled.store(nowEnabled, std::memory_order_relaxed);
         g_prediction.initialized = false;
@@ -7554,6 +7558,17 @@ struct OverlayVertex {
     std::uint32_t color;
 };
 
+struct OverlayFont {
+    ID3D11ShaderResourceView* atlas = nullptr;
+    int pixelHeight = 0;
+    int cellWidth = 0;
+    int cellHeight = 0;
+};
+
+// DevGUI draws with the engine's 48-pixel courier font at a scale; each scale
+// used gets its own Courier New atlas at the matching pixel height.
+constexpr std::size_t kDevGuiFontSlots = 4;
+
 struct OverlayRenderer {
     bool failed = false;
     bool ready = false;
@@ -7565,13 +7580,12 @@ struct OverlayRenderer {
     ID3D11PixelShader* pixelShader = nullptr;
     ID3D11InputLayout* inputLayout = nullptr;
     ID3D11Buffer* vertexBuffer = nullptr;
-    ID3D11ShaderResourceView* font = nullptr;
+    OverlayFont statusFont;
+    std::array<OverlayFont, kDevGuiFontSlots> devGuiFonts{};
     ID3D11SamplerState* sampler = nullptr;
     ID3D11BlendState* blend = nullptr;
     ID3D11RasterizerState* rasterizer = nullptr;
     ID3D11DepthStencilState* depth = nullptr;
-    int cellWidth = 0;
-    int cellHeight = 0;
     std::uint64_t frames = 0;
     std::uint64_t lastBoundPresent = 0;
     bool targetFailureLogged = false;
@@ -7693,7 +7707,11 @@ void ReleaseOverlayRenderer(OverlayRenderer& renderer) {
     ReleaseOverlayObject(renderer.rasterizer);
     ReleaseOverlayObject(renderer.blend);
     ReleaseOverlayObject(renderer.sampler);
-    ReleaseOverlayObject(renderer.font);
+    ReleaseOverlayObject(renderer.statusFont.atlas);
+    for (OverlayFont& font : renderer.devGuiFonts) {
+        ReleaseOverlayObject(font.atlas);
+        font = OverlayFont{};
+    }
     ReleaseOverlayObject(renderer.vertexBuffer);
     ReleaseOverlayObject(renderer.inputLayout);
     ReleaseOverlayObject(renderer.pixelShader);
@@ -7723,21 +7741,23 @@ float4 PSMain(PixelInput input) : SV_Target {
 
 // Renders characters 32..126 of a monospaced font into an R8 atlas; cell 127
 // is filled solid for background quads.
-bool CreateOverlayFontAtlas(OverlayRenderer& renderer, int pixelHeight) {
+bool CreateOverlayFontAtlas(ID3D11Device* device, const wchar_t* face, int weight,
+                            int pixelHeight, OverlayFont& output) {
     HDC dc = CreateCompatibleDC(nullptr);
     if (dc == nullptr) {
         return false;
     }
-    HFONT font = CreateFontW(-pixelHeight, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+    HFONT font = CreateFontW(-pixelHeight, 0, 0, 0, weight, FALSE, FALSE, FALSE,
                              DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
-                             ANTIALIASED_QUALITY, FIXED_PITCH | FF_MODERN, L"Consolas");
+                             ANTIALIASED_QUALITY, FIXED_PITCH | FF_MODERN, face);
     HGDIOBJ previousFont = SelectObject(dc, font);
     SIZE glyph{};
     GetTextExtentPoint32W(dc, L"M", 1, &glyph);
-    renderer.cellWidth = std::max(1, static_cast<int>(glyph.cx));
-    renderer.cellHeight = std::max(1, static_cast<int>(glyph.cy));
-    const int width = renderer.cellWidth * kOverlayAtlasColumns;
-    const int height = renderer.cellHeight * kOverlayAtlasRows;
+    output.pixelHeight = pixelHeight;
+    output.cellWidth = std::max(1, static_cast<int>(glyph.cx));
+    output.cellHeight = std::max(1, static_cast<int>(glyph.cy));
+    const int width = output.cellWidth * kOverlayAtlasColumns;
+    const int height = output.cellHeight * kOverlayAtlasRows;
 
     BITMAPINFO info{};
     info.bmiHeader.biSize = sizeof(info.bmiHeader);
@@ -7756,8 +7776,8 @@ bool CreateOverlayFontAtlas(OverlayRenderer& renderer, int pixelHeight) {
         SetTextColor(dc, RGB(255, 255, 255));
         for (int index = 0; index < kOverlayCharCount - 1; ++index) {
             const char character = static_cast<char>(kOverlayFirstChar + index);
-            TextOutA(dc, (index % kOverlayAtlasColumns) * renderer.cellWidth,
-                     (index / kOverlayAtlasColumns) * renderer.cellHeight, &character, 1);
+            TextOutA(dc, (index % kOverlayAtlasColumns) * output.cellWidth,
+                     (index / kOverlayAtlasColumns) * output.cellHeight, &character, 1);
         }
         GdiFlush();
         std::vector<unsigned char> alpha(static_cast<std::size_t>(width) * height);
@@ -7766,11 +7786,11 @@ bool CreateOverlayFontAtlas(OverlayRenderer& renderer, int pixelHeight) {
             alpha[pixel] = static_cast<unsigned char>((pixels[pixel] >> 16) & 0xFF);
         }
         const int solid = kOverlayCharCount - 1;
-        for (int y = 0; y < renderer.cellHeight; ++y) {
-            for (int x = 0; x < renderer.cellWidth; ++x) {
+        for (int y = 0; y < output.cellHeight; ++y) {
+            for (int x = 0; x < output.cellWidth; ++x) {
                 alpha[static_cast<std::size_t>((solid / kOverlayAtlasColumns) *
-                                               renderer.cellHeight + y) * width +
-                      (solid % kOverlayAtlasColumns) * renderer.cellWidth + x] = 0xFF;
+                                               output.cellHeight + y) * width +
+                      (solid % kOverlayAtlasColumns) * output.cellWidth + x] = 0xFF;
             }
         }
         SelectObject(dc, previousBitmap);
@@ -7788,9 +7808,9 @@ bool CreateOverlayFontAtlas(OverlayRenderer& renderer, int pixelHeight) {
         data.pSysMem = alpha.data();
         data.SysMemPitch = static_cast<UINT>(width);
         ID3D11Texture2D* texture = nullptr;
-        if (SUCCEEDED(renderer.device->CreateTexture2D(&description, &data, &texture))) {
-            created = SUCCEEDED(renderer.device->CreateShaderResourceView(
-                texture, nullptr, &renderer.font));
+        if (SUCCEEDED(device->CreateTexture2D(&description, &data, &texture))) {
+            created = SUCCEEDED(device->CreateShaderResourceView(
+                texture, nullptr, &output.atlas));
             texture->Release();
         }
     }
@@ -7918,7 +7938,8 @@ bool InitializeOverlayRenderer(OverlayRenderer& renderer, IDXGISwapChain* swapCh
          SUCCEEDED(device->CreateRasterizerState(&rasterizerDescription,
                                                  &renderer.rasterizer)) &&
          SUCCEEDED(device->CreateDepthStencilState(&depthDescription, &renderer.depth)) &&
-         CreateOverlayFontAtlas(renderer, fontHeight);
+         CreateOverlayFontAtlas(device, L"Consolas", FW_SEMIBOLD, fontHeight,
+                                renderer.statusFont);
     if (!ok) {
         Log("Diagnostics overlay: resource setup failed; the overlay is off.");
         return false;
@@ -7929,8 +7950,8 @@ bool InitializeOverlayRenderer(OverlayRenderer& renderer, IDXGISwapChain* swapCh
         static_cast<void*>(swapChain), static_cast<void*>(device));
     Log("Diagnostics overlay: D3D11 renderer ready (back buffer %ux%u format %u, font "
         "cell %dx%d).", swapDescription.BufferDesc.Width, swapDescription.BufferDesc.Height,
-        static_cast<unsigned>(swapDescription.BufferDesc.Format), renderer.cellWidth,
-        renderer.cellHeight);
+        static_cast<unsigned>(swapDescription.BufferDesc.Format),
+        renderer.statusFont.cellWidth, renderer.statusFont.cellHeight);
     return true;
 }
 
@@ -7946,6 +7967,111 @@ void AppendOverlayQuad(OverlayVertex* vertices, UINT& count, float x0, float y0,
     };
     memcpy(vertices + count, quad, sizeof(quad));
     count += 6;
+}
+
+
+// DevGUI replay. The DevGUI pass (0x8989F0) runs once per game frame; while it
+// runs, every string handed to DevGUI's text drawer is recorded with its
+// position, scale, color and alignment, and when the pass returns the list is
+// published for the Present hook, which draws it at the same coordinates.
+struct DevGuiTextEntry {
+    float x = 0.0f;
+    float y = 0.0f;
+    float scale = 0.0f;
+    std::uint32_t color = 0;
+    int alignment = 0;
+    char text[128]{};
+};
+
+constexpr std::size_t kDevGuiMaxEntries = 1024;
+SRWLOCK g_devGuiTextLock = SRWLOCK_INIT;
+std::vector<DevGuiTextEntry> g_devGuiCapture;
+std::vector<DevGuiTextEntry> g_devGuiPublished;
+std::uint64_t g_devGuiPublishedCounter = 0;
+thread_local bool g_inDevGuiPass = false;
+bool g_devGuiBacking = true;
+
+std::uint32_t PackOverlayColor(const float* color) {
+    if (color == nullptr || !IsReadableMemoryCached(color, 4 * sizeof(float))) {
+        return 0xFFFFFFFFu;
+    }
+    const auto channel = [](float value) {
+        const float clamped = std::isfinite(value) ? std::min(1.0f, std::max(0.0f, value)) : 1.0f;
+        return static_cast<std::uint32_t>(clamped * 255.0f + 0.5f);
+    };
+    return channel(color[0]) | (channel(color[1]) << 8) | (channel(color[2]) << 16) |
+           (channel(color[3]) << 24);
+}
+
+void RecordDevGuiText(float x, float y, float scale, const float* color, const char* text,
+                      int alignment) {
+    if (!g_inDevGuiPass || text == nullptr || !IsReadableMemoryCached(text, 1)) {
+        return;
+    }
+    DevGuiTextEntry entry{};
+    entry.x = x;
+    entry.y = y;
+    entry.scale = scale;
+    entry.color = PackOverlayColor(color);
+    entry.alignment = alignment;
+    std::size_t length = 0;
+    for (const char* character = text;
+         *character != '\0' && length + 1 < sizeof(entry.text) &&
+         IsReadableMemoryCached(character + 1, 1);
+         ++character) {
+        if (*character == '^' && character[1] != '\0') {
+            ++character;  // id color escape such as ^1
+            continue;
+        }
+        entry.text[length++] = (*character >= 32 && *character < 127) ? *character : '?';
+    }
+    if (length == 0 || g_devGuiCapture.size() >= kDevGuiMaxEntries) {
+        return;
+    }
+    g_devGuiCapture.push_back(entry);
+}
+
+void PublishDevGuiText() {
+    AcquireSRWLockExclusive(&g_devGuiTextLock);
+    g_devGuiPublished.swap(g_devGuiCapture);
+    g_devGuiPublishedCounter = ReadPerformanceCounter();
+    ReleaseSRWLockExclusive(&g_devGuiTextLock);
+    g_devGuiCapture.clear();
+}
+
+void CopyPublishedDevGuiText(std::vector<DevGuiTextEntry>& output) {
+    LARGE_INTEGER frequency{};
+    QueryPerformanceFrequency(&frequency);
+    AcquireSRWLockShared(&g_devGuiTextLock);
+    // A stale list (the game view stopped running, e.g. a load screen) is dropped.
+    if (ReadPerformanceCounter() - g_devGuiPublishedCounter <
+        static_cast<std::uint64_t>(frequency.QuadPart / 2)) {
+        output = g_devGuiPublished;
+    }
+    ReleaseSRWLockShared(&g_devGuiTextLock);
+}
+
+const OverlayFont* AcquireDevGuiFont(OverlayRenderer& renderer, float scale) {
+    // The engine font is 48 pixels tall; DevGUI draws it at scale 0.25 (12 px).
+    const int pixelHeight = std::max(8, std::min(64, static_cast<int>(48.0f * scale + 0.5f)));
+    for (OverlayFont& font : renderer.devGuiFonts) {
+        if (font.atlas != nullptr && font.pixelHeight == pixelHeight) {
+            return &font;
+        }
+    }
+    for (OverlayFont& font : renderer.devGuiFonts) {
+        if (font.atlas == nullptr) {
+            if (CreateOverlayFontAtlas(renderer.device, L"Courier New", FW_BOLD, pixelHeight,
+                                       font)) {
+                Log("Diagnostics overlay: DevGUI font %d px (cell %dx%d).", pixelHeight,
+                    font.cellWidth, font.cellHeight);
+                return &font;
+            }
+            font = OverlayFont{};
+            return nullptr;
+        }
+    }
+    return nullptr;
 }
 
 void DrawOverlayFrame(IDXGISwapChain* swapChain);
@@ -8036,31 +8162,69 @@ void DrawOverlayFrame(IDXGISwapChain* swapChain) {
         return;
     }
 
-    char lines[4][160]{};
-    const int lineCount = FormatOverlayLines(lines);
     const float width = static_cast<float>(backDescription.Width);
     const float height = static_cast<float>(backDescription.Height);
-    const float cellWidth = static_cast<float>(renderer.cellWidth);
-    const float cellHeight = static_cast<float>(renderer.cellHeight);
-    const float margin = cellHeight * 0.5f;
-    std::size_t longest = 0;
-    for (int line = 0; line < lineCount; ++line) {
-        longest = std::max(longest, strlen(lines[line]));
-    }
-    const float boxWidth = static_cast<float>(longest) * cellWidth + 2.0f * margin;
-    const float boxHeight = static_cast<float>(lineCount) * cellHeight + 2.0f * margin;
-    const float boxLeft = width - boxWidth - margin * 2.0f;
-    const float boxTop = margin * 2.0f;
     const auto ndcX = [&](float x) { return x / width * 2.0f - 1.0f; };
     const auto ndcY = [&](float y) { return 1.0f - y / height * 2.0f; };
-    const float atlasWidth = cellWidth * kOverlayAtlasColumns;
-    const float atlasHeight = cellHeight * kOverlayAtlasRows;
-    const auto cellUv = [&](int index, float& u0, float& v0, float& u1, float& v1) {
-        u0 = (index % kOverlayAtlasColumns) * cellWidth / atlasWidth;
-        v0 = (index / kOverlayAtlasColumns) * cellHeight / atlasHeight;
-        u1 = u0 + cellWidth / atlasWidth;
-        v1 = v0 + cellHeight / atlasHeight;
+
+    // Each batch is a vertex range drawn with one font atlas.
+    struct Batch {
+        const OverlayFont* font;
+        UINT first;
+        UINT count;
     };
+    Batch batches[1 + kDevGuiFontSlots]{};
+    std::size_t batchCount = 0;
+    OverlayVertex* vertices = nullptr;
+    UINT count = 0;
+    const auto beginBatch = [&](const OverlayFont* font) {
+        if (batchCount != 0 && batches[batchCount - 1].font == font) {
+            return;
+        }
+        if (batchCount < std::size(batches)) {
+            batches[batchCount++] = {font, count, 0};
+        }
+    };
+    const auto endBatch = [&]() {
+        if (batchCount != 0) {
+            batches[batchCount - 1].count = count - batches[batchCount - 1].first;
+        }
+    };
+    const auto cellUv = [](const OverlayFont& font, int index, float& u0, float& v0,
+                           float& u1, float& v1) {
+        u0 = static_cast<float>(index % kOverlayAtlasColumns) / kOverlayAtlasColumns;
+        v0 = static_cast<float>(index / kOverlayAtlasColumns) / kOverlayAtlasRows;
+        u1 = u0 + 1.0f / kOverlayAtlasColumns;
+        v1 = v0 + 1.0f / kOverlayAtlasRows;
+        (void)font;
+    };
+    const auto appendBox = [&](const OverlayFont& font, float left, float top, float right,
+                               float bottom, std::uint32_t color) {
+        float u0 = 0, v0 = 0, u1 = 0, v1 = 0;
+        cellUv(font, kOverlayCharCount - 1, u0, v0, u1, v1);
+        const float su = (u0 + u1) * 0.5f;
+        const float sv = (v0 + v1) * 0.5f;
+        AppendOverlayQuad(vertices, count, ndcX(left), ndcY(top), ndcX(right), ndcY(bottom),
+                          su, sv, su, sv, color);
+    };
+    const auto appendText = [&](const OverlayFont& font, float x, float y, const char* text,
+                                std::uint32_t color) {
+        const float cellWidth = static_cast<float>(font.cellWidth);
+        const float cellHeight = static_cast<float>(font.cellHeight);
+        float u0 = 0, v0 = 0, u1 = 0, v1 = 0;
+        for (const char* character = text; *character != '\0'; ++character) {
+            const int code = static_cast<unsigned char>(*character);
+            if (code > kOverlayFirstChar && code < kOverlayFirstChar + kOverlayCharCount - 1) {
+                cellUv(font, code - kOverlayFirstChar, u0, v0, u1, v1);
+                AppendOverlayQuad(vertices, count, ndcX(x), ndcY(y), ndcX(x + cellWidth),
+                                  ndcY(y + cellHeight), u0, v0, u1, v1, color);
+            }
+            x += cellWidth;
+        }
+    };
+
+    std::vector<DevGuiTextEntry> devGui;
+    CopyPublishedDevGuiText(devGui);
 
     D3D11_MAPPED_SUBRESOURCE mapped{};
     ID3DDeviceContextState* previous = nullptr;
@@ -8069,28 +8233,54 @@ void DrawOverlayFrame(IDXGISwapChain* swapChain) {
     OVERLAY_TRACE("mapping vertices");
     if (SUCCEEDED(renderer.context->Map(renderer.vertexBuffer, 0, D3D11_MAP_WRITE_DISCARD,
                                         0, &mapped))) {
-        auto* vertices = static_cast<OverlayVertex*>(mapped.pData);
-        UINT count = 0;
-        float u0 = 0, v0 = 0, u1 = 0, v1 = 0;
-        cellUv(kOverlayCharCount - 1, u0, v0, u1, v1);
-        const float su = (u0 + u1) * 0.5f;
-        const float sv = (v0 + v1) * 0.5f;
-        AppendOverlayQuad(vertices, count, ndcX(boxLeft), ndcY(boxTop),
-                          ndcX(boxLeft + boxWidth), ndcY(boxTop + boxHeight), su, sv, su,
-                          sv, 0xB0000000u);
-        const std::uint32_t textColor = 0xFF33D9FFu;  // ABGR: yellow
+        vertices = static_cast<OverlayVertex*>(mapped.pData);
+
+        // Mod status box, top right.
+        const OverlayFont& status = renderer.statusFont;
+        char lines[4][160]{};
+        const int lineCount = FormatOverlayLines(lines);
+        const float cellWidth = static_cast<float>(status.cellWidth);
+        const float cellHeight = static_cast<float>(status.cellHeight);
+        const float margin = cellHeight * 0.5f;
+        std::size_t longest = 0;
         for (int line = 0; line < lineCount; ++line) {
-            const float y = boxTop + margin + static_cast<float>(line) * cellHeight;
-            float x = boxLeft + margin;
-            for (const char* character = lines[line]; *character != '\0'; ++character) {
-                const int code = static_cast<unsigned char>(*character);
-                if (code > kOverlayFirstChar && code < kOverlayFirstChar + kOverlayCharCount - 1) {
-                    cellUv(code - kOverlayFirstChar, u0, v0, u1, v1);
-                    AppendOverlayQuad(vertices, count, ndcX(x), ndcY(y), ndcX(x + cellWidth),
-                                      ndcY(y + cellHeight), u0, v0, u1, v1, textColor);
-                }
-                x += cellWidth;
+            longest = std::max(longest, strlen(lines[line]));
+        }
+        const float boxWidth = static_cast<float>(longest) * cellWidth + 2.0f * margin;
+        const float boxHeight = static_cast<float>(lineCount) * cellHeight + 2.0f * margin;
+        const float boxLeft = width - boxWidth - margin * 2.0f;
+        const float boxTop = margin * 2.0f;
+        beginBatch(&status);
+        appendBox(status, boxLeft, boxTop, boxLeft + boxWidth, boxTop + boxHeight,
+                  0xB0000000u);
+        for (int line = 0; line < lineCount; ++line) {
+            appendText(status, boxLeft + margin,
+                       boxTop + margin + static_cast<float>(line) * cellHeight, lines[line],
+                       0xFF33D9FFu);  // ABGR: yellow
+        }
+        endBatch();
+
+        // DevGUI, at its own coordinates, scale and colors.
+        for (const DevGuiTextEntry& entry : devGui) {
+            const OverlayFont* font = AcquireDevGuiFont(renderer, entry.scale);
+            if (font == nullptr) {
+                continue;
             }
+            beginBatch(font);
+            const float textWidth =
+                static_cast<float>(strlen(entry.text)) * static_cast<float>(font->cellWidth);
+            float x = entry.x;
+            if (entry.alignment == 1) {
+                x -= textWidth;
+            } else if (entry.alignment == 2) {
+                x -= textWidth * 0.5f;
+            }
+            if (g_devGuiBacking) {
+                appendBox(*font, x - 2.0f, entry.y - 1.0f, x + textWidth + 2.0f,
+                          entry.y + static_cast<float>(font->cellHeight) + 1.0f, 0x90000000u);
+            }
+            appendText(*font, x, entry.y, entry.text, entry.color);
+            endBatch();
         }
         renderer.context->Unmap(renderer.vertexBuffer, 0);
 
@@ -8108,10 +8298,15 @@ void DrawOverlayFrame(IDXGISwapChain* swapChain) {
         renderer.context->IASetVertexBuffers(0, 1, &renderer.vertexBuffer, &stride, &offset);
         renderer.context->VSSetShader(renderer.vertexShader, nullptr, 0);
         renderer.context->PSSetShader(renderer.pixelShader, nullptr, 0);
-        renderer.context->PSSetShaderResources(0, 1, &renderer.font);
         renderer.context->PSSetSamplers(0, 1, &renderer.sampler);
         OVERLAY_TRACE("drawing");
-        renderer.context->Draw(count, 0);
+        for (std::size_t batch = 0; batch < batchCount; ++batch) {
+            if (batches[batch].count == 0) {
+                continue;
+            }
+            renderer.context->PSSetShaderResources(0, 1, &batches[batch].font->atlas);
+            renderer.context->Draw(batches[batch].count, batches[batch].first);
+        }
         ID3D11RenderTargetView* none = nullptr;
         renderer.context->OMSetRenderTargets(1, &none, nullptr);
     }
@@ -8525,7 +8720,7 @@ extern "C" std::uint64_t __fastcall HookDevGuiText(void* self, float x, float y,
                                                    const float* color, const char* text,
                                                    std::uint64_t seventh, std::uint64_t eighth,
                                                    std::uint64_t ninth) {
-    if (g_devGuiTextLogged.load(std::memory_order_relaxed) < 80) {
+    if (g_devGuiTextLogged.load(std::memory_order_relaxed) < 24) {
         char sample[96]{};
         if (text != nullptr && IsReadableMemory(text, 1)) {
             std::size_t length = 0;
@@ -8543,16 +8738,61 @@ extern "C" std::uint64_t __fastcall HookDevGuiText(void* self, float x, float y,
             Log("DevGUI text: (%.0f, %.0f) scale %.2f \"%s\"", x, y, scale, sample);
         }
     }
+    RecordDevGuiText(x, y, scale, color, text, static_cast<int>(seventh));
     return g_originalDevGuiText(self, x, y, scale, color, text, seventh, eighth, ninth);
 }
 
-bool InstallDevGuiTextLogHook() {
-    if (g_layout != &kSteamLayout) {
-        return false;
+// The DevGUI pass, hooked only to mark DevGUI frames for the replay above.
+constexpr std::uintptr_t kSteamDevGuiPassRva = 0x8989F0;
+constexpr std::size_t kSteamDevGuiPassHookLength = 18;
+constexpr unsigned char kSteamDevGuiPassBytes[kSteamDevGuiPassHookLength] = {
+    0x40, 0x57,
+    0x48, 0x81, 0xEC, 0x60, 0x05, 0x00, 0x00,
+    0x48, 0xC7, 0x44, 0x24, 0x30, 0xFE, 0xFF, 0xFF, 0xFF,
+};
+using DevGuiPassFn = void*(__fastcall*)(void*);
+DevGuiPassFn g_originalDevGuiPass = nullptr;
+
+extern "C" void* __fastcall HookDevGuiPass(void* self) {
+    g_inDevGuiPass = true;
+    void* context = g_originalDevGuiPass(self);
+    g_inDevGuiPass = false;
+    PublishDevGuiText();
+    return context;
+}
+
+// The devgui cvar (Steam): 0 off, 1 on, 2 on with the key legend.
+constexpr std::uintptr_t kSteamDevGuiCvarRva = 0x39A4FE0;
+constexpr char kDevGuiCvarName[] = "devgui";
+
+void ToggleDevGui() {
+    if (g_layout != &kSteamLayout || g_originalDevGuiPass == nullptr) {
+        PlayToggleCue(ToggleCue::Unavailable);
+        return;
     }
-    auto* entry = reinterpret_cast<unsigned char*>(g_executableBase + kSteamDevGuiTextRva);
-    if (memcmp(entry, kSteamDevGuiTextBytes, kSteamDevGuiTextHookLength) != 0) {
-        Log("DevGUI text-log hook bytes do not match; not installed.");
+    auto* cvar = reinterpret_cast<unsigned char*>(g_executableBase + kSteamDevGuiCvarRva);
+    const char* name = nullptr;
+    memcpy(&name, cvar + kCVarNameOffset, sizeof(name));
+    if (name == nullptr || !IsReadableMemory(name, sizeof(kDevGuiCvarName)) ||
+        memcmp(name, kDevGuiCvarName, sizeof(kDevGuiCvarName)) != 0) {
+        PlayToggleCue(ToggleCue::Unavailable);
+        Log("Ctrl+F10: the devgui cvar was not found.");
+        return;
+    }
+    LONG current = 0;
+    memcpy(&current, cvar + kCVarIntegerOffset, sizeof(current));
+    const LONG value = current > 0 ? 0 : 2;
+    *reinterpret_cast<volatile float*>(cvar + kCVarFloatOffset) = static_cast<float>(value);
+    InterlockedExchange(reinterpret_cast<volatile LONG*>(cvar + kCVarIntegerOffset), value);
+    PlayToggleCue(value != 0 ? ToggleCue::On : ToggleCue::Off);
+    Log("Ctrl+F10: DevGUI %s.", value != 0 ? "opened (devgui 2)" : "closed (devgui 0)");
+}
+
+bool InstallInlineHook(std::uintptr_t rva, const unsigned char* expected, std::size_t length,
+                       const void* hook, void** original, const char* description) {
+    auto* entry = reinterpret_cast<unsigned char*>(g_executableBase + rva);
+    if (memcmp(entry, expected, length) != 0) {
+        Log("%s hook bytes do not match; not installed.", description);
         return false;
     }
     auto* trampoline = static_cast<unsigned char*>(
@@ -8560,25 +8800,46 @@ bool InstallDevGuiTextLogHook() {
     if (trampoline == nullptr) {
         return false;
     }
-    memcpy(trampoline, entry, kSteamDevGuiTextHookLength);
-    WriteAbsoluteIndirectJump(trampoline + kSteamDevGuiTextHookLength,
-                              entry + kSteamDevGuiTextHookLength);
-    FlushInstructionCache(GetCurrentProcess(), trampoline, kSteamDevGuiTextHookLength + 14);
-    unsigned char patch[kSteamDevGuiTextHookLength];
+    memcpy(trampoline, entry, length);
+    WriteAbsoluteIndirectJump(trampoline + length, entry + length);
+    FlushInstructionCache(GetCurrentProcess(), trampoline, length + 14);
+    unsigned char patch[kMaximumHookLength];
     memset(patch, 0x90, sizeof(patch));
-    WriteAbsoluteIndirectJump(patch, reinterpret_cast<const void*>(&HookDevGuiText));
+    WriteAbsoluteIndirectJump(patch, hook);
     DWORD oldProtection = 0;
-    if (!VirtualProtect(entry, sizeof(patch), PAGE_EXECUTE_READWRITE, &oldProtection)) {
+    if (!VirtualProtect(entry, length, PAGE_EXECUTE_READWRITE, &oldProtection)) {
         VirtualFree(trampoline, 0, MEM_RELEASE);
         return false;
     }
-    g_originalDevGuiText = reinterpret_cast<DevGuiTextFn>(trampoline);
-    memcpy(entry, patch, sizeof(patch));
-    FlushInstructionCache(GetCurrentProcess(), entry, sizeof(patch));
+    *original = trampoline;
+    memcpy(entry, patch, length);
+    FlushInstructionCache(GetCurrentProcess(), entry, length);
     DWORD ignored = 0;
-    VirtualProtect(entry, sizeof(patch), oldProtection, &ignored);
-    Log("Installed the DevGUI text-log hook at RVA 0x%llX.",
-        static_cast<unsigned long long>(kSteamDevGuiTextRva));
+    VirtualProtect(entry, length, oldProtection, &ignored);
+    Log("Installed the %s hook at RVA 0x%llX.", description,
+        static_cast<unsigned long long>(rva));
+    return true;
+}
+
+bool InstallDevGuiTextLogHook() {
+    if (g_layout != &kSteamLayout) {
+        return false;
+    }
+    void* original = nullptr;
+    if (!InstallInlineHook(kSteamDevGuiTextRva, kSteamDevGuiTextBytes,
+                           kSteamDevGuiTextHookLength,
+                           reinterpret_cast<const void*>(&HookDevGuiText), &original,
+                           "DevGUI text")) {
+        return false;
+    }
+    g_originalDevGuiText = reinterpret_cast<DevGuiTextFn>(original);
+    if (InstallInlineHook(kSteamDevGuiPassRva, kSteamDevGuiPassBytes,
+                          kSteamDevGuiPassHookLength,
+                          reinterpret_cast<const void*>(&HookDevGuiPass), &original,
+                          "DevGUI pass")) {
+        g_originalDevGuiPass = reinterpret_cast<DevGuiPassFn>(original);
+        Log("DevGUI: Ctrl+F10 opens/closes it; it is drawn by the D3D11 overlay.");
+    }
     return true;
 }
 
