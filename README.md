@@ -165,7 +165,7 @@ Edit `d2-high-fps-fix.ini` while the game is closed.
 - `StabilizeMouseSensitivity=1` makes the turn per mouse count independent of the frame rate, both above and below 120 FPS. The game's own look scaling divides the mouse input by the real frame time while the view turns by the simulation time step; the patch makes it divide by the simulation step, so the two cancel on every frame. Sensitivity then matches the unmodified game at its normal 120 FPS cap. Earlier versions of this patch used the game's alternative path instead, which halved sensitivity above 120 FPS and sped it up below 120 FPS; if you raised the in-game sensitivity for those versions, lower it back to about half.
 - `StabilizeFirstPersonHands=1` enables the validated renderer-only first-person root correction. It is enabled by default.
 
-Press **F10** in game to toggle camera prediction and the enabled first-person root correction for an A/B comparison. F10 does not change the FPS limit or the separate interpolation options.
+Camera prediction and the enabled first-person root correction are **on by default**; no key press is needed. Press **F10** in game only for an A/B comparison: it turns them off, and pressing it again turns them back on. F10 does not change the FPS limit or the separate interpolation options.
 
 For development performance comparisons, set
 `Diagnostics/InterpolationABProbe=1`. The in-session controls are:

@@ -52,9 +52,10 @@ frame-rate-independent mouse sensitivity, camera and first-person root
 stabilization, eligible world/root interpolation, first-person and selected
 world skeletal interpolation, and small cinematic-control interpolation.
 
-Press F10 in game to toggle camera prediction and first-person root correction
-for an A/B comparison. F10 does not change the FPS limit or the other
-interpolation settings.
+Camera prediction and first-person root correction are ON by default; no key
+press is needed. Press F10 in game only for an A/B comparison: it turns them
+off, and pressing it again turns them back on. F10 does not change the FPS
+limit or the other interpolation settings.
 
 The adaptive performance controller is enabled by default. It sheds skeletal
 interpolation first, then transform interpolation, when maintaining those
