@@ -7447,9 +7447,10 @@ void CorrectEmitterPoseNow(unsigned char* model, void* placementContext) {
     if (!havePredicted || !BuildCameraCorrection(used, predicted, delta, inverseDelta)) {
         return;
     }
-    // Mode 4: the frame this placement is drawn in has not published its
-    // camera yet, so extrapolate one frame: step = latest * inverse(previous),
-    // next = step * latest, delta = next * inverse(used) = step * delta.
+    // Mode 4: the particle geometry appears to trail the rendered camera by a
+    // frame, so extrapolate one frame: step = latest * inverse(previous),
+    // next = step * latest, delta = next * inverse(used) = step * delta. The
+    // camera-hook refresh is skipped in this mode.
     if (g_screenParticleMode.load(std::memory_order_relaxed) == 4 && havePrevious) {
         Matrix4 step{};
         Matrix4 inverseStep{};
@@ -7521,7 +7522,9 @@ bool WriteCorrectedEmitterPose(unsigned char* model, const std::array<float, 12>
 // placed since is moved again from the camera it was placed with onto the
 // camera now being rendered, unless the engine has placed it again meanwhile.
 void RefreshScreenParticlesForCamera(const Transform& predicted) {
-    if (g_screenParticleMode.load(std::memory_order_relaxed) < 3 || !SourceHandsActive()) {
+    // Mode 4 relies on its extrapolation alone; refreshing onto the
+    // published camera would undo it.
+    if (g_screenParticleMode.load(std::memory_order_relaxed) != 3 || !SourceHandsActive()) {
         return;
     }
     AcquireSRWLockExclusive(&g_screenPlacementLock);
