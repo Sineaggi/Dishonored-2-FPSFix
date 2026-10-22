@@ -9861,6 +9861,48 @@ bool InstallPauseDevGuiCallbackHook() {
     return true;
 }
 
+// DevGUI's own key handler (0x899050) closes it with SetInteger(devgui, 0)
+// (0x1028E0 -> 0x102400), which the retail cvar system does not apply, the
+// same way it ignores the pause menu's "devgui 1". When that setter is called
+// on the devgui cvar, the value is written directly after it returns.
+constexpr std::uintptr_t kSteamCvarSetIntegerRva = 0x1028E0;
+constexpr unsigned char kSteamCvarSetIntegerBytes[15] = {
+    0x40, 0x57, 0x48, 0x83, 0xEC, 0x50, 0x48, 0xC7, 0x44, 0x24, 0x20, 0xFE, 0xFF, 0xFF, 0xFF,
+};
+using CvarSetIntegerFn = void(__fastcall*)(void*, int, bool);
+CvarSetIntegerFn g_originalCvarSetInteger = nullptr;
+
+extern "C" void __fastcall HookCvarSetInteger(void* cvar, int value, bool force) {
+    g_originalCvarSetInteger(cvar, value, force);
+    if (cvar == reinterpret_cast<void*>(g_executableBase + kSteamDevGuiCvarRva)) {
+        unsigned char* devgui = FindDevGuiCvar();
+        if (devgui != nullptr) {
+            LONG current = 0;
+            memcpy(&current, devgui + kCVarIntegerOffset, sizeof(current));
+            if (current != value) {
+                SetDevGuiCvar(devgui, value);
+                if (value == 0) {
+                    PlayToggleCue(ToggleCue::Off);
+                }
+                Log("DevGUI set devgui to %d itself; applied it directly.", value);
+            }
+        }
+    }
+}
+
+bool InstallDevGuiCvarSetHook() {
+    void* original = nullptr;
+    if (g_layout != &kSteamLayout ||
+        !InstallInlineHook(kSteamCvarSetIntegerRva, kSteamCvarSetIntegerBytes,
+                           sizeof(kSteamCvarSetIntegerBytes),
+                           reinterpret_cast<const void*>(&HookCvarSetInteger), &original,
+                           "cvar SetInteger (devgui)")) {
+        return false;
+    }
+    g_originalCvarSetInteger = reinterpret_cast<CvarSetIntegerFn>(original);
+    return true;
+}
+
 bool InstallDevGuiTextLogHook() {
     if (g_layout != &kSteamLayout) {
         return false;
@@ -10013,6 +10055,7 @@ DWORD WINAPI InstallThread(void*) {
             InstallDevGuiTextLogHook();
             InstallIggyCallbackLogHook();
             InstallPauseDevGuiCallbackHook();
+            InstallDevGuiCvarSetHook();
         }
         InstallCameraBloodHooks();
     }
