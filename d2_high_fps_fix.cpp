@@ -345,7 +345,8 @@ bool g_enableTelemetry = false;
 bool g_enableInterpolationAbProbe = false;
 bool g_toggleSounds = true;
 bool g_overlay = false;
-extern bool g_screenParticleCorrection;
+extern std::atomic<int> g_screenParticleMode;
+void CycleScreenParticleMode();
 bool InstallInlineHook(std::uintptr_t rva, const unsigned char* expected, std::size_t length,
                        const void* hook, void** original, const char* description);
 void TryInstallOverlayPresentHook();
@@ -939,8 +940,10 @@ void LoadConfiguration() {
         GetPrivateProfileIntW(L"Interpolation", L"SourceLevelWrites", 0, path) != 0;
     g_sourceLevelHands = g_sourceLevelWrites &&
         GetPrivateProfileIntW(L"Interpolation", L"SourceLevelHands", 1, path) != 0;
-    g_screenParticleCorrection = g_sourceLevelHands &&
-        GetPrivateProfileIntW(L"Interpolation", L"ScreenParticleCorrection", 1, path) != 0;
+    g_screenParticleMode.store(g_sourceLevelHands
+        ? std::max(0, std::min(2, static_cast<int>(GetPrivateProfileIntW(
+              L"Interpolation", L"ScreenParticleCorrection", 2, path))))
+        : 0, std::memory_order_relaxed);
     g_enableTelemetry = GetPrivateProfileIntW(
         L"Diagnostics", L"Telemetry", 0, path) != 0;
     g_enableInterpolationAbProbe = GetPrivateProfileIntW(
@@ -5962,7 +5965,9 @@ void ApplyPrediction(void* destination, const void* source) {
     const bool f10IsDown = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
     const bool controlIsDown = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
     const bool altIsDown = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
-    if (f10IsDown && !g_f10WasDown && controlIsDown && g_overlay) {
+    if (f10IsDown && !g_f10WasDown && controlIsDown && altIsDown) {
+        CycleScreenParticleMode();
+    } else if (f10IsDown && !g_f10WasDown && controlIsDown && g_overlay) {
         ToggleDevGui();
     } else if (f10IsDown && !g_f10WasDown && altIsDown) {
         ToggleForcedBloodEffect();
@@ -6537,6 +6542,11 @@ struct SourceTrack {
     // in world space at the tick camera, so like the hands it is moved by the
     // camera correction instead of being interpolated.
     bool screenParticle = false;
+    // Mode 2: the emitter pose (+0x1860 origin, +0x186C axis) the engine last
+    // placed, and what this track wrote there.
+    std::array<float, 12> poseBase{};
+    std::array<float, 12> poseExpected{};
+    int screenMode = 0;
 };
 
 std::array<SourceTrack, kSourceTrackCapacity> g_sourceTracks{};
@@ -6665,7 +6675,15 @@ bool SourceHandsActive() {
 
 // Writes the engine's committed matrices back (when ours are still in place)
 // and forgets the track.
+void RestoreScreenParticlePose(SourceTrack& track);
+
 void RestoreAndDropSourceTrack(SourceTrack& track, bool registered) {
+    if (registered && track.screenParticle && track.screenMode == 2) {
+        RestoreScreenParticlePose(track);
+        track = {};
+        ++g_sourceCounters.drops;
+        return;
+    }
     if (registered && !track.fresh) {
         const Matrix4 raw = ReadMatrix(static_cast<const unsigned char*>(track.model),
                                        kRenderModelMatrixOffset);
@@ -7071,7 +7089,8 @@ constexpr unsigned char kParticleSystemScreenFlag = 0x40;
 constexpr std::size_t kScreenParticleCapacity = 32;
 using ParticleUpdateFn = std::uint64_t(__fastcall*)(void*, float, void*, void*);
 ParticleUpdateFn g_originalParticleUpdate = nullptr;
-bool g_screenParticleCorrection = true;
+std::atomic<int> g_screenParticleMode{2};
+bool g_screenParticleHookInstalled = false;
 
 struct ScreenParticleEntry {
     void* model = nullptr;
@@ -7182,6 +7201,7 @@ void RegisterScreenParticleModels(const SourceWorldView& view) {
         track->dirty = true;
         track->hands = true;
         track->screenParticle = true;
+        track->screenMode = g_screenParticleMode.load(std::memory_order_relaxed);
         static bool logged = false;
         if (!logged) {
             logged = true;
@@ -7192,8 +7212,97 @@ void RegisterScreenParticleModels(const SourceWorldView& view) {
     }
 }
 
+constexpr std::size_t kRenderModelOriginOffset = 0x1860;
+constexpr std::size_t kRenderModelAxisOffset = 0x186C;
+
+void ReadEmitterPose(const unsigned char* model, std::array<float, 12>& pose) {
+    memcpy(pose.data(), model + kRenderModelOriginOffset, 3 * sizeof(float));
+    memcpy(pose.data() + 3, model + kRenderModelAxisOffset, 9 * sizeof(float));
+}
+
+void WriteEmitterPose(unsigned char* model, const std::array<float, 12>& pose) {
+    memcpy(model + kRenderModelOriginOffset, pose.data(), 3 * sizeof(float));
+    memcpy(model + kRenderModelAxisOffset, pose.data() + 3, 9 * sizeof(float));
+}
+
+void RestoreScreenParticlePose(SourceTrack& track) {
+    auto* bytes = static_cast<unsigned char*>(track.model);
+    std::array<float, 12> raw{};
+    ReadEmitterPose(bytes, raw);
+    if (raw == track.poseExpected && raw != track.poseBase) {
+        WriteEmitterPose(bytes, track.poseBase);
+        ++g_sourceCounters.restores;
+    }
+}
+
+// Mode 2: moves the particle system's emitter pose (origin/axis, from which the
+// particle geometry is built) by the camera correction. The pose is laid out
+// as Commit (0x1095F0) uses it: matrix column j is axis row j, column 3 the
+// origin.
+void UpdateScreenParticlePoseTrack(SourceTrack& track, std::uint64_t& writes) {
+    auto* bytes = static_cast<unsigned char*>(track.model);
+    std::array<float, 12> raw{};
+    ReadEmitterPose(bytes, raw);
+    if (track.fresh || raw != track.poseExpected) {
+        track.poseBase = raw;  // placed again by the particle update
+    }
+    track.fresh = false;
+    track.dirty = false;
+    RenderCorrectionState correction{};
+    if (!ReadRenderCorrection(correction)) {
+        if (raw != track.poseBase) {
+            WriteEmitterPose(bytes, track.poseBase);
+            ++g_sourceCounters.restores;
+        }
+        track.poseExpected = track.poseBase;
+        return;
+    }
+    const std::array<float, 12>& base = track.poseBase;
+    Matrix4 pose{};
+    for (int row = 0; row < 3; ++row) {
+        for (int column = 0; column < 3; ++column) {
+            pose.values[row * 4 + column] = base[3 + column * 3 + row];
+        }
+        pose.values[row * 4 + 3] = base[row];
+    }
+    pose.values[15] = 1.0f;
+    const Matrix4 corrected = MultiplyMatrices4(correction.currentDelta, pose);
+    if (!IsFinite(corrected)) {
+        return;
+    }
+    std::array<float, 12> output{};
+    for (int row = 0; row < 3; ++row) {
+        output[row] = corrected.values[row * 4 + 3];
+        for (int column = 0; column < 3; ++column) {
+            output[3 + column * 3 + row] = corrected.values[row * 4 + column];
+        }
+    }
+    if (output != raw) {
+        WriteEmitterPose(bytes, output);
+        ++writes;
+        ++g_sourceCounters.handsWrites;
+    }
+    track.poseExpected = output;
+}
+
+// Ctrl+Alt+F10 cycles ScreenParticleCorrection: off, model matrix, emitter
+// pose (1-3 beeps).
+void CycleScreenParticleMode() {
+    if (!g_screenParticleHookInstalled) {
+        PlayToggleCue(ToggleCue::Unavailable);
+        return;
+    }
+    const int next = (g_screenParticleMode.load(std::memory_order_relaxed) + 1) % 3;
+    g_screenParticleMode.store(next, std::memory_order_relaxed);
+    PlayProfileCue(next);
+    static const char* const kNames[] = {"off", "model matrix (+0x20)",
+                                         "emitter pose (+0x1860/+0x186C)"};
+    Log("Ctrl+Alt+F10: screen-particle correction %s.", kNames[next]);
+}
+
 bool InstallScreenParticleHook() {
-    if (!g_screenParticleCorrection || g_layout != &kSteamLayout) {
+    if (g_screenParticleMode.load(std::memory_order_relaxed) == 0 ||
+        g_layout != &kSteamLayout) {
         return false;
     }
     void* original = nullptr;
@@ -7201,10 +7310,11 @@ bool InstallScreenParticleHook() {
                            kSteamParticleUpdateHookLength,
                            reinterpret_cast<const void*>(&HookParticleUpdate), &original,
                            "screen-particle update")) {
-        g_screenParticleCorrection = false;
+        g_screenParticleMode.store(0, std::memory_order_relaxed);
         return false;
     }
     g_originalParticleUpdate = reinterpret_cast<ParticleUpdateFn>(original);
+    g_screenParticleHookInstalled = true;
     return true;
 }
 
@@ -7229,7 +7339,7 @@ void ProcessSourceLevelTracks(void* world, const PresentationContext& context,
 
     ++g_sourceFlushSerial;
     RegisterSourceDirtyModels(view, dirty, worldActive, handsActive);
-    if (handsActive && g_screenParticleCorrection) {
+    if (handsActive && g_screenParticleMode.load(std::memory_order_relaxed) != 0) {
         RegisterScreenParticleModels(view);
     }
     std::uint64_t writes = 0;
@@ -7257,7 +7367,9 @@ void ProcessSourceLevelTracks(void* world, const PresentationContext& context,
             ++g_sourceCounters.deadTracks;
             continue;
         }
-        if (track.screenParticle && !ScreenParticleSeenRecently(track.model)) {
+        if (track.screenParticle &&
+            (!ScreenParticleSeenRecently(track.model) ||
+             track.screenMode != g_screenParticleMode.load(std::memory_order_relaxed))) {
             // The particle system stopped or the model went back to the pool.
             RestoreAndDropSourceTrack(track, true);
             continue;
@@ -7274,7 +7386,9 @@ void ProcessSourceLevelTracks(void* world, const PresentationContext& context,
         }
         // A lost dirty notification (overflow) is still caught by the
         // expected-matrix comparison in the update.
-        if (track.hands) {
+        if (track.screenParticle && track.screenMode == 2) {
+            UpdateScreenParticlePoseTrack(track, writes);
+        } else if (track.hands) {
             UpdateSourceHandsTrack(track, context, writes);
         } else {
             UpdateSourceTrack(track, context, writes);
@@ -7878,6 +7992,9 @@ int FormatFpsFixColumn(FpsFixColumnRow (&rows)[16]) {
     row("First-Person Hands (Shift+F11)", "%s", box(RuntimeFirstPersonHandsEnabled()));
     row("Force Blood Effect (Alt+F10)", "%s",
         box(g_forceBloodEffect.load(std::memory_order_relaxed)));
+    static const char* const kScreenModes[] = {"<off>", "<matrix>", "<pose>"};
+    row("Screen Particle Fix (Ctrl+Alt+F10)", "%s",
+        kScreenModes[std::max(0, std::min(2, g_screenParticleMode.load(std::memory_order_relaxed)))]);
     if (g_enableInterpolationAbProbe) {
         if (g_interpolationAbProbe.capturing) {
             LARGE_INTEGER now{};
