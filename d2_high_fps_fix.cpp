@@ -360,6 +360,7 @@ void CloseDevGuiOnEscape();
 void NoteSimulationTime(double simulationTime);
 bool ClosePauseMenu();
 bool g_crashLog = false;
+bool g_devGuiEscapeFallback = true;
 std::atomic<bool> g_forceBloodEffect{false};
 int g_devGuiScale = 0;
 bool g_autoContinueLoadScreen = false;
@@ -960,6 +961,8 @@ void LoadConfiguration() {
         L"Diagnostics", L"CrashLog", 0, path) != 0;
     g_devGuiScale = std::max(0, std::min(4, static_cast<int>(
         GetPrivateProfileIntW(L"Diagnostics", L"DevGuiScale", 0, path))));
+    g_devGuiEscapeFallback = GetPrivateProfileIntW(
+        L"Diagnostics", L"DevGuiEscapeFallback", 1, path) != 0;
     g_forceBloodEffect.store(GetPrivateProfileIntW(
         L"Diagnostics", L"ForceBloodEffect", 0, path) != 0, std::memory_order_relaxed);
     g_autoContinueLoadScreen = GetPrivateProfileIntW(
@@ -9408,9 +9411,14 @@ void SetDevGuiCvar(unsigned char* cvar, LONG value) {
     InterlockedExchange(reinterpret_cast<volatile LONG*>(cvar + kCVarIntegerOffset), value);
 }
 
-// DevGUI's key legend says Esc exits it; the retail build's own handling is
-// not relied on: while devgui is above 0, an Esc press sets it to 0.
+// DevGUI closes itself on Esc (and = and a pad button) once it has input
+// focus (handler 0x899050 sets devgui 0). As a fallback, also covering the
+// frames before it takes focus, an Esc press while devgui is above 0 sets it
+// to 0 here (Diagnostics/DevGuiEscapeFallback).
 void CloseDevGuiOnEscape() {
+    if (!g_devGuiEscapeFallback) {
+        return;
+    }
     static bool escapeWasDown = false;
     const bool escapeIsDown = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
     const bool pressed = escapeIsDown && !escapeWasDown;
