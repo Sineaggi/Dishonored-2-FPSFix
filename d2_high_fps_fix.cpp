@@ -356,6 +356,7 @@ void NoteCameraOrigins(const Transform& raw, const Transform& output);
 void RefreshScreenParticlesForCamera(const Transform& predicted);
 void ToggleForcedBloodEffect();
 void ToggleDevGui();
+void CloseDevGuiOnEscape();
 void NoteSimulationTime(double simulationTime);
 bool ClosePauseMenu();
 bool g_crashLog = false;
@@ -5983,6 +5984,7 @@ void ApplyPrediction(void* destination, const void* source) {
             nowEnabled ? "enabled" : "disabled");
     }
     g_f10WasDown = f10IsDown;
+    CloseDevGuiOnEscape();
     HandleInterpolationAbControls();
     if (!g_enabled.load(std::memory_order_relaxed)) {
         return;
@@ -9404,6 +9406,30 @@ unsigned char* FindDevGuiCvar() {
 void SetDevGuiCvar(unsigned char* cvar, LONG value) {
     *reinterpret_cast<volatile float*>(cvar + kCVarFloatOffset) = static_cast<float>(value);
     InterlockedExchange(reinterpret_cast<volatile LONG*>(cvar + kCVarIntegerOffset), value);
+}
+
+// DevGUI's key legend says Esc exits it; the retail build's own handling is
+// not relied on: while devgui is above 0, an Esc press sets it to 0.
+void CloseDevGuiOnEscape() {
+    static bool escapeWasDown = false;
+    const bool escapeIsDown = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
+    const bool pressed = escapeIsDown && !escapeWasDown;
+    escapeWasDown = escapeIsDown;
+    if (!pressed) {
+        return;
+    }
+    unsigned char* cvar = FindDevGuiCvar();
+    if (cvar == nullptr) {
+        return;
+    }
+    LONG current = 0;
+    memcpy(&current, cvar + kCVarIntegerOffset, sizeof(current));
+    if (current <= 0) {
+        return;
+    }
+    SetDevGuiCvar(cvar, 0);
+    PlayToggleCue(ToggleCue::Off);
+    Log("Esc: DevGUI closed (devgui 0).");
 }
 
 void ToggleDevGui() {
