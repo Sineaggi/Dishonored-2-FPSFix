@@ -345,6 +345,9 @@ bool g_enableTelemetry = false;
 bool g_enableInterpolationAbProbe = false;
 bool g_toggleSounds = true;
 bool g_overlay = false;
+extern bool g_screenParticleCorrection;
+bool InstallInlineHook(std::uintptr_t rva, const unsigned char* expected, std::size_t length,
+                       const void* hook, void** original, const char* description);
 void TryInstallOverlayPresentHook();
 void UpdateForcedBloodEffect();
 void ToggleForcedBloodEffect();
@@ -936,6 +939,8 @@ void LoadConfiguration() {
         GetPrivateProfileIntW(L"Interpolation", L"SourceLevelWrites", 0, path) != 0;
     g_sourceLevelHands = g_sourceLevelWrites &&
         GetPrivateProfileIntW(L"Interpolation", L"SourceLevelHands", 1, path) != 0;
+    g_screenParticleCorrection = g_sourceLevelHands &&
+        GetPrivateProfileIntW(L"Interpolation", L"ScreenParticleCorrection", 1, path) != 0;
     g_enableTelemetry = GetPrivateProfileIntW(
         L"Diagnostics", L"Telemetry", 0, path) != 0;
     g_enableInterpolationAbProbe = GetPrivateProfileIntW(
@@ -6528,6 +6533,10 @@ struct SourceTrack {
     bool assemblyPart = false;
     // First-person (depth-hacked) model corrected to the predicted camera.
     bool hands = false;
+    // Screen particle (camera blood and similar): its particles are emitted
+    // in world space at the tick camera, so like the hands it is moved by the
+    // camera correction instead of being interpolated.
+    bool screenParticle = false;
 };
 
 std::array<SourceTrack, kSourceTrackCapacity> g_sourceTracks{};
@@ -7038,6 +7047,167 @@ void UpdateSourceHandsTrack(SourceTrack& track, const PresentationContext& conte
     }
 }
 
+// Screen particles (Interpolation/ScreenParticleCorrection). A particle
+// system flagged as a screen particle (flag 0x40 at +0x24; camera blood uses
+// it) is placed every tick by 0x227190 at the game camera plus
+// pm_screenParticleOffset along its forward axis, by writing that pose into its
+// render model's +0x1860/+0x186C; the particles are emitted in world space and
+// the model's +0x20 commits as identity. With the predicted camera they would
+// lag the view by the prediction and snap every tick, and their motion vectors
+// would follow the camera, so after the flush the model's +0x20/+0xA0 take the
+// camera correction (predicted * inverse(tick)), exactly as the first-person
+// hands do. 0x227190 is wrapped to collect the models of such systems.
+constexpr std::uintptr_t kSteamParticleUpdateRva = 0x227190;
+constexpr std::size_t kSteamParticleUpdateHookLength = 18;
+constexpr unsigned char kSteamParticleUpdateBytes[kSteamParticleUpdateHookLength] = {
+    0x48, 0x89, 0x74, 0x24, 0x10,
+    0x57,
+    0x48, 0x83, 0xEC, 0x60,
+    0x41, 0x0F, 0xB6, 0x81, 0x54, 0x01, 0x00, 0x00,
+};
+constexpr std::size_t kParticleSystemModelOffset = 0x08;
+constexpr std::size_t kParticleSystemFlagsOffset = 0x24;
+constexpr unsigned char kParticleSystemScreenFlag = 0x40;
+constexpr std::size_t kScreenParticleCapacity = 32;
+using ParticleUpdateFn = std::uint64_t(__fastcall*)(void*, float, void*, void*);
+ParticleUpdateFn g_originalParticleUpdate = nullptr;
+bool g_screenParticleCorrection = true;
+
+struct ScreenParticleEntry {
+    void* model = nullptr;
+    std::uint64_t seenCounter = 0;
+};
+SRWLOCK g_screenParticleLock = SRWLOCK_INIT;
+std::array<ScreenParticleEntry, kScreenParticleCapacity> g_screenParticles{};
+
+extern "C" std::uint64_t __fastcall HookParticleUpdate(void* system, float deltaTime,
+                                                       void* third, void* fourth) {
+    const std::uint64_t result = g_originalParticleUpdate(system, deltaTime, third, fourth);
+    const auto* bytes = static_cast<const unsigned char*>(system);
+    if ((bytes[kParticleSystemFlagsOffset] & kParticleSystemScreenFlag) == 0) {
+        return result;
+    }
+    void* model = nullptr;
+    memcpy(&model, bytes + kParticleSystemModelOffset, sizeof(model));
+    if (model == nullptr) {
+        return result;
+    }
+    const std::uint64_t now = ReadPerformanceCounter();
+    AcquireSRWLockExclusive(&g_screenParticleLock);
+    ScreenParticleEntry* slot = nullptr;
+    ScreenParticleEntry* oldest = &g_screenParticles[0];
+    for (ScreenParticleEntry& entry : g_screenParticles) {
+        if (entry.model == model) {
+            slot = &entry;
+            break;
+        }
+        if (entry.seenCounter < oldest->seenCounter) {
+            oldest = &entry;
+        }
+    }
+    if (slot == nullptr) {
+        slot = oldest;
+        slot->model = model;
+    }
+    slot->seenCounter = now;
+    ReleaseSRWLockExclusive(&g_screenParticleLock);
+    return result;
+}
+
+// True when the particle update placed this model as a screen particle within
+// the last quarter second.
+bool ScreenParticleSeenRecently(const void* model) {
+    LARGE_INTEGER frequency{};
+    QueryPerformanceFrequency(&frequency);
+    const std::uint64_t now = ReadPerformanceCounter();
+    bool seen = false;
+    AcquireSRWLockShared(&g_screenParticleLock);
+    for (const ScreenParticleEntry& entry : g_screenParticles) {
+        if (entry.model == model) {
+            seen = now - entry.seenCounter < static_cast<std::uint64_t>(frequency.QuadPart / 4);
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&g_screenParticleLock);
+    return seen;
+}
+
+// Creates hands-style tracks for this world's recently placed screen
+// particles (the flush only offers models that were marked dirty).
+void RegisterScreenParticleModels(const SourceWorldView& view) {
+    void* models[kScreenParticleCapacity]{};
+    std::size_t count = 0;
+    LARGE_INTEGER frequency{};
+    QueryPerformanceFrequency(&frequency);
+    const std::uint64_t now = ReadPerformanceCounter();
+    AcquireSRWLockShared(&g_screenParticleLock);
+    for (const ScreenParticleEntry& entry : g_screenParticles) {
+        if (entry.model != nullptr &&
+            now - entry.seenCounter < static_cast<std::uint64_t>(frequency.QuadPart / 4)) {
+            models[count++] = entry.model;
+        }
+    }
+    ReleaseSRWLockShared(&g_screenParticleLock);
+    for (std::size_t index = 0; index < count; ++index) {
+        void* model = models[index];
+        SourceTrack* existing = FindSourceTrack(model);
+        if (existing != nullptr) {
+            if (!existing->screenParticle) {
+                // Previously tracked as something else: hand it over.
+                RestoreAndDropSourceTrack(*existing, true);
+            } else {
+                continue;
+            }
+        }
+        if (!IsReadableMemory(model, kRenderModelSize)) {
+            continue;
+        }
+        std::uint16_t handle = 0;
+        memcpy(&handle, static_cast<unsigned char*>(model) + kRenderModelHandleOffset,
+               sizeof(handle));
+        if (!SourceModelRegistered(view, model, handle)) {
+            continue;  // Another world, or not registered yet.
+        }
+        SourceTrack* track = CreateSourceTrack(model);
+        if (track == nullptr) {
+            ++g_sourceCounters.capacityMisses;
+            continue;
+        }
+        std::uintptr_t vtable = 0;
+        memcpy(&vtable, model, sizeof(vtable));
+        track->world = view.world;
+        track->handle = handle;
+        track->vtable = vtable;
+        track->fresh = true;
+        track->dirty = true;
+        track->hands = true;
+        track->screenParticle = true;
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            Log("Screen particles: correcting a screen-particle model to the predicted "
+                "camera (first seen at serial %llu).",
+                static_cast<unsigned long long>(g_presentationSerial.load()));
+        }
+    }
+}
+
+bool InstallScreenParticleHook() {
+    if (!g_screenParticleCorrection || g_layout != &kSteamLayout) {
+        return false;
+    }
+    void* original = nullptr;
+    if (!InstallInlineHook(kSteamParticleUpdateRva, kSteamParticleUpdateBytes,
+                           kSteamParticleUpdateHookLength,
+                           reinterpret_cast<const void*>(&HookParticleUpdate), &original,
+                           "screen-particle update")) {
+        g_screenParticleCorrection = false;
+        return false;
+    }
+    g_originalParticleUpdate = reinterpret_cast<ParticleUpdateFn>(original);
+    return true;
+}
+
 void ProcessSourceLevelTracks(void* world, const PresentationContext& context,
                               bool hasContext, const std::vector<void*>& dirty) {
     SourceWorldView view{};
@@ -7059,6 +7229,9 @@ void ProcessSourceLevelTracks(void* world, const PresentationContext& context,
 
     ++g_sourceFlushSerial;
     RegisterSourceDirtyModels(view, dirty, worldActive, handsActive);
+    if (handsActive && g_screenParticleCorrection) {
+        RegisterScreenParticleModels(view);
+    }
     std::uint64_t writes = 0;
     std::uint64_t active = 0;
     std::uint64_t activeParts = 0;
@@ -7084,7 +7257,12 @@ void ProcessSourceLevelTracks(void* world, const PresentationContext& context,
             ++g_sourceCounters.deadTracks;
             continue;
         }
-        if (SourceModelIsFirstPerson(track.model) != track.hands) {
+        if (track.screenParticle && !ScreenParticleSeenRecently(track.model)) {
+            // The particle system stopped or the model went back to the pool.
+            RestoreAndDropSourceTrack(track, true);
+            continue;
+        }
+        if (!track.screenParticle && SourceModelIsFirstPerson(track.model) != track.hands) {
             // Switched between first-person and world rendering.
             RestoreAndDropSourceTrack(track, true);
             ++g_sourceCounters.ineligible;
@@ -9261,6 +9439,9 @@ DWORD WINAPI InstallThread(void*) {
     }
     if (InstallHook()) {
         InstallSourceLevelHooks();
+        if (g_sourceLevelInstalled) {
+            InstallScreenParticleHook();
+        }
         // In source mode both the world and first-person layers run after the
         // flush; the per-draw hook is kept only for the A/B comparison.
         const bool perDrawNeeded =
