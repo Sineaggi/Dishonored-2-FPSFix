@@ -351,6 +351,8 @@ bool InstallInlineHook(std::uintptr_t rva, const unsigned char* expected, std::s
                        const void* hook, void** original, const char* description);
 void TryInstallOverlayPresentHook();
 void UpdateForcedBloodEffect();
+struct Transform;
+void NoteCameraOrigins(const Transform& raw, const Transform& output);
 void ToggleForcedBloodEffect();
 void ToggleDevGui();
 void NoteSimulationTime(double simulationTime);
@@ -6333,6 +6335,7 @@ extern "C" void* __fastcall HookCopyView(void* destination, const void* source) 
     const Transform rawCamera = ReadTransform(destination);
     ApplyPrediction(destination, source);
     PublishRenderCorrection(rawCamera, ReadTransform(destination));
+    NoteCameraOrigins(rawCamera, ReadTransform(destination));
     PublishPresentationContext();
     PresentationContext probeContext{};
     if (ReadPresentationContext(probeContext)) {
@@ -7099,6 +7102,89 @@ struct ScreenParticleEntry {
 SRWLOCK g_screenParticleLock = SRWLOCK_INIT;
 std::array<ScreenParticleEntry, kScreenParticleCapacity> g_screenParticles{};
 
+// Diagnostics for screen particles: where the placement puts the emitter
+// relative to the raw (tick) and the predicted camera, how often, and on which
+// thread, logged once a second while one is active.
+SRWLOCK g_cameraOriginLock = SRWLOCK_INIT;
+float g_rawCameraOrigin[3]{};
+float g_outputCameraOrigin[3]{};
+std::uint64_t g_cameraOriginSerial = 0;
+
+void NoteCameraOrigins(const Transform& raw, const Transform& output) {
+    AcquireSRWLockExclusive(&g_cameraOriginLock);
+    g_rawCameraOrigin[0] = static_cast<float>(raw.origin.x);
+    g_rawCameraOrigin[1] = static_cast<float>(raw.origin.y);
+    g_rawCameraOrigin[2] = static_cast<float>(raw.origin.z);
+    g_outputCameraOrigin[0] = static_cast<float>(output.origin.x);
+    g_outputCameraOrigin[1] = static_cast<float>(output.origin.y);
+    g_outputCameraOrigin[2] = static_cast<float>(output.origin.z);
+    ++g_cameraOriginSerial;
+    ReleaseSRWLockExclusive(&g_cameraOriginLock);
+}
+
+struct ScreenParticleDiagnostics {
+    std::uint64_t windowStart = 0;
+    std::uint64_t calls = 0;
+    std::uint64_t distinctFrames = 0;
+    std::uint64_t lastFrame = 0;
+    double rawDistanceSum = 0.0;
+    double outputDistanceSum = 0.0;
+    double emitterStepSum = 0.0;
+    float lastEmitter[3]{};
+    DWORD thread = 0;
+};
+ScreenParticleDiagnostics g_screenParticleDiagnostics;
+SRWLOCK g_screenParticleDiagnosticsLock = SRWLOCK_INIT;
+
+void NoteScreenParticlePlacement(const unsigned char* model) {
+    // Emitter = camera origin + forward * offset; compare the emitter with
+    // both camera origins (the offset adds the same ~3.2 to either).
+    float emitter[3]{};
+    memcpy(emitter, model + 0x1860, sizeof(emitter));
+    float raw[3]{};
+    float output[3]{};
+    std::uint64_t frame = 0;
+    AcquireSRWLockShared(&g_cameraOriginLock);
+    memcpy(raw, g_rawCameraOrigin, sizeof(raw));
+    memcpy(output, g_outputCameraOrigin, sizeof(output));
+    frame = g_cameraOriginSerial;
+    ReleaseSRWLockShared(&g_cameraOriginLock);
+    const auto distance = [](const float* a, const float* b) {
+        const double dx = a[0] - b[0], dy = a[1] - b[1], dz = a[2] - b[2];
+        return std::sqrt(dx * dx + dy * dy + dz * dz);
+    };
+    LARGE_INTEGER frequency{};
+    QueryPerformanceFrequency(&frequency);
+    const std::uint64_t now = ReadPerformanceCounter();
+    AcquireSRWLockExclusive(&g_screenParticleDiagnosticsLock);
+    ScreenParticleDiagnostics& d = g_screenParticleDiagnostics;
+    if (d.windowStart == 0) {
+        d.windowStart = now;
+    }
+    ++d.calls;
+    if (frame != d.lastFrame) {
+        ++d.distinctFrames;
+        d.lastFrame = frame;
+    }
+    d.rawDistanceSum += distance(emitter, raw);
+    d.outputDistanceSum += distance(emitter, output);
+    d.emitterStepSum += distance(emitter, d.lastEmitter);
+    memcpy(d.lastEmitter, emitter, sizeof(emitter));
+    d.thread = GetCurrentThreadId();
+    if (now - d.windowStart >= static_cast<std::uint64_t>(frequency.QuadPart)) {
+        const double calls = static_cast<double>(d.calls);
+        Log("Screen particles: %llu placements in %.2fs over %llu rendered frames on thread "
+            "%lu; mean emitter distance to raw camera %.4f, to predicted camera %.4f, "
+            "mean emitter step %.4f.",
+            static_cast<unsigned long long>(d.calls),
+            static_cast<double>(now - d.windowStart) / static_cast<double>(frequency.QuadPart),
+            static_cast<unsigned long long>(d.distinctFrames), d.thread,
+            d.rawDistanceSum / calls, d.outputDistanceSum / calls, d.emitterStepSum / calls);
+        d = ScreenParticleDiagnostics{};
+    }
+    ReleaseSRWLockExclusive(&g_screenParticleDiagnosticsLock);
+}
+
 extern "C" std::uint64_t __fastcall HookParticleUpdate(void* system, float deltaTime,
                                                        void* third, void* fourth) {
     const std::uint64_t result = g_originalParticleUpdate(system, deltaTime, third, fourth);
@@ -7111,6 +7197,7 @@ extern "C" std::uint64_t __fastcall HookParticleUpdate(void* system, float delta
     if (model == nullptr) {
         return result;
     }
+    NoteScreenParticlePlacement(static_cast<const unsigned char*>(model));
     const std::uint64_t now = ReadPerformanceCounter();
     AcquireSRWLockExclusive(&g_screenParticleLock);
     ScreenParticleEntry* slot = nullptr;
