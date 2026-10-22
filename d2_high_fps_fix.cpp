@@ -9276,16 +9276,29 @@ extern "C" void* __fastcall HookDevGuiPass(void* self) {
 constexpr std::uintptr_t kSteamDevGuiCvarRva = 0x39A4FE0;
 constexpr char kDevGuiCvarName[] = "devgui";
 
-void ToggleDevGui() {
+// Returns the devgui cvar after checking its name, or null.
+unsigned char* FindDevGuiCvar() {
     if (g_layout != &kSteamLayout || g_originalDevGuiPass == nullptr) {
-        PlayToggleCue(ToggleCue::Unavailable);
-        return;
+        return nullptr;
     }
     auto* cvar = reinterpret_cast<unsigned char*>(g_executableBase + kSteamDevGuiCvarRva);
     const char* name = nullptr;
     memcpy(&name, cvar + kCVarNameOffset, sizeof(name));
     if (name == nullptr || !IsReadableMemory(name, sizeof(kDevGuiCvarName)) ||
         memcmp(name, kDevGuiCvarName, sizeof(kDevGuiCvarName)) != 0) {
+        return nullptr;
+    }
+    return cvar;
+}
+
+void SetDevGuiCvar(unsigned char* cvar, LONG value) {
+    *reinterpret_cast<volatile float*>(cvar + kCVarFloatOffset) = static_cast<float>(value);
+    InterlockedExchange(reinterpret_cast<volatile LONG*>(cvar + kCVarIntegerOffset), value);
+}
+
+void ToggleDevGui() {
+    unsigned char* cvar = FindDevGuiCvar();
+    if (cvar == nullptr) {
         PlayToggleCue(ToggleCue::Unavailable);
         Log("Ctrl+F10: the devgui cvar was not found.");
         return;
@@ -9296,8 +9309,7 @@ void ToggleDevGui() {
     if (value != 0 && ClosePauseMenu()) {
         Log("Ctrl+F10: closed the pause menu for DevGUI.");
     }
-    *reinterpret_cast<volatile float*>(cvar + kCVarFloatOffset) = static_cast<float>(value);
-    InterlockedExchange(reinterpret_cast<volatile LONG*>(cvar + kCVarIntegerOffset), value);
+    SetDevGuiCvar(cvar, value);
     PlayToggleCue(value != 0 ? ToggleCue::On : ToggleCue::Off);
     Log("Ctrl+F10: DevGUI %s.", value != 0 ? "opened (devgui 2)" : "closed (devgui 0)");
 }
@@ -9606,10 +9618,11 @@ bool InstallIggyCallbackLogHook() {
     return true;
 }
 
-// Diagnostics: the exe's "DevGUI" pause callback itself (0x78F140), hooked
-// directly because the menu registers its callbacks before the plugin can
-// wrap the registration. Its 4th instruction is a rel32 call, so the
-// trampoline replays it as an absolute call.
+// The exe's "DevGUI" pause callback (0x78F140): it closes the pause state and
+// buffers the console command "devgui 1", which the retail command system
+// does not apply (the cvar stays 0). After it runs, the plugin sets devgui to
+// 2 itself. Its 4th instruction is a rel32 call, so the trampoline replays it
+// as an absolute call.
 constexpr std::uintptr_t kSteamPauseDevGuiCallbackEntryRva = 0x78F140;
 constexpr unsigned char kSteamPauseDevGuiCallbackEntryBytes[18] = {
     0x48, 0x83, 0xEC, 0x28, 0x48, 0x8B, 0x49, 0x08, 0xBA, 0x01, 0x00, 0x00, 0x00,
@@ -9619,8 +9632,16 @@ using PauseCallbackFn = std::uint64_t(__fastcall*)(void*, void*, void*, void*);
 PauseCallbackFn g_originalPauseDevGuiCallback = nullptr;
 
 extern "C" std::uint64_t __fastcall HookPauseDevGuiCallback(void* a, void* b, void* c, void* d) {
-    Log("Pause menu: the exe's \"DevGUI\" callback (0x78F140) ran.");
-    return g_originalPauseDevGuiCallback(a, b, c, d);
+    const std::uint64_t result = g_originalPauseDevGuiCallback(a, b, c, d);
+    unsigned char* cvar = FindDevGuiCvar();
+    if (cvar != nullptr) {
+        SetDevGuiCvar(cvar, 2);
+        PlayToggleCue(ToggleCue::On);
+        Log("Pause menu: Dev GUI chosen; opened DevGUI (devgui 2).");
+    } else {
+        Log("Pause menu: Dev GUI chosen, but the devgui cvar was not found.");
+    }
+    return result;
 }
 
 bool InstallPauseDevGuiCallbackHook() {
