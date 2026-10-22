@@ -7102,7 +7102,7 @@ struct ScreenParticleEntry {
 SRWLOCK g_screenParticleLock = SRWLOCK_INIT;
 std::array<ScreenParticleEntry, kScreenParticleCapacity> g_screenParticles{};
 
-void CorrectEmitterPoseNow(unsigned char* model);
+void CorrectEmitterPoseNow(unsigned char* model, void* placementContext);
 
 // Diagnostics for screen particles: where the placement puts the emitter
 // relative to the raw (tick) and the predicted camera, how often, and on which
@@ -7111,6 +7111,8 @@ SRWLOCK g_cameraOriginLock = SRWLOCK_INIT;
 float g_rawCameraOrigin[3]{};
 float g_outputCameraOrigin[3]{};
 std::uint64_t g_cameraOriginSerial = 0;
+Transform g_outputCamera{};
+bool g_outputCameraValid = false;
 
 void NoteCameraOrigins(const Transform& raw, const Transform& output) {
     AcquireSRWLockExclusive(&g_cameraOriginLock);
@@ -7120,6 +7122,8 @@ void NoteCameraOrigins(const Transform& raw, const Transform& output) {
     g_outputCameraOrigin[0] = static_cast<float>(output.origin.x);
     g_outputCameraOrigin[1] = static_cast<float>(output.origin.y);
     g_outputCameraOrigin[2] = static_cast<float>(output.origin.z);
+    g_outputCamera = output;
+    g_outputCameraValid = IsFinite(output);
     ++g_cameraOriginSerial;
     ReleaseSRWLockExclusive(&g_cameraOriginLock);
 }
@@ -7201,7 +7205,7 @@ extern "C" std::uint64_t __fastcall HookParticleUpdate(void* system, float delta
     }
     NoteScreenParticlePlacement(static_cast<const unsigned char*>(model));
     if (g_screenParticleMode.load(std::memory_order_relaxed) == 3 && SourceHandsActive()) {
-        CorrectEmitterPoseNow(static_cast<unsigned char*>(model));
+        CorrectEmitterPoseNow(static_cast<unsigned char*>(model), fourth);
     }
     const std::uint64_t now = ReadPerformanceCounter();
     AcquireSRWLockExclusive(&g_screenParticleLock);
@@ -7380,9 +7384,40 @@ void UpdateScreenParticlePoseTrack(SourceTrack& track, std::uint64_t& writes) {
 // Mode 3: the placement (0x227190) runs once per rendered frame on a job
 // thread and rewrites the emitter pose from the unpredicted camera, after the
 // flush, so the pose is corrected right after the placement instead.
-void CorrectEmitterPoseNow(unsigned char* model) {
-    RenderCorrectionState correction{};
-    if (!ReadRenderCorrection(correction)) {
+// The placement reads its camera from [context+0x128] (origin via vtable
+// +0x20, axis via +0x30; 0x21DC00) on the same call, and it runs on a job
+// thread at a point in the frame that does not line up with the camera hook,
+// so a published "predicted * inverse(raw)" delta can belong to another tick.
+// Instead the pose is re-expressed relative to the camera the placement used
+// and put on the latest predicted camera: pose' = predicted * inverse(used) * pose.
+void CorrectEmitterPoseNow(unsigned char* model, void* placementContext) {
+    if (placementContext == nullptr) {
+        return;
+    }
+    void* camera = nullptr;
+    memcpy(&camera, static_cast<unsigned char*>(placementContext) + 0x128, sizeof(camera));
+    if (camera == nullptr) {
+        return;
+    }
+    using VectorGetter = const float*(__fastcall*)(void*);
+    void** vtable = *static_cast<void***>(camera);
+    const float* usedOrigin = reinterpret_cast<VectorGetter>(vtable[0x20 / sizeof(void*)])(camera);
+    const float* usedAxis = reinterpret_cast<VectorGetter>(vtable[0x30 / sizeof(void*)])(camera);
+    if (usedOrigin == nullptr || usedAxis == nullptr) {
+        return;
+    }
+    Transform used{};
+    used.origin = {usedOrigin[0], usedOrigin[1], usedOrigin[2]};
+    memcpy(used.axis, usedAxis, sizeof(used.axis));
+    Transform predicted{};
+    bool havePredicted = false;
+    AcquireSRWLockShared(&g_cameraOriginLock);
+    predicted = g_outputCamera;
+    havePredicted = g_outputCameraValid;
+    ReleaseSRWLockShared(&g_cameraOriginLock);
+    Matrix4 delta{};
+    Matrix4 inverseDelta{};
+    if (!havePredicted || !BuildCameraCorrection(used, predicted, delta, inverseDelta)) {
         return;
     }
     std::array<float, 12> base{};
@@ -7395,7 +7430,7 @@ void CorrectEmitterPoseNow(unsigned char* model) {
         pose.values[row * 4 + 3] = base[row];
     }
     pose.values[15] = 1.0f;
-    const Matrix4 corrected = MultiplyMatrices4(correction.currentDelta, pose);
+    const Matrix4 corrected = MultiplyMatrices4(delta, pose);
     if (!IsFinite(corrected)) {
         return;
     }
