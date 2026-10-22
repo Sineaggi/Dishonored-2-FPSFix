@@ -82,6 +82,25 @@ if errorlevel 1 (
   exit /b 1
 )
 
+if not exist "build\camera-prediction-test" mkdir "build\camera-prediction-test"
+cl.exe /nologo /std:c++17 /O2 /EHsc /W4 /DUNICODE /D_UNICODE ^
+  /Fo:"build\camera-prediction-test.obj" ^
+  "camera-prediction-test.cpp" ^
+  /link /OUT:"build\camera-prediction-test\camera-prediction-test.exe" bcrypt.lib user32.lib
+
+if errorlevel 1 (
+  echo.
+  echo Camera-prediction test build failed.
+  exit /b 1
+)
+
+"build\camera-prediction-test\camera-prediction-test.exe"
+if errorlevel 1 (
+  echo.
+  echo Camera-prediction and slow-motion tests failed.
+  exit /b 1
+)
+
 if not exist "build\layout-profile-test" mkdir "build\layout-profile-test"
 cl.exe /nologo /std:c++17 /O2 /EHsc /W4 /DUNICODE /D_UNICODE ^
   /Fo:"build\layout-profile-test.obj" ^
@@ -131,5 +150,6 @@ echo Built and load-tested: %CD%\build\Dishonored2HighFPSFix.asi
 echo Built: %CD%\build\asi-load-test.exe
 echo Built: %CD%\build\asi-loader-test.exe
 echo Built and passed: %CD%\build\joint-pose-test.exe
+echo Built and passed: %CD%\build\camera-prediction-test\camera-prediction-test.exe
 echo Built: %CD%\build\layout-profile-test\layout-profile-test.exe
 endlocal

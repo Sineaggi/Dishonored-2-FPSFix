@@ -12,7 +12,7 @@
 
 A source-only high-frame-rate fix for the GOG and Steam releases of Dishonored 2. It keeps the game's simulation and physics at their native 120 Hz while smoothing presentation above 120 FPS by interpolating all world assets, player included, alongside skeletal animations to match the display framerate, with an additional per-frame mouse delta override to keep mouse input latency low.
 
-Current release: **v1.4.0**
+Current release: **v1.5.0**
 
 ## Compatibility
 
@@ -22,7 +22,7 @@ Dishonored 2 version 1.77.9.0:
 | Build | `Dishonored2.exe` SHA-256 | Status |
 | --- | --- | --- |
 | GOG | `C3150F9F2D9BF967D23CA6A79BB32703B90116854AAD9892C7FC1F46A1060293` | Reference build; fully live-tested |
-| Steam (February 2025 rebuild) | `B671F8249422862BF557D00AAB2F4BB671ED4515CC10AD8A8A9DECAD84516180` | Live-tested in multi-level play, including vehicle cutscenes |
+| Steam (February 2025 rebuild) | `B671F8249422862BF557D00AAB2F4BB671ED4515CC10AD8A8A9DECAD84516180` | Live-tested in multi-level play, including vehicle cutscenes, and in a v1.5.0 slow-motion session |
 
 The Steam executable reports the same version but is a separate, newer
 compile: every code and global-data address differs and several hooked
@@ -47,6 +47,7 @@ gameplay-support claim.
 
 - Removes the game's internal 120 FPS presentation cap so an external limiter can be used.
 - Smooths the renderer camera above the 120 Hz simulation rate.
+- Keeps mouse turning even at frame rates that are not a multiple of 120, such as 90 or 144 FPS.
 - Makes mouse sensitivity independent of the frame rate, above and below 120 FPS.
 - Optionally keeps first-person body and weapon roots aligned with the smoothed camera.
 - Provides separately gated interpolation for eligible world transforms, first-person skeletal animation, selected world skeletal animation, and small ownerless cinematic controls.
@@ -55,7 +56,7 @@ The patch does not raise the simulation rate or modify authoritative physics, AI
 
 ## Current status
 
-Camera prediction, FPS unlocking, mouse stabilization, first-person root correction, world/root interpolation, skeletal interpolation, and cinematic-control interpolation have passed focused live tests and multi-level gameplay/lifecycle testing without a major issue. The validated presentation layers remain enabled by default and can still be disabled independently.
+Camera prediction, FPS unlocking, mouse stabilization, first-person root correction, world/root interpolation, skeletal interpolation, and cinematic-control interpolation have passed focused live tests and multi-level gameplay/lifecycle testing without a major issue. The v1.5.0 real-time turn prediction and slow-motion handling passed GOG play sessions at 90, 144, and 350 FPS and a Steam session. The validated presentation layers remain enabled by default and can still be disabled independently.
 
 Two areas are deliberately unsupported:
 
@@ -73,8 +74,9 @@ build-msvc.cmd
 The script locates the x64 MSVC toolchain, builds
 `build\Dishonored2HighFPSFix.asi`, builds and runs the direct ASI load test,
 builds the external-loader integration host, builds and runs the joint-pose
-interpolation tests, and builds the offline layout-profile test. No game files
-are needed to compile or test the source.
+interpolation tests and the camera-prediction and slow-motion tests, and
+builds the offline layout-profile test. No game files are needed to compile or
+test the source.
 
 To also check the layout profiles against real executables, set the local
 paths of the installed games before building:
@@ -111,7 +113,7 @@ the game installation, build first and then provide the path to an x64 loader:
 The script creates a disposable staging directory below `build`, runs the
 integration host, and verifies loader discovery, system DirectInput forwarding,
 plugin loading, sibling logging, and safe unsupported-host rejection. The
-official Ultimate ASI Loader v9.7.4 x64 build passes this test and the v1.4.0
+official Ultimate ASI Loader v9.7.4 x64 build passes this test and the v1.5.0
 in-game testing on both the GOG and Steam builds.
 
 ## Package
@@ -120,7 +122,7 @@ After building and validating the plugin, create the canonical plugin-only
 archive and the optional tested-loader convenience archive with:
 
 ```powershell
-.\package-release.ps1 -Version 1.4.0 `
+.\package-release.ps1 -Version 1.5.0 `
   -LoaderPath .\build\third-party\ultimate-asi-loader-v9.7.4\extracted\dinput8.dll
 ```
 
@@ -164,8 +166,9 @@ Edit `d2-high-fps-fix.ini` while the game is closed.
 - `UnlockAbove120=1` disables the game's frame spinner. An external FPS limiter is still required.
 - `StabilizeMouseSensitivity=1` makes the turn per mouse count independent of the frame rate, both above and below 120 FPS. The game's own look scaling divides the mouse input by the real frame time while the view turns by the simulation time step; the patch makes it divide by the simulation step, so the two cancel on every frame. Sensitivity then matches the unmodified game at its normal 120 FPS cap. Earlier versions of this patch used the game's alternative path instead, which halved sensitivity above 120 FPS and sped it up below 120 FPS; if you raised the in-game sensitivity for those versions, lower it back to about half.
 - `StabilizeFirstPersonHands=1` enables the validated renderer-only first-person root correction. It is enabled by default.
+- `RealTimeTurnPrediction=1` predicts camera rotation from the real time since the game last applied mouse look, while position keeps the simulation-time prediction. The game turns the view once per game frame by the mouse input gathered since the previous one, so extrapolating that turn by simulation time made turning judder at frame rates that are not a multiple of 120, such as 90 or 144 FPS. Cutscenes and menus keep the simulation-time rotation rule, which suits scripted cameras. Set it to `0` to always use the simulation-time rule.
 
-Camera prediction and the enabled first-person root correction are **on by default**; no key press is needed. Press **F10** in game only for an A/B comparison: it turns them off, and pressing it again turns them back on. F10 does not change the FPS limit or the separate interpolation options.
+Camera prediction and the enabled first-person root correction are **on by default**; no key press is needed. Press **F10** in game only for an A/B comparison: it turns them off, and pressing it again turns them back on. **Ctrl+F10** switches camera rotation between the real-time and simulation-time rules for an A/B comparison of turning. Neither key changes the FPS limit or the separate interpolation options.
 
 For development performance comparisons, set
 `Diagnostics/InterpolationABProbe=1`. The in-session controls are:
@@ -221,10 +224,30 @@ The plugin reads the engine's game-logic state stack for this and logs each
 state change and cutscene start/end. Set it to `0` to let the adaptive gate
 manage cutscenes like gameplay.
 
+`FullInterpolationInSlowMotion=1` (the default) does the same while the game
+slows time, such as during kill cams, executions, and slowed-time powers. Slow
+motion makes the game run fewer, longer simulation ticks, so new states arrive
+less often than frames, at any frame rate. That is what the interpolation
+layers smooth, but below about 130 FPS the adaptive gate would otherwise have
+turned them off. The plugin reads the slow-down factor directly from the engine
+clock, which slows two of its timers together, and logs each detected period.
+Set it to `0` to let the adaptive gate manage slow motion like normal play.
+
+Two slow-motion adjustments apply regardless of that setting. Every layer, the
+camera included, accepts the longer gap between simulation samples instead of
+treating it as a stall. Ownerless skinned character models, such as some that
+appear in takedowns, are also interpolated while time is slowed. Outside slow
+motion the cinematic layers admit only small ownerless controls of at most 64
+joints.
+
 Leave these settings unchanged:
 
 - `ShadowTransforms=0` — required; the prototype is not safe for normal use.
 - `Telemetry=0` — normal play does not need the development telemetry block.
+
+`TimeScaleLog=1` logs the engine clock's time scales whenever they change and
+summarizes each detected slow-motion period, a few lines per event. Set it to
+`0` to omit these lines.
 
 For ordinary play, keep `InterpolationABProbe=0`.
 

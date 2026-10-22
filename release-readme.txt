@@ -57,6 +57,10 @@ press is needed. Press F10 in game only for an A/B comparison: it turns them
 off, and pressing it again turns them back on. F10 does not change the FPS
 limit or the other interpolation settings.
 
+RealTimeTurnPrediction=1 keeps mouse turning even at frame rates that are not
+a multiple of 120, such as 90 or 144 FPS. Ctrl+F10 switches camera rotation
+between this rule and the previous simulation-time rule for an A/B comparison.
+
 The adaptive performance controller is enabled by default. It sheds skeletal
 interpolation first, then transform interpolation, when maintaining those
 layers would leave too little native-120-Hz headroom, and restores them after
@@ -64,6 +68,11 @@ sustained recovery. Set AdaptivePerformanceGate=0 in d2-high-fps-fix.ini to
 keep every individually enabled interpolation layer active continuously.
 During cutscenes the controller keeps every enabled layer active and does not
 measure; set FullInterpolationInCutscenes=0 to let it manage cutscenes too.
+It does the same while the game slows time, such as during kill cams and
+slowed-time powers; set FullInterpolationInSlowMotion=0 to let it manage slow
+motion too. During slow motion every layer also accepts the longer gaps between
+simulation samples, and ownerless character models, such as some in takedowns,
+are interpolated as well.
 
 StabilizeMouseSensitivity=1 makes the turn per mouse count independent of the
 frame rate, above and below 120 FPS, and matches the unmodified game at its
