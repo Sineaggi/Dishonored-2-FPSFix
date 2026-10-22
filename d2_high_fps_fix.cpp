@@ -346,10 +346,13 @@ bool g_enableInterpolationAbProbe = false;
 bool g_toggleSounds = true;
 bool g_overlay = false;
 void TryInstallOverlayPresentHook();
+void UpdateForcedBloodEffect();
+void ToggleForcedBloodEffect();
 void ToggleDevGui();
 void NoteSimulationTime(double simulationTime);
 bool ClosePauseMenu();
 bool g_crashLog = false;
+std::atomic<bool> g_forceBloodEffect{false};
 int g_devGuiScale = 0;
 bool g_autoContinueLoadScreen = false;
 bool g_autoAbSchedule = false;
@@ -945,6 +948,8 @@ void LoadConfiguration() {
         L"Diagnostics", L"CrashLog", 0, path) != 0;
     g_devGuiScale = std::max(0, std::min(4, static_cast<int>(
         GetPrivateProfileIntW(L"Diagnostics", L"DevGuiScale", 0, path))));
+    g_forceBloodEffect.store(GetPrivateProfileIntW(
+        L"Diagnostics", L"ForceBloodEffect", 0, path) != 0, std::memory_order_relaxed);
     g_autoContinueLoadScreen = GetPrivateProfileIntW(
         L"Diagnostics", L"AutoContinueLoadScreen", 0, path) != 0;
     if (g_autoContinueLoadScreen && !g_sourceLevelTransforms) {
@@ -5948,10 +5953,14 @@ void ApplyPrediction(void* destination, const void* source) {
     TryUnlockAbove120();
     TryStabilizeMouseSensitivity();
     TryInstallOverlayPresentHook();
+    UpdateForcedBloodEffect();
     const bool f10IsDown = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
     const bool controlIsDown = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+    const bool altIsDown = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
     if (f10IsDown && !g_f10WasDown && controlIsDown && g_overlay) {
         ToggleDevGui();
+    } else if (f10IsDown && !g_f10WasDown && altIsDown) {
+        ToggleForcedBloodEffect();
     } else if (f10IsDown && !g_f10WasDown) {
         const bool nowEnabled = !g_enabled.load(std::memory_order_relaxed);
         g_enabled.store(nowEnabled, std::memory_order_relaxed);
@@ -7670,13 +7679,13 @@ struct FpsFixColumnRow {
     char value[48];
 };
 
-int FormatFpsFixColumn(FpsFixColumnRow (&rows)[12]) {
+int FormatFpsFixColumn(FpsFixColumnRow (&rows)[16]) {
     UpdateOverlayStatistics();
     const OverlayStatistics& stats = g_overlayStatistics;
     const bool transforms = RuntimeTransformInterpolationEnabled();
     int count = 0;
     const auto row = [&](const char* label, const char* format, auto... values) {
-        if (count < 12) {
+        if (count < 16) {
             strcpy_s(rows[count].label, label);
             sprintf_s(rows[count].value, format, values...);
             ++count;
@@ -7689,6 +7698,8 @@ int FormatFpsFixColumn(FpsFixColumnRow (&rows)[12]) {
         SourceLevelWritesSelected() ? "<source>" : "<per-draw>");
     row("Skeletons (Alt+F11)", "%s", box(RuntimeSkeletalInterpolationEnabled()));
     row("First-Person Hands (Shift+F11)", "%s", box(RuntimeFirstPersonHandsEnabled()));
+    row("Force Blood Effect (Alt+F10)", "%s",
+        box(g_forceBloodEffect.load(std::memory_order_relaxed)));
     if (g_enableInterpolationAbProbe) {
         if (g_interpolationAbProbe.capturing) {
             LARGE_INTEGER now{};
@@ -8107,7 +8118,7 @@ void AppendFpsFixColumn(std::vector<DevGuiTextEntry>& entries) {
         strncpy_s(entry.text, text, _TRUNCATE);
         entries.push_back(entry);
     };
-    FpsFixColumnRow rows[12]{};
+    FpsFixColumnRow rows[16]{};
     const int count = FormatFpsFixColumn(rows);
     const float headerY = static_cast<float>(screenHeight) -
                           lineHeight * (2.0f + 1.4f + static_cast<float>(count));
@@ -8988,6 +8999,138 @@ bool InstallPauseMenuHook() {
     return true;
 }
 
+// Camera blood (Diagnostics/ForceBloodEffect, Alt+F10). The player FX
+// manager's arkPlayerFXCameraBlood (vtable 0x1C3A6D8) plays m_bloodLightFx
+// (decl +0x298) on ARK_MSG_DAMAGING when the player hurts a valid target, and
+// m_bloodHeavyFx (decl +0x2A0) on ARK_MSG_ASSASSINATION_TARGET_KILLED. Both are
+// "screen particle" FX whose emitter is placed each tick at the game camera
+// plus pm_screenParticleOffset (3.2) along its forward axis. The toggle keeps
+// the heavy effect playing by starting it again (same play call, 0x8120B0)
+// whenever it is no longer alive (0x878C30); the instance is captured from the
+// class's init slot and dropped by its shutdown slot.
+constexpr std::uintptr_t kSteamCameraBloodVtableRva = 0x1C3A6D8;
+constexpr std::uintptr_t kSteamCameraBloodInitRva = 0x680800;
+constexpr std::uintptr_t kSteamCameraBloodShutdownRva = 0x6808B0;
+constexpr std::uintptr_t kSteamFxPlayRva = 0x8120B0;
+constexpr std::uintptr_t kSteamFxAliveRva = 0x878C30;
+constexpr unsigned char kSteamFxPlayBytes[16] = {
+    0x48, 0x89, 0x5C, 0x24, 0x10, 0x48, 0x89, 0x6C,
+    0x24, 0x18, 0x48, 0x89, 0x74, 0x24, 0x20, 0x57,
+};
+constexpr unsigned char kSteamFxAliveBytes[8] = {
+    0x89, 0x54, 0x24, 0x10, 0x48, 0x83, 0xEC, 0x28,
+};
+constexpr std::size_t kCameraBloodFxComponentOffset = 0x10;
+constexpr std::size_t kCameraBloodDeclOffset = 0x18;
+constexpr std::size_t kCameraBloodHeavyIdOffset = 0x24;
+constexpr std::size_t kCameraBloodHeavyDeclFieldOffset = 0x2A0;
+using CameraBloodLifecycleFn = void(__fastcall*)(void*);
+using FxPlayFn = std::int32_t*(__fastcall*)(void*, std::int32_t*, const void*);
+using FxAliveFn = bool(__fastcall*)(void*, std::int32_t);
+CameraBloodLifecycleFn g_originalCameraBloodInit = nullptr;
+CameraBloodLifecycleFn g_originalCameraBloodShutdown = nullptr;
+std::atomic<void*> g_cameraBlood{nullptr};
+std::uint64_t g_lastForcedBloodCounter = 0;
+
+extern "C" void __fastcall HookCameraBloodInit(void* self) {
+    g_cameraBlood.store(self, std::memory_order_relaxed);
+    g_originalCameraBloodInit(self);
+}
+
+extern "C" void __fastcall HookCameraBloodShutdown(void* self) {
+    void* expected = self;
+    g_cameraBlood.compare_exchange_strong(expected, nullptr, std::memory_order_relaxed);
+    g_originalCameraBloodShutdown(self);
+}
+
+bool InstallCameraBloodHooks() {
+    if (g_layout != &kSteamLayout ||
+        memcmp(reinterpret_cast<const void*>(g_executableBase + kSteamFxPlayRva),
+               kSteamFxPlayBytes, sizeof(kSteamFxPlayBytes)) != 0 ||
+        memcmp(reinterpret_cast<const void*>(g_executableBase + kSteamFxAliveRva),
+               kSteamFxAliveBytes, sizeof(kSteamFxAliveBytes)) != 0) {
+        return false;
+    }
+    const std::uintptr_t vtable = g_executableBase + kSteamCameraBloodVtableRva;
+    g_originalCameraBloodInit = reinterpret_cast<CameraBloodLifecycleFn>(
+        g_executableBase + kSteamCameraBloodInitRva);
+    g_originalCameraBloodShutdown = reinterpret_cast<CameraBloodLifecycleFn>(
+        g_executableBase + kSteamCameraBloodShutdownRva);
+    if (!ReplaceVtableSlot(vtable + 1 * sizeof(void*), g_executableBase + kSteamCameraBloodInitRva,
+                           reinterpret_cast<const void*>(&HookCameraBloodInit))) {
+        Log("Camera blood: init slot mismatch; ForceBloodEffect unavailable.");
+        return false;
+    }
+    if (!ReplaceVtableSlot(vtable + 2 * sizeof(void*),
+                           g_executableBase + kSteamCameraBloodShutdownRva,
+                           reinterpret_cast<const void*>(&HookCameraBloodShutdown))) {
+        ReplaceVtableSlot(vtable + 1 * sizeof(void*),
+                          reinterpret_cast<std::uintptr_t>(&HookCameraBloodInit),
+                          reinterpret_cast<const void*>(g_executableBase +
+                                                        kSteamCameraBloodInitRva));
+        Log("Camera blood: shutdown slot mismatch; ForceBloodEffect unavailable.");
+        return false;
+    }
+    Log("Camera blood: hooked arkPlayerFXCameraBlood init/shutdown; Alt+F10 toggles "
+        "ForceBloodEffect (now %s).",
+        g_forceBloodEffect.load(std::memory_order_relaxed) ? "on" : "off");
+    return true;
+}
+
+void ToggleForcedBloodEffect() {
+    if (g_originalCameraBloodInit == nullptr) {
+        PlayToggleCue(ToggleCue::Unavailable);
+        return;
+    }
+    const bool now = !g_forceBloodEffect.load(std::memory_order_relaxed);
+    g_forceBloodEffect.store(now, std::memory_order_relaxed);
+    PlayToggleCue(now ? ToggleCue::On : ToggleCue::Off);
+    Log("Alt+F10: ForceBloodEffect %s.", now ? "on" : "off");
+}
+
+// Runs on the game thread (camera hook). Restarts the heavy camera blood at
+// most every 250 ms while it is not alive.
+void UpdateForcedBloodEffect() {
+    if (!g_forceBloodEffect.load(std::memory_order_relaxed) ||
+        g_originalCameraBloodInit == nullptr) {
+        return;
+    }
+    auto* blood = static_cast<unsigned char*>(g_cameraBlood.load(std::memory_order_relaxed));
+    if (blood == nullptr || !IsReadableMemory(blood, kCameraBloodHeavyIdOffset + 4)) {
+        return;
+    }
+    const std::uint64_t now = ReadPerformanceCounter();
+    LARGE_INTEGER frequency{};
+    QueryPerformanceFrequency(&frequency);
+    if (now - g_lastForcedBloodCounter < static_cast<std::uint64_t>(frequency.QuadPart / 4)) {
+        return;
+    }
+    g_lastForcedBloodCounter = now;
+    void* fxComponent = nullptr;
+    unsigned char* decl = nullptr;
+    memcpy(&fxComponent, blood + kCameraBloodFxComponentOffset, sizeof(fxComponent));
+    memcpy(&decl, blood + kCameraBloodDeclOffset, sizeof(decl));
+    if (fxComponent == nullptr || decl == nullptr ||
+        !IsReadableMemory(decl + kCameraBloodHeavyDeclFieldOffset, sizeof(void*))) {
+        return;
+    }
+    void* heavyFx = nullptr;
+    memcpy(&heavyFx, decl + kCameraBloodHeavyDeclFieldOffset, sizeof(heavyFx));
+    if (heavyFx == nullptr) {
+        return;
+    }
+    std::int32_t id = -1;
+    memcpy(&id, blood + kCameraBloodHeavyIdOffset, sizeof(id));
+    if (id != -1 && reinterpret_cast<FxAliveFn>(g_executableBase + kSteamFxAliveRva)(
+                        nullptr, id)) {
+        return;
+    }
+    std::int32_t started = -1;
+    reinterpret_cast<FxPlayFn>(g_executableBase + kSteamFxPlayRva)(fxComponent, &started,
+                                                                    heavyFx);
+    memcpy(blood + kCameraBloodHeavyIdOffset, &started, sizeof(started));
+}
+
 bool InstallDevGuiTextLogHook() {
     if (g_layout != &kSteamLayout) {
         return false;
@@ -9136,6 +9279,7 @@ DWORD WINAPI InstallThread(void*) {
         if (g_overlay) {
             InstallDevGuiTextLogHook();
         }
+        InstallCameraBloodHooks();
     }
     return 0;
 }
