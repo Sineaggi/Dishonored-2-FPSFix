@@ -943,8 +943,8 @@ void LoadConfiguration() {
     g_sourceLevelHands = g_sourceLevelWrites &&
         GetPrivateProfileIntW(L"Interpolation", L"SourceLevelHands", 1, path) != 0;
     g_screenParticleMode.store(g_sourceLevelHands
-        ? std::max(0, std::min(2, static_cast<int>(GetPrivateProfileIntW(
-              L"Interpolation", L"ScreenParticleCorrection", 2, path))))
+        ? std::max(0, std::min(3, static_cast<int>(GetPrivateProfileIntW(
+              L"Interpolation", L"ScreenParticleCorrection", 3, path))))
         : 0, std::memory_order_relaxed);
     g_enableTelemetry = GetPrivateProfileIntW(
         L"Diagnostics", L"Telemetry", 0, path) != 0;
@@ -7092,7 +7092,7 @@ constexpr unsigned char kParticleSystemScreenFlag = 0x40;
 constexpr std::size_t kScreenParticleCapacity = 32;
 using ParticleUpdateFn = std::uint64_t(__fastcall*)(void*, float, void*, void*);
 ParticleUpdateFn g_originalParticleUpdate = nullptr;
-std::atomic<int> g_screenParticleMode{2};
+std::atomic<int> g_screenParticleMode{3};
 bool g_screenParticleHookInstalled = false;
 
 struct ScreenParticleEntry {
@@ -7101,6 +7101,8 @@ struct ScreenParticleEntry {
 };
 SRWLOCK g_screenParticleLock = SRWLOCK_INIT;
 std::array<ScreenParticleEntry, kScreenParticleCapacity> g_screenParticles{};
+
+void CorrectEmitterPoseNow(unsigned char* model);
 
 // Diagnostics for screen particles: where the placement puts the emitter
 // relative to the raw (tick) and the predicted camera, how often, and on which
@@ -7198,6 +7200,9 @@ extern "C" std::uint64_t __fastcall HookParticleUpdate(void* system, float delta
         return result;
     }
     NoteScreenParticlePlacement(static_cast<const unsigned char*>(model));
+    if (g_screenParticleMode.load(std::memory_order_relaxed) == 3 && SourceHandsActive()) {
+        CorrectEmitterPoseNow(static_cast<unsigned char*>(model));
+    }
     const std::uint64_t now = ReadPerformanceCounter();
     AcquireSRWLockExclusive(&g_screenParticleLock);
     ScreenParticleEntry* slot = nullptr;
@@ -7372,18 +7377,51 @@ void UpdateScreenParticlePoseTrack(SourceTrack& track, std::uint64_t& writes) {
     track.poseExpected = output;
 }
 
+// Mode 3: the placement (0x227190) runs once per rendered frame on a job
+// thread and rewrites the emitter pose from the unpredicted camera, after the
+// flush, so the pose is corrected right after the placement instead.
+void CorrectEmitterPoseNow(unsigned char* model) {
+    RenderCorrectionState correction{};
+    if (!ReadRenderCorrection(correction)) {
+        return;
+    }
+    std::array<float, 12> base{};
+    ReadEmitterPose(model, base);
+    Matrix4 pose{};
+    for (int row = 0; row < 3; ++row) {
+        for (int column = 0; column < 3; ++column) {
+            pose.values[row * 4 + column] = base[3 + column * 3 + row];
+        }
+        pose.values[row * 4 + 3] = base[row];
+    }
+    pose.values[15] = 1.0f;
+    const Matrix4 corrected = MultiplyMatrices4(correction.currentDelta, pose);
+    if (!IsFinite(corrected)) {
+        return;
+    }
+    std::array<float, 12> output{};
+    for (int row = 0; row < 3; ++row) {
+        output[row] = corrected.values[row * 4 + 3];
+        for (int column = 0; column < 3; ++column) {
+            output[3 + column * 3 + row] = corrected.values[row * 4 + column];
+        }
+    }
+    WriteEmitterPose(model, output);
+}
+
 // Ctrl+Alt+F10 cycles ScreenParticleCorrection: off, model matrix, emitter
-// pose (1-3 beeps).
+// pose after the flush, emitter pose at placement.
 void CycleScreenParticleMode() {
     if (!g_screenParticleHookInstalled) {
         PlayToggleCue(ToggleCue::Unavailable);
         return;
     }
-    const int next = (g_screenParticleMode.load(std::memory_order_relaxed) + 1) % 3;
+    const int next = (g_screenParticleMode.load(std::memory_order_relaxed) + 1) % 4;
     g_screenParticleMode.store(next, std::memory_order_relaxed);
     PlayProfileCue(next);
     static const char* const kNames[] = {"off", "model matrix (+0x20)",
-                                         "emitter pose (+0x1860/+0x186C)"};
+                                         "emitter pose after the flush",
+                                         "emitter pose at placement"};
     Log("Ctrl+Alt+F10: screen-particle correction %s.", kNames[next]);
 }
 
@@ -7426,7 +7464,8 @@ void ProcessSourceLevelTracks(void* world, const PresentationContext& context,
 
     ++g_sourceFlushSerial;
     RegisterSourceDirtyModels(view, dirty, worldActive, handsActive);
-    if (handsActive && g_screenParticleMode.load(std::memory_order_relaxed) != 0) {
+    if (handsActive && (g_screenParticleMode.load(std::memory_order_relaxed) == 1 ||
+                        g_screenParticleMode.load(std::memory_order_relaxed) == 2)) {
         RegisterScreenParticleModels(view);
     }
     std::uint64_t writes = 0;
@@ -8079,9 +8118,9 @@ int FormatFpsFixColumn(FpsFixColumnRow (&rows)[16]) {
     row("First-Person Hands (Shift+F11)", "%s", box(RuntimeFirstPersonHandsEnabled()));
     row("Force Blood Effect (Alt+F10)", "%s",
         box(g_forceBloodEffect.load(std::memory_order_relaxed)));
-    static const char* const kScreenModes[] = {"<off>", "<matrix>", "<pose>"};
+    static const char* const kScreenModes[] = {"<off>", "<matrix>", "<pose>", "<placement>"};
     row("Screen Particle Fix (Ctrl+Alt+F10)", "%s",
-        kScreenModes[std::max(0, std::min(2, g_screenParticleMode.load(std::memory_order_relaxed)))]);
+        kScreenModes[std::max(0, std::min(3, g_screenParticleMode.load(std::memory_order_relaxed)))]);
     if (g_enableInterpolationAbProbe) {
         if (g_interpolationAbProbe.capturing) {
             LARGE_INTEGER now{};
@@ -9567,6 +9606,69 @@ bool InstallIggyCallbackLogHook() {
     return true;
 }
 
+// Diagnostics: the exe's "DevGUI" pause callback itself (0x78F140), hooked
+// directly because the menu registers its callbacks before the plugin can
+// wrap the registration. Its 4th instruction is a rel32 call, so the
+// trampoline replays it as an absolute call.
+constexpr std::uintptr_t kSteamPauseDevGuiCallbackEntryRva = 0x78F140;
+constexpr unsigned char kSteamPauseDevGuiCallbackEntryBytes[18] = {
+    0x48, 0x83, 0xEC, 0x28, 0x48, 0x8B, 0x49, 0x08, 0xBA, 0x01, 0x00, 0x00, 0x00,
+    0xE8, 0x5E, 0x94, 0xFF, 0xFF,
+};
+using PauseCallbackFn = std::uint64_t(__fastcall*)(void*, void*, void*, void*);
+PauseCallbackFn g_originalPauseDevGuiCallback = nullptr;
+
+extern "C" std::uint64_t __fastcall HookPauseDevGuiCallback(void* a, void* b, void* c, void* d) {
+    Log("Pause menu: the exe's \"DevGUI\" callback (0x78F140) ran.");
+    return g_originalPauseDevGuiCallback(a, b, c, d);
+}
+
+bool InstallPauseDevGuiCallbackHook() {
+    if (g_layout != &kSteamLayout) {
+        return false;
+    }
+    auto* entry = reinterpret_cast<unsigned char*>(g_executableBase +
+                                                   kSteamPauseDevGuiCallbackEntryRva);
+    if (memcmp(entry, kSteamPauseDevGuiCallbackEntryBytes,
+               sizeof(kSteamPauseDevGuiCallbackEntryBytes)) != 0) {
+        return false;
+    }
+    auto* trampoline = static_cast<unsigned char*>(
+        VirtualAlloc(nullptr, 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE));
+    if (trampoline == nullptr) {
+        return false;
+    }
+    std::int32_t relative = 0;
+    memcpy(&relative, entry + 14, sizeof(relative));
+    const std::uintptr_t callTarget = reinterpret_cast<std::uintptr_t>(entry) + 18 + relative;
+    unsigned char* cursor = trampoline;
+    memcpy(cursor, entry, 13);
+    cursor += 13;
+    // call qword ptr [rip+2]; jmp +8; dq target
+    const unsigned char callAbsolute[] = {0xFF, 0x15, 0x02, 0x00, 0x00, 0x00, 0xEB, 0x08};
+    memcpy(cursor, callAbsolute, sizeof(callAbsolute));
+    cursor += sizeof(callAbsolute);
+    memcpy(cursor, &callTarget, sizeof(callTarget));
+    cursor += sizeof(callTarget);
+    WriteAbsoluteIndirectJump(cursor, entry + 18);
+    FlushInstructionCache(GetCurrentProcess(), trampoline, 0x40);
+    unsigned char patch[18];
+    memset(patch, 0x90, sizeof(patch));
+    WriteAbsoluteIndirectJump(patch, reinterpret_cast<const void*>(&HookPauseDevGuiCallback));
+    DWORD oldProtection = 0;
+    if (!VirtualProtect(entry, sizeof(patch), PAGE_EXECUTE_READWRITE, &oldProtection)) {
+        VirtualFree(trampoline, 0, MEM_RELEASE);
+        return false;
+    }
+    g_originalPauseDevGuiCallback = reinterpret_cast<PauseCallbackFn>(trampoline);
+    memcpy(entry, patch, sizeof(patch));
+    FlushInstructionCache(GetCurrentProcess(), entry, sizeof(patch));
+    DWORD ignored = 0;
+    VirtualProtect(entry, sizeof(patch), oldProtection, &ignored);
+    Log("Installed the pause-menu DevGUI callback log hook at RVA 0x78F140.");
+    return true;
+}
+
 bool InstallDevGuiTextLogHook() {
     if (g_layout != &kSteamLayout) {
         return false;
@@ -9718,6 +9820,7 @@ DWORD WINAPI InstallThread(void*) {
         if (g_overlay) {
             InstallDevGuiTextLogHook();
             InstallIggyCallbackLogHook();
+            InstallPauseDevGuiCallbackHook();
         }
         InstallCameraBloodHooks();
     }
