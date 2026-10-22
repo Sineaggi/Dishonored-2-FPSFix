@@ -123,7 +123,8 @@ def main(src, dst):
     ci = a['bodyinfo'][callbacks_m]
     ccode = bytes(d[ci['code_pos']:ci['code_pos'] + ci['code_len']])
     cops = read_ops_cb(ccode)
-    new_callbacks, pairs = rebuild_callbacks(cops, dev_getter)
+    new_method_index = len(a['minfo'])
+    new_callbacks, pairs = rebuild_callbacks(cops, dev_getter, new_method_index)
 
     # ---- new method: PauseMenuScreen.devGUI() sends DEV_GUI ----
     ri = a['bodyinfo'][resume_m]
@@ -131,26 +132,27 @@ def main(src, dst):
     needle = b'\x66' + u30(resume_const)
     assert rcode.count(needle) == 1
     dev_code = rcode.replace(needle, b'\x66' + u30(dev_const))
-    new_method_index = len(a['minfo'])
     ms, me = a['minfo'][resume_m]
     new_minfo = bytes(d[ms:me])
+    # A closure made by newfunction in _initCallbackMenu (Iggy did not resolve
+    # a trait added to PauseMenuScreen: the button showed but did nothing). Its
+    # scope starts at the depth _initCallbackMenu has after its pushscope.
     new_body = (u30(new_method_index) + u30(ri['max_stack']) + u30(ri['local_count']) +
-                u30(ri['init_scope']) + u30(ri['max_scope']) + u30(len(dev_code)) + dev_code +
-                u30(0) + u30(0))
-    new_trait = u30(dev_getter) + b'\x01' + u30(0) + u30(new_method_index)
+                u30(ci['max_scope']) + u30(ci['max_scope'] + 1) + u30(len(dev_code)) +
+                dev_code + u30(0) + u30(0))
 
     # ---- size balance: pad the rewritten bodies with nops before returnvoid ----
-    grow = len(new_minfo) + len(new_body) + len(new_trait)
+    grow = len(new_minfo) + len(new_body)
     old_sizes = len(code) + len(ccode)
     def body_delta(old, new):
         return len(u30(len(new))) - len(u30(len(old)))
     shrink = old_sizes - (len(new_entries) + len(new_callbacks))
-    shrink -= body_delta(code, new_entries) + body_delta(ccode, new_callbacks)
+    # The callbacks body is padded back to its old size class, so only the
+    # entries body can change its code_len width.
+    shrink -= body_delta(code, new_entries)
     # counts that grow by one must keep their width
     mcount = len(a['minfo']); bcount = len(a['bodies'])
-    tcount_pos, _ = a['tpos']['PauseMenuScreen']
-    tcount = R(bytes(d), tcount_pos).u30()
-    for old in (mcount, bcount, tcount):
+    for old in (mcount, bcount):
         assert len(u30(old)) == len(u30(old + 1))
     pad = shrink - grow
     assert pad >= 0, 'not enough room: %d' % pad
@@ -173,9 +175,6 @@ def main(src, dst):
     edits.append(body_edit(ci, new_callbacks, max(ci['local_count'], 3)))
     edits.append(body_edit(bi, new_entries, max(bi['local_count'], 2)))
     edits.append((a['nb_pos'], a['nb_pos'] + len(u30(bcount)), u30(bcount + 1)))
-    _, tend = a['tpos']['PauseMenuScreen']
-    edits.append((tend, tend, new_trait))
-    edits.append((tcount_pos, tcount_pos + len(u30(tcount)), u30(tcount + 1)))
     edits.append((a['mend'], a['mend'], new_minfo))
     edits.append((a['mcount_pos'], a['mcount_pos'] + len(u30(mcount)), u30(mcount + 1)))
     edits.sort(key=lambda e: e[0], reverse=True)
@@ -185,8 +184,7 @@ def main(src, dst):
     assert len(out) == len(d), (len(out), len(d))
     check = parse(out, start)
     assert check['end'] == a['end']
-    dev = [t for t in check['traits'] if t[0] == 'PauseMenuScreen' and t[1] == 'devGUI']
-    assert dev and dev[0][2] == new_method_index
+    assert len(check['minfo']) == new_method_index + 1 and new_method_index in check['bodies']
     open(dst, 'wb').write(out)
     print('ok: %s -> %s (pad %d nops, new method %d, %d callbacks)' %
           (src, dst, pad, new_method_index, len(pairs) + 1))
@@ -203,7 +201,7 @@ def read_ops_cb(code):
     return ops
 
 
-def rebuild_callbacks(ops, dev_getter):
+def rebuild_callbacks(ops, dev_getter, dev_method):
     # d0 30 | d0 5d D 26 4a D 01 61 CALLBACKS | {d0 66 CALLBACKS d0 66 GAMEDATA 66 E d0 66 H 61 L}* | 47
     assert ops[0][1] == 0xd0 and ops[1][1] == 0x30
     i = 2; ctor = []
@@ -225,8 +223,10 @@ def rebuild_callbacks(ops, dev_getter):
             out += b'\x2a\xd5'  # dup; setlocal1 (keep the dictionary)
         out += bytes([op]) + arg
     out += b'\xd0\x66' + gamedata + b'\xd6'  # _gameData -> local2
-    for entry, handler in pairs + [(u30(dev_getter), u30(dev_getter))]:
+    for entry, handler in pairs:
         out += b'\xd1\xd2\x66' + entry + b'\xd0\x66' + handler + b'\x61' + setl
+    # _callbacks[_gameData.devGUI] = function () { send DEV_GUI; backward(); }
+    out += b'\xd1\xd2\x66' + u30(dev_getter) + b'\x40' + u30(dev_method) + b'\x61' + setl
     out += b'\x47'
     return bytes(out), pairs
 

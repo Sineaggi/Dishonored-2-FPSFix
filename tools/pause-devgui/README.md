@@ -9,9 +9,11 @@ runs `devgui 1`).
 
 `patch_pause_devgui.py` rewrites the menu's AS3 bytecode at the same total ABC
 length: `_initMenuEntries` and `_initCallbackMenu` keep the entry list and the
-callback dictionary in locals, and the bytes saved pay for a new
-`PauseMenuScreen.devGUI()` method (a copy of `_onResumeClicked` that sends
-`DEV_GUI`), its trait, and the list/dictionary entries for the button.
+callback dictionary in locals, and the bytes saved pay for a new method (a copy
+of `_onResumeClicked` that sends `DEV_GUI`) that `_initCallbackMenu` turns into
+a closure with `newfunction` for the button's dictionary entry. A first version
+that added the method as a `PauseMenuScreen` trait showed the button, but
+clicking it did nothing.
 
 `repack_pause_devgui.py` extracts the two files from `game1_patch`, patches
 them, and (with `--apply`, game closed) appends them uncompressed to
