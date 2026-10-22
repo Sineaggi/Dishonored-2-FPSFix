@@ -946,7 +946,7 @@ void LoadConfiguration() {
     g_sourceLevelHands = g_sourceLevelWrites &&
         GetPrivateProfileIntW(L"Interpolation", L"SourceLevelHands", 1, path) != 0;
     g_screenParticleMode.store(g_sourceLevelHands
-        ? std::max(0, std::min(3, static_cast<int>(GetPrivateProfileIntW(
+        ? std::max(0, std::min(4, static_cast<int>(GetPrivateProfileIntW(
               L"Interpolation", L"ScreenParticleCorrection", 3, path))))
         : 0, std::memory_order_relaxed);
     g_enableTelemetry = GetPrivateProfileIntW(
@@ -7120,6 +7120,8 @@ float g_outputCameraOrigin[3]{};
 std::uint64_t g_cameraOriginSerial = 0;
 Transform g_outputCamera{};
 bool g_outputCameraValid = false;
+Transform g_previousOutputCamera{};
+bool g_previousOutputCameraValid = false;
 
 void NoteCameraOrigins(const Transform& raw, const Transform& output) {
     AcquireSRWLockExclusive(&g_cameraOriginLock);
@@ -7129,6 +7131,8 @@ void NoteCameraOrigins(const Transform& raw, const Transform& output) {
     g_outputCameraOrigin[0] = static_cast<float>(output.origin.x);
     g_outputCameraOrigin[1] = static_cast<float>(output.origin.y);
     g_outputCameraOrigin[2] = static_cast<float>(output.origin.z);
+    g_previousOutputCamera = g_outputCamera;
+    g_previousOutputCameraValid = g_outputCameraValid;
     g_outputCamera = output;
     g_outputCameraValid = IsFinite(output);
     ++g_cameraOriginSerial;
@@ -7211,7 +7215,7 @@ extern "C" std::uint64_t __fastcall HookParticleUpdate(void* system, float delta
         return result;
     }
     NoteScreenParticlePlacement(static_cast<const unsigned char*>(model));
-    if (g_screenParticleMode.load(std::memory_order_relaxed) == 3 && SourceHandsActive()) {
+    if (g_screenParticleMode.load(std::memory_order_relaxed) >= 3 && SourceHandsActive()) {
         CorrectEmitterPoseNow(static_cast<unsigned char*>(model), fourth);
     }
     const std::uint64_t now = ReadPerformanceCounter();
@@ -7429,15 +7433,32 @@ void CorrectEmitterPoseNow(unsigned char* model, void* placementContext) {
     used.origin = {usedOrigin[0], usedOrigin[1], usedOrigin[2]};
     memcpy(used.axis, usedAxis, sizeof(used.axis));
     Transform predicted{};
+    Transform previousPredicted{};
     bool havePredicted = false;
+    bool havePrevious = false;
     AcquireSRWLockShared(&g_cameraOriginLock);
     predicted = g_outputCamera;
     havePredicted = g_outputCameraValid;
+    previousPredicted = g_previousOutputCamera;
+    havePrevious = g_previousOutputCameraValid;
     ReleaseSRWLockShared(&g_cameraOriginLock);
     Matrix4 delta{};
     Matrix4 inverseDelta{};
     if (!havePredicted || !BuildCameraCorrection(used, predicted, delta, inverseDelta)) {
         return;
+    }
+    // Mode 4: the frame this placement is drawn in has not published its
+    // camera yet, so extrapolate one frame: step = latest * inverse(previous),
+    // next = step * latest, delta = next * inverse(used) = step * delta.
+    if (g_screenParticleMode.load(std::memory_order_relaxed) == 4 && havePrevious) {
+        Matrix4 step{};
+        Matrix4 inverseStep{};
+        if (BuildCameraCorrection(previousPredicted, predicted, step, inverseStep)) {
+            const Matrix4 extrapolated = MultiplyMatrices4(step, delta);
+            if (IsFinite(extrapolated)) {
+                delta = extrapolated;
+            }
+        }
     }
     std::array<float, 12> base{};
     ReadEmitterPose(model, base);
@@ -7500,7 +7521,7 @@ bool WriteCorrectedEmitterPose(unsigned char* model, const std::array<float, 12>
 // placed since is moved again from the camera it was placed with onto the
 // camera now being rendered, unless the engine has placed it again meanwhile.
 void RefreshScreenParticlesForCamera(const Transform& predicted) {
-    if (g_screenParticleMode.load(std::memory_order_relaxed) != 3 || !SourceHandsActive()) {
+    if (g_screenParticleMode.load(std::memory_order_relaxed) < 3 || !SourceHandsActive()) {
         return;
     }
     AcquireSRWLockExclusive(&g_screenPlacementLock);
@@ -7531,12 +7552,17 @@ void CycleScreenParticleMode() {
         PlayToggleCue(ToggleCue::Unavailable);
         return;
     }
-    const int next = (g_screenParticleMode.load(std::memory_order_relaxed) + 1) % 4;
+    const int next = (g_screenParticleMode.load(std::memory_order_relaxed) + 1) % 5;
     g_screenParticleMode.store(next, std::memory_order_relaxed);
-    PlayProfileCue(next);
+    if (next == 0) {
+        PlayToggleCue(ToggleCue::Off);
+    } else {
+        PlayProfileCue(next);
+    }
     static const char* const kNames[] = {"off", "model matrix (+0x20)",
                                          "emitter pose after the flush",
-                                         "emitter pose at placement"};
+                                         "emitter pose at placement",
+                                         "emitter pose at placement, extrapolated one frame"};
     Log("Ctrl+Alt+F10: screen-particle correction %s.", kNames[next]);
 }
 
@@ -8233,9 +8259,10 @@ int FormatFpsFixColumn(FpsFixColumnRow (&rows)[16]) {
     row("First-Person Hands (Shift+F11)", "%s", box(RuntimeFirstPersonHandsEnabled()));
     row("Force Blood Effect (Alt+F10)", "%s",
         box(g_forceBloodEffect.load(std::memory_order_relaxed)));
-    static const char* const kScreenModes[] = {"<off>", "<matrix>", "<pose>", "<placement>"};
+    static const char* const kScreenModes[] = {"<off>", "<matrix>", "<pose>", "<placement>",
+                                               "<extrapolated>"};
     row("Screen Particle Fix (Ctrl+Alt+F10)", "%s",
-        kScreenModes[std::max(0, std::min(3, g_screenParticleMode.load(std::memory_order_relaxed)))]);
+        kScreenModes[std::max(0, std::min(4, g_screenParticleMode.load(std::memory_order_relaxed)))]);
     if (g_enableInterpolationAbProbe) {
         if (g_interpolationAbProbe.capturing) {
             LARGE_INTEGER now{};
