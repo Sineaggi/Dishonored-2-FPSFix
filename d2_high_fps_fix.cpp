@@ -353,6 +353,7 @@ void TryInstallOverlayPresentHook();
 void UpdateForcedBloodEffect();
 struct Transform;
 void NoteCameraOrigins(const Transform& raw, const Transform& output);
+void RefreshScreenParticlesForCamera(const Transform& predicted);
 void ToggleForcedBloodEffect();
 void ToggleDevGui();
 void NoteSimulationTime(double simulationTime);
@@ -6336,6 +6337,7 @@ extern "C" void* __fastcall HookCopyView(void* destination, const void* source) 
     ApplyPrediction(destination, source);
     PublishRenderCorrection(rawCamera, ReadTransform(destination));
     NoteCameraOrigins(rawCamera, ReadTransform(destination));
+    RefreshScreenParticlesForCamera(ReadTransform(destination));
     PublishPresentationContext();
     PresentationContext probeContext{};
     if (ReadPresentationContext(probeContext)) {
@@ -7384,6 +7386,18 @@ void UpdateScreenParticlePoseTrack(SourceTrack& track, std::uint64_t& writes) {
 // Mode 3: the placement (0x227190) runs once per rendered frame on a job
 // thread and rewrites the emitter pose from the unpredicted camera, after the
 // flush, so the pose is corrected right after the placement instead.
+struct ScreenParticlePlacement {
+    void* model = nullptr;
+    Transform used{};
+    std::array<float, 12> base{};
+    std::array<float, 12> written{};
+};
+SRWLOCK g_screenPlacementLock = SRWLOCK_INIT;
+std::array<ScreenParticlePlacement, 8> g_screenPlacements{};
+
+bool WriteCorrectedEmitterPose(unsigned char* model, const std::array<float, 12>& base,
+                               const Matrix4& delta, std::array<float, 12>* written = nullptr);
+
 // The placement reads its camera from [context+0x128] (origin via vtable
 // +0x20, axis via +0x30; 0x21DC00) on the same call, and it runs on a job
 // thread at a point in the frame that does not line up with the camera hook,
@@ -7422,6 +7436,33 @@ void CorrectEmitterPoseNow(unsigned char* model, void* placementContext) {
     }
     std::array<float, 12> base{};
     ReadEmitterPose(model, base);
+    std::array<float, 12> written = base;
+    WriteCorrectedEmitterPose(model, base, delta, &written);
+    AcquireSRWLockExclusive(&g_screenPlacementLock);
+    ScreenParticlePlacement* slot = nullptr;
+    for (ScreenParticlePlacement& placement : g_screenPlacements) {
+        if (placement.model == model) {
+            slot = &placement;
+            break;
+        }
+        if (slot == nullptr && placement.model == nullptr) {
+            slot = &placement;
+        }
+    }
+    if (slot == nullptr) {
+        slot = &g_screenPlacements[0];
+    }
+    slot->model = model;
+    slot->used = used;
+    slot->base = base;
+    slot->written = written;
+    ReleaseSRWLockExclusive(&g_screenPlacementLock);
+}
+
+// Applies delta to an emitter pose laid out as Commit (0x1095F0) uses it and
+// writes it.
+bool WriteCorrectedEmitterPose(unsigned char* model, const std::array<float, 12>& base,
+                               const Matrix4& delta, std::array<float, 12>* written) {
     Matrix4 pose{};
     for (int row = 0; row < 3; ++row) {
         for (int column = 0; column < 3; ++column) {
@@ -7432,7 +7473,7 @@ void CorrectEmitterPoseNow(unsigned char* model, void* placementContext) {
     pose.values[15] = 1.0f;
     const Matrix4 corrected = MultiplyMatrices4(delta, pose);
     if (!IsFinite(corrected)) {
-        return;
+        return false;
     }
     std::array<float, 12> output{};
     for (int row = 0; row < 3; ++row) {
@@ -7442,6 +7483,40 @@ void CorrectEmitterPoseNow(unsigned char* model, void* placementContext) {
         }
     }
     WriteEmitterPose(model, output);
+    if (written != nullptr) {
+        *written = output;
+    }
+    return true;
+}
+
+// The placement runs before the camera hook of the frame it is drawn in, so a
+// pose put on the latest predicted camera trails by one frame. The camera hook
+// calls this after publishing the new predicted camera: each screen particle
+// placed since is moved again from the camera it was placed with onto the
+// camera now being rendered, unless the engine has placed it again meanwhile.
+void RefreshScreenParticlesForCamera(const Transform& predicted) {
+    if (g_screenParticleMode.load(std::memory_order_relaxed) != 3 || !SourceHandsActive()) {
+        return;
+    }
+    AcquireSRWLockExclusive(&g_screenPlacementLock);
+    for (ScreenParticlePlacement& placement : g_screenPlacements) {
+        if (placement.model == nullptr) {
+            continue;
+        }
+        auto* model = static_cast<unsigned char*>(placement.model);
+        std::array<float, 12> current{};
+        ReadEmitterPose(model, current);
+        if (current != placement.written) {
+            placement = ScreenParticlePlacement{};  // placed again, or reused
+            continue;
+        }
+        Matrix4 delta{};
+        Matrix4 inverseDelta{};
+        if (BuildCameraCorrection(placement.used, predicted, delta, inverseDelta)) {
+            WriteCorrectedEmitterPose(model, placement.base, delta, &placement.written);
+        }
+    }
+    ReleaseSRWLockExclusive(&g_screenPlacementLock);
 }
 
 // Ctrl+Alt+F10 cycles ScreenParticleCorrection: off, model matrix, emitter
