@@ -9426,6 +9426,60 @@ void UpdateForcedBloodEffect() {
     memcpy(blood + kCameraBloodHeavyIdOffset, &started, sizeof(started));
 }
 
+// Diagnostics: Iggy callback registration (0x2CD20: context, name, function,
+// user data). The pause menu's "DevGUI" and "ResumeGame" callbacks are wrapped
+// to log when the menu's script actually sends them.
+constexpr std::uintptr_t kSteamIggyRegisterCallbackRva = 0x2CD20;
+constexpr unsigned char kSteamIggyRegisterCallbackBytes[15] = {
+    0x40, 0x57, 0x48, 0x83, 0xEC, 0x40, 0x48, 0xC7, 0x44, 0x24, 0x30, 0xFE, 0xFF, 0xFF, 0xFF,
+};
+using IggyCallbackFn = std::uint64_t(__fastcall*)(void*, void*, void*, void*);
+using IggyRegisterCallbackFn = std::uint64_t(__fastcall*)(void*, const char*, void*, void*);
+IggyRegisterCallbackFn g_originalIggyRegisterCallback = nullptr;
+std::atomic<IggyCallbackFn> g_originalDevGuiCallback{nullptr};
+std::atomic<IggyCallbackFn> g_originalResumeCallback{nullptr};
+
+extern "C" std::uint64_t __fastcall HookDevGuiCallback(void* a, void* b, void* c, void* d) {
+    Log("Pause menu: the \"DevGUI\" callback was called by the menu script.");
+    return g_originalDevGuiCallback.load()(a, b, c, d);
+}
+
+extern "C" std::uint64_t __fastcall HookResumeCallback(void* a, void* b, void* c, void* d) {
+    Log("Pause menu: the \"ResumeGame\" callback was called by the menu script.");
+    return g_originalResumeCallback.load()(a, b, c, d);
+}
+
+extern "C" std::uint64_t __fastcall HookIggyRegisterCallback(void* context, const char* name,
+                                                             void* function, void* user) {
+    if (name != nullptr && IsReadableMemory(name, 11)) {
+        if (strcmp(name, "DevGUI") == 0) {
+            g_originalDevGuiCallback.store(reinterpret_cast<IggyCallbackFn>(function));
+            function = reinterpret_cast<void*>(&HookDevGuiCallback);
+            Log("Pause menu: \"DevGUI\" callback registered (handler RVA 0x%llX).",
+                static_cast<unsigned long long>(
+                    reinterpret_cast<std::uintptr_t>(g_originalDevGuiCallback.load()) -
+                    g_executableBase));
+        } else if (strcmp(name, "ResumeGame") == 0) {
+            g_originalResumeCallback.store(reinterpret_cast<IggyCallbackFn>(function));
+            function = reinterpret_cast<void*>(&HookResumeCallback);
+        }
+    }
+    return g_originalIggyRegisterCallback(context, name, function, user);
+}
+
+bool InstallIggyCallbackLogHook() {
+    void* original = nullptr;
+    if (g_layout != &kSteamLayout ||
+        !InstallInlineHook(kSteamIggyRegisterCallbackRva, kSteamIggyRegisterCallbackBytes,
+                           sizeof(kSteamIggyRegisterCallbackBytes),
+                           reinterpret_cast<const void*>(&HookIggyRegisterCallback), &original,
+                           "Iggy callback registration (log)")) {
+        return false;
+    }
+    g_originalIggyRegisterCallback = reinterpret_cast<IggyRegisterCallbackFn>(original);
+    return true;
+}
+
 bool InstallDevGuiTextLogHook() {
     if (g_layout != &kSteamLayout) {
         return false;
@@ -9576,6 +9630,7 @@ DWORD WINAPI InstallThread(void*) {
         InstallShadowCasterBuildHooks();
         if (g_overlay) {
             InstallDevGuiTextLogHook();
+            InstallIggyCallbackLogHook();
         }
         InstallCameraBloodHooks();
     }
