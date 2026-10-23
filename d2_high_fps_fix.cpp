@@ -351,6 +351,7 @@ bool InstallInlineHook(std::uintptr_t rva, const unsigned char* expected, std::s
                        const void* hook, void** original, const char* description);
 void TryInstallOverlayPresentHook();
 void UpdateForcedBloodEffect();
+void SyncFpsFixCvars();
 struct Transform;
 void NoteCameraOrigins(const Transform& raw, const Transform& output);
 void RefreshScreenParticlesForCamera(const Transform& predicted);
@@ -5965,6 +5966,7 @@ void ApplyPrediction(void* destination, const void* source) {
     TryStabilizeMouseSensitivity();
     TryInstallOverlayPresentHook();
     UpdateForcedBloodEffect();
+    SyncFpsFixCvars();
     const bool f10IsDown = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
     const bool controlIsDown = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
     const bool altIsDown = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
@@ -8130,59 +8132,6 @@ void UpdateOverlayStatistics() {
     stats.lastCounters = counters;
 }
 
-// Rows of the FPSFix column added to DevGUI: {label, value}. Labels name the
-// hotkey that changes each state.
-struct FpsFixColumnRow {
-    char label[64];
-    char value[48];
-};
-
-int FormatFpsFixColumn(FpsFixColumnRow (&rows)[16]) {
-    UpdateOverlayStatistics();
-    const OverlayStatistics& stats = g_overlayStatistics;
-    const bool transforms = RuntimeTransformInterpolationEnabled();
-    int count = 0;
-    const auto row = [&](const char* label, const char* format, auto... values) {
-        if (count < 16) {
-            strcpy_s(rows[count].label, label);
-            sprintf_s(rows[count].value, format, values...);
-            ++count;
-        }
-    };
-    const auto box = [](bool on) { return on ? "[X]" : "[ ]"; };
-    row("Camera Prediction (F10)", "%s", box(g_enabled.load(std::memory_order_relaxed)));
-    row("World Transforms (Alt+F11)", "%s", box(transforms));
-    row("Transform Method (Ctrl+Shift+F11)", "%s",
-        SourceLevelWritesSelected() ? "<source>" : "<per-draw>");
-    row("Skeletons (Alt+F11)", "%s", box(RuntimeSkeletalInterpolationEnabled()));
-    row("First-Person Hands (Shift+F11)", "%s", box(RuntimeFirstPersonHandsEnabled()));
-    row("Force Blood Effect (Alt+F10)", "%s",
-        box(g_forceBloodEffect.load(std::memory_order_relaxed)));
-    static const char* const kScreenModes[] = {"<off>", "<matrix>", "<pose>", "<placement>"};
-    row("Screen Particle Fix (Ctrl+Alt+F10)", "%s",
-        kScreenModes[std::max(0, std::min(3, g_screenParticleMode.load(std::memory_order_relaxed)))]);
-    if (g_enableInterpolationAbProbe) {
-        if (g_interpolationAbProbe.capturing) {
-            LARGE_INTEGER now{};
-            QueryPerformanceCounter(&now);
-            const double elapsed = static_cast<double>(
-                now.QuadPart - g_interpolationAbProbe.segmentStartCounter.QuadPart) /
-                static_cast<double>(g_interpolationAbProbe.frequency.QuadPart);
-            row("A/B Recording (Ctrl+F11)", "[X] %.0fs%s", elapsed,
-                elapsed < kAbProbeWarmupSeconds ? " warm-up" : "");
-        } else {
-            row("A/B Recording (Ctrl+F11)", "%s", "[ ]");
-        }
-        row("Plugin ms/frame: model", "%.2f", stats.modelMs);
-        row("Plugin ms/frame: pose", "%.2f", stats.poseMs);
-        row("Plugin ms/frame: flush", "%.2f", stats.flushMs);
-    }
-    row("Frames/s", "%.0f", stats.fps);
-    row("Source Tracks", "%llu", static_cast<unsigned long long>(g_sourceCounters.activeTracks));
-    row("Source Writes/frame", "%.1f", stats.writesPerFrame);
-    return count;
-}
-
 template <typename T>
 void ReleaseOverlayObject(T*& object) {
     if (object != nullptr) {
@@ -8515,87 +8464,7 @@ void RecordDevGuiText(float x, float y, float scale, const float* color, const c
     g_devGuiCapture.push_back(entry);
 }
 
-// Adds an "- FPSFIX -" block at DevGUI's bottom-left (the key legend is at the
-// bottom-right), in DevGUI's own colors (the most common header and row colors
-// this frame), text scale, left margin, and row spacing.
-std::atomic<int> g_overlayBackBufferHeight{0};
-void AppendFpsFixColumn(std::vector<DevGuiTextEntry>& entries) {
-    float scale = 0.0f;
-    float left = 1.0e9f;
-    std::uint32_t headerColor = 0xFFFFFFFFu;
-    std::uint32_t rowColor = 0xFFFFFFFFu;
-    std::vector<std::pair<std::uint32_t, int>> headerColors;
-    std::vector<std::pair<std::uint32_t, int>> rowColors;
-    const auto tally = [](std::vector<std::pair<std::uint32_t, int>>& tallies,
-                          std::uint32_t color) {
-        for (auto& tallyEntry : tallies) {
-            if (tallyEntry.first == color) {
-                ++tallyEntry.second;
-                return;
-            }
-        }
-        tallies.emplace_back(color, 1);
-    };
-    for (const DevGuiTextEntry& entry : entries) {
-        const std::size_t length = strlen(entry.text);
-        if (length > 4 && entry.text[0] == '-' && entry.text[length - 1] == '-') {
-            scale = entry.scale;
-            left = std::min(left, entry.x);
-            tally(headerColors, entry.color);
-        } else {
-            tally(rowColors, entry.color);
-        }
-    }
-    const int screenHeight = g_overlayBackBufferHeight.load(std::memory_order_relaxed);
-    if (scale <= 0.0f || screenHeight <= 0) {
-        return;
-    }
-    const auto mostCommon = [](const std::vector<std::pair<std::uint32_t, int>>& tallies,
-                               std::uint32_t fallback) {
-        int best = 0;
-        for (const auto& tallyEntry : tallies) {
-            if (tallyEntry.second > best) {
-                best = tallyEntry.second;
-                fallback = tallyEntry.first;
-            }
-        }
-        return fallback;
-    };
-    headerColor = mostCommon(headerColors, headerColor);
-    rowColor = mostCommon(rowColors, rowColor);
-    // Courier advance is 0.6 em of the 48 px font.
-    const float lineHeight = 48.0f * scale;
-    const float x = left;
-    const float valueX = x + 36.0f * 28.8f * scale;
-    const auto add = [&](float atX, float atY, std::uint32_t color, const char* text) {
-        if (entries.size() >= kDevGuiMaxEntries) {
-            return;
-        }
-        DevGuiTextEntry entry{};
-        entry.x = atX;
-        entry.y = atY;
-        entry.scale = scale;
-        entry.color = color;
-        strncpy_s(entry.text, text, _TRUNCATE);
-        entries.push_back(entry);
-    };
-    FpsFixColumnRow rows[16]{};
-    const int count = FormatFpsFixColumn(rows);
-    const float headerY = static_cast<float>(screenHeight) -
-                          lineHeight * (2.0f + 1.4f + static_cast<float>(count));
-    add(x, headerY, headerColor, "- FPSFIX -");
-    float y = headerY + lineHeight * 1.4f;
-    for (int index = 0; index < count; ++index) {
-        add(x, y, rowColor, rows[index].label);
-        add(valueX, y, rowColor, rows[index].value);
-        y += lineHeight;
-    }
-}
-
 void PublishDevGuiText() {
-    if (!g_devGuiCapture.empty()) {
-        AppendFpsFixColumn(g_devGuiCapture);
-    }
     AcquireSRWLockExclusive(&g_devGuiTextLock);
     g_devGuiPublished.swap(g_devGuiCapture);
     g_devGuiPublishedCounter = ReadPerformanceCounter();
@@ -8728,8 +8597,6 @@ void DrawOverlayFrame(IDXGISwapChain* swapChain) {
 
     const float width = static_cast<float>(backDescription.Width);
     const float height = static_cast<float>(backDescription.Height);
-    g_overlayBackBufferHeight.store(static_cast<int>(backDescription.Height),
-                                    std::memory_order_relaxed);
     const auto ndcX = [&](float x) { return x / width * 2.0f - 1.0f; };
     const auto ndcY = [&](float y) { return 1.0f - y / height * 2.0f; };
 
@@ -9701,6 +9568,277 @@ bool InstallDevGuiCvarSetHook() {
     }
     g_originalCvarSetInteger = reinterpret_cast<CvarSetIntegerFn>(original);
     return true;
+}
+
+// Engine cvars for the FPSFix DevGUI page (debug/devgui_fpsfix): fpsfix_*
+// settings are real idCVars, so DevGUI rows (m_linkedCVar / "toggle ...") and
+// the console can read and change them. They are built with the engine's own
+// constructor (0x100840: this, name, default, flags, description, min, max,
+// completion). The cvar system has registered its static list by then, so the
+// new ones are registered by pointing the static list (head 0x31C04B0, next
+// at +0x78) at just them and calling idCVarSystemLocal::RegisterStatics
+// (vtable +0xD0 of the cvar system at 0x31C0640). Each frame, a value that
+// changed outside the plugin is applied, and the plugin's state is written
+// back so DevGUI shows it.
+constexpr std::uintptr_t kSteamCvarConstructRva = 0x100840;
+constexpr unsigned char kSteamCvarConstructBytes[16] = {
+    0x48, 0x8B, 0xC4, 0x48, 0x89, 0x48, 0x08, 0x57,
+    0x48, 0x83, 0xEC, 0x60, 0x48, 0xC7, 0x40, 0xE8,
+};
+constexpr std::uintptr_t kSteamCvarStaticListRva = 0x31C04B0;
+constexpr std::uintptr_t kSteamCvarSystemRva = 0x31C0640;
+constexpr std::uintptr_t kSteamCvarSystemVtableRva = 0x1AE6AB8;
+constexpr std::size_t kCvarSystemRegisterStaticsSlot = 0xD0;
+constexpr std::uintptr_t kSteamCvarRegisterStaticsRva = 0x1020A0;
+constexpr std::size_t kCvarNextOffset = 0x78;
+constexpr std::size_t kCvarObjectSize = 0x100;
+constexpr int kCvarFlagBool = 1;
+constexpr int kCvarFlagInteger = 2;
+constexpr int kCvarFlagFloat = 4;
+using CvarConstructFn = void*(__fastcall*)(void*, const char*, const char*, int, const char*,
+                                            float, float, void*);
+using CvarRegisterStaticsFn = void(__fastcall*)(void*);
+using CvarSetIntegerDirectFn = void(__fastcall*)(void*, int, bool);
+
+enum class FpsFixCvar {
+    Camera,
+    Transforms,
+    Source,
+    Skeletons,
+    Hands,
+    Blood,
+    ScreenParticles,
+    AbRecord,
+    Fps,
+    ModelMs,
+    PoseMs,
+    FlushMs,
+    Count,
+};
+
+struct FpsFixCvarDefinition {
+    const char* name;
+    const char* defaultValue;
+    int flags;
+    const char* description;
+    float minimum;
+    float maximum;
+    bool readOnly;
+};
+
+constexpr FpsFixCvarDefinition kFpsFixCvars[] = {
+    {"fpsfix_camera", "1", kCvarFlagBool, "FPSFix: high-FPS camera prediction (F10)", 0, 1, false},
+    {"fpsfix_transforms", "1", kCvarFlagBool, "FPSFix: world transform interpolation", 0, 1,
+     false},
+    {"fpsfix_source", "1", kCvarFlagBool,
+     "FPSFix: source-level (1) or per-draw (0) transform method", 0, 1, false},
+    {"fpsfix_skeletons", "1", kCvarFlagBool, "FPSFix: skeletal interpolation", 0, 1, false},
+    {"fpsfix_hands", "1", kCvarFlagBool, "FPSFix: first-person hands correction", 0, 1, false},
+    {"fpsfix_blood", "0", kCvarFlagBool, "FPSFix: keep the camera blood effect on (Alt+F10)",
+     0, 1, false},
+    {"fpsfix_screenParticles", "3", kCvarFlagInteger,
+     "FPSFix: screen-particle correction 0 off, 1 matrix, 2 pose, 3 placement", 0, 3, false},
+    {"fpsfix_abRecord", "0", kCvarFlagBool, "FPSFix: A/B probe recording (Ctrl+F11)", 0, 1,
+     false},
+    {"fpsfix_fps", "0", kCvarFlagInteger, "FPSFix: frames per second (read-only)", 0, 100000,
+     true},
+    {"fpsfix_modelMs", "0", kCvarFlagFloat, "FPSFix: plugin model ms per frame (read-only)", 0,
+     1000, true},
+    {"fpsfix_poseMs", "0", kCvarFlagFloat, "FPSFix: plugin pose ms per frame (read-only)", 0,
+     1000, true},
+    {"fpsfix_flushMs", "0", kCvarFlagFloat, "FPSFix: plugin flush ms per frame (read-only)", 0,
+     1000, true},
+};
+static_assert(std::size(kFpsFixCvars) == static_cast<std::size_t>(FpsFixCvar::Count));
+
+std::array<unsigned char*, static_cast<std::size_t>(FpsFixCvar::Count)> g_fpsFixCvars{};
+std::array<LONG, static_cast<std::size_t>(FpsFixCvar::Count)> g_fpsFixCvarLast{};
+bool g_fpsFixCvarsTried = false;
+bool g_fpsFixCvarsReady = false;
+std::uint64_t g_fpsFixStatsCounter = 0;
+
+LONG ReadCvarInteger(const unsigned char* cvar) {
+    LONG value = 0;
+    memcpy(&value, cvar + kCVarIntegerOffset, sizeof(value));
+    return value;
+}
+
+void SetFpsFixCvarInteger(unsigned char* cvar, LONG value) {
+    reinterpret_cast<CvarSetIntegerDirectFn>(g_executableBase + kSteamCvarSetIntegerRva)(
+        cvar, static_cast<int>(value), true);
+}
+
+void SetFpsFixCvarFloat(unsigned char* cvar, float value) {
+    // Read-only stats: int and float fields are what DevGUI shows.
+    *reinterpret_cast<volatile float*>(cvar + kCVarFloatOffset) = value;
+    InterlockedExchange(reinterpret_cast<volatile LONG*>(cvar + kCVarIntegerOffset),
+                        static_cast<LONG>(value));
+}
+
+bool CreateFpsFixCvars() {
+    if (g_layout != &kSteamLayout ||
+        memcmp(reinterpret_cast<const void*>(g_executableBase + kSteamCvarConstructRva),
+               kSteamCvarConstructBytes, sizeof(kSteamCvarConstructBytes)) != 0) {
+        return false;
+    }
+    void* cvarSystem = reinterpret_cast<void*>(g_executableBase + kSteamCvarSystemRva);
+    void** systemVtable = *static_cast<void***>(cvarSystem);
+    if (reinterpret_cast<std::uintptr_t>(systemVtable) !=
+            g_executableBase + kSteamCvarSystemVtableRva ||
+        reinterpret_cast<std::uintptr_t>(
+            systemVtable[kCvarSystemRegisterStaticsSlot / sizeof(void*)]) !=
+            g_executableBase + kSteamCvarRegisterStaticsRva) {
+        Log("FPSFix cvars: the cvar system does not match; DevGUI page cvars not created.");
+        return false;
+    }
+    auto** head = reinterpret_cast<unsigned char**>(g_executableBase + kSteamCvarStaticListRva);
+    unsigned char* const oldHead = *head;
+    auto* storage = static_cast<unsigned char*>(
+        VirtualAlloc(nullptr, kCvarObjectSize * std::size(kFpsFixCvars),
+                     MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    if (storage == nullptr) {
+        return false;
+    }
+    const auto construct =
+        reinterpret_cast<CvarConstructFn>(g_executableBase + kSteamCvarConstructRva);
+    for (std::size_t index = 0; index < std::size(kFpsFixCvars); ++index) {
+        const FpsFixCvarDefinition& definition = kFpsFixCvars[index];
+        unsigned char* cvar = storage + index * kCvarObjectSize;
+        construct(cvar, definition.name, definition.defaultValue, definition.flags,
+                  definition.description, definition.minimum, definition.maximum, nullptr);
+        g_fpsFixCvars[index] = cvar;
+    }
+    // The constructors pushed the new cvars onto the static list head; register
+    // only them, then reconnect the list.
+    unsigned char* const firstCreated = g_fpsFixCvars[0];
+    unsigned char* savedNext = nullptr;
+    memcpy(&savedNext, firstCreated + kCvarNextOffset, sizeof(savedNext));
+    if (savedNext != oldHead || *head != g_fpsFixCvars[std::size(kFpsFixCvars) - 1]) {
+        Log("FPSFix cvars: unexpected static-list layout; not registered.");
+        return false;
+    }
+    unsigned char* const terminator = nullptr;
+    memcpy(firstCreated + kCvarNextOffset, &terminator, sizeof(terminator));
+    reinterpret_cast<CvarRegisterStaticsFn>(
+        systemVtable[kCvarSystemRegisterStaticsSlot / sizeof(void*)])(cvarSystem);
+    memcpy(firstCreated + kCvarNextOffset, &savedNext, sizeof(savedNext));
+    for (std::size_t index = 0; index < std::size(kFpsFixCvars); ++index) {
+        g_fpsFixCvarLast[index] = ReadCvarInteger(g_fpsFixCvars[index]);
+    }
+    Log("FPSFix cvars: registered %zu fpsfix_* cvars for the DevGUI FPSFIX page.",
+        std::size(kFpsFixCvars));
+    return true;
+}
+
+LONG FpsFixRuntimeValue(FpsFixCvar which) {
+    switch (which) {
+        case FpsFixCvar::Camera: return g_enabled.load(std::memory_order_relaxed) ? 1 : 0;
+        case FpsFixCvar::Transforms:
+            return g_transformInterpolationRuntimeEnabled.load(std::memory_order_relaxed) ? 1 : 0;
+        case FpsFixCvar::Source: return SourceLevelWritesSelected() ? 1 : 0;
+        case FpsFixCvar::Skeletons:
+            return g_skeletalInterpolationRuntimeEnabled.load(std::memory_order_relaxed) ? 1 : 0;
+        case FpsFixCvar::Hands:
+            return g_firstPersonHandsRuntimeEnabled.load(std::memory_order_relaxed) ? 1 : 0;
+        case FpsFixCvar::Blood: return g_forceBloodEffect.load(std::memory_order_relaxed) ? 1 : 0;
+        case FpsFixCvar::ScreenParticles: return g_screenParticleMode.load(std::memory_order_relaxed);
+        case FpsFixCvar::AbRecord: return g_interpolationAbProbe.capturing ? 1 : 0;
+        default: return 0;
+    }
+}
+
+// A value changed from DevGUI or the console: apply it like the hotkey would.
+void ApplyFpsFixCvar(FpsFixCvar which, LONG value) {
+    const bool on = value != 0;
+    switch (which) {
+        case FpsFixCvar::Camera:
+            g_enabled.store(on, std::memory_order_relaxed);
+            g_prediction.initialized = false;
+            break;
+        case FpsFixCvar::Transforms:
+            g_transformInterpolationRuntimeEnabled.store(on, std::memory_order_relaxed);
+            break;
+        case FpsFixCvar::Source:
+            if (g_sourceLevelInstalled && g_sourceLevelWrites) {
+                g_sourceLevelRuntimeEnabled.store(on, std::memory_order_relaxed);
+            }
+            break;
+        case FpsFixCvar::Skeletons:
+            g_skeletalInterpolationRuntimeEnabled.store(on, std::memory_order_relaxed);
+            break;
+        case FpsFixCvar::Hands:
+            g_firstPersonHandsRuntimeEnabled.store(on, std::memory_order_relaxed);
+            break;
+        case FpsFixCvar::Blood:
+            g_forceBloodEffect.store(on, std::memory_order_relaxed);
+            break;
+        case FpsFixCvar::ScreenParticles:
+            if (g_screenParticleHookInstalled) {
+                g_screenParticleMode.store(std::max<LONG>(0, std::min<LONG>(3, value)),
+                                           std::memory_order_relaxed);
+            }
+            break;
+        case FpsFixCvar::AbRecord:
+            if (g_enableInterpolationAbProbe && on != g_interpolationAbProbe.capturing) {
+                if (on) {
+                    StartInterpolationAbSegment();
+                } else {
+                    StopInterpolationAbSegment("fpsfix_abRecord");
+                }
+            }
+            break;
+        default:
+            return;
+    }
+    PlayToggleCue(on ? ToggleCue::On : ToggleCue::Off);
+    Log("DevGUI/console: %s %ld.", kFpsFixCvars[static_cast<std::size_t>(which)].name,
+        static_cast<long>(value));
+}
+
+// Game thread, once per frame.
+void SyncFpsFixCvars() {
+    if (!g_overlay) {
+        return;
+    }
+    if (!g_fpsFixCvarsTried) {
+        g_fpsFixCvarsTried = true;
+        g_fpsFixCvarsReady = CreateFpsFixCvars();
+    }
+    if (!g_fpsFixCvarsReady) {
+        return;
+    }
+    for (std::size_t index = 0; index < std::size(kFpsFixCvars); ++index) {
+        if (kFpsFixCvars[index].readOnly) {
+            continue;
+        }
+        const auto which = static_cast<FpsFixCvar>(index);
+        unsigned char* cvar = g_fpsFixCvars[index];
+        const LONG current = ReadCvarInteger(cvar);
+        if (current != g_fpsFixCvarLast[index]) {
+            ApplyFpsFixCvar(which, current);
+        }
+        const LONG runtime = FpsFixRuntimeValue(which);
+        if (runtime != current) {
+            SetFpsFixCvarInteger(cvar, runtime);
+        }
+        g_fpsFixCvarLast[index] = ReadCvarInteger(cvar);
+    }
+    const std::uint64_t now = ReadPerformanceCounter();
+    LARGE_INTEGER frequency{};
+    QueryPerformanceFrequency(&frequency);
+    if (now - g_fpsFixStatsCounter >= static_cast<std::uint64_t>(frequency.QuadPart / 2)) {
+        g_fpsFixStatsCounter = now;
+        UpdateOverlayStatistics();
+        const OverlayStatistics& stats = g_overlayStatistics;
+        SetFpsFixCvarFloat(g_fpsFixCvars[static_cast<std::size_t>(FpsFixCvar::Fps)],
+                           static_cast<float>(stats.fps));
+        SetFpsFixCvarFloat(g_fpsFixCvars[static_cast<std::size_t>(FpsFixCvar::ModelMs)],
+                           static_cast<float>(stats.modelMs));
+        SetFpsFixCvarFloat(g_fpsFixCvars[static_cast<std::size_t>(FpsFixCvar::PoseMs)],
+                           static_cast<float>(stats.poseMs));
+        SetFpsFixCvarFloat(g_fpsFixCvars[static_cast<std::size_t>(FpsFixCvar::FlushMs)],
+                           static_cast<float>(stats.flushMs));
+    }
 }
 
 bool InstallDevGuiTextLogHook() {
