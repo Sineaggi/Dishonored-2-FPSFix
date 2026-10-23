@@ -944,7 +944,7 @@ void LoadConfiguration() {
     g_sourceLevelHands = g_sourceLevelWrites &&
         GetPrivateProfileIntW(L"Interpolation", L"SourceLevelHands", 1, path) != 0;
     g_screenParticleMode.store(g_sourceLevelHands
-        ? std::max(0, std::min(5, static_cast<int>(GetPrivateProfileIntW(
+        ? std::max(0, std::min(3, static_cast<int>(GetPrivateProfileIntW(
               L"Interpolation", L"ScreenParticleCorrection", 3, path))))
         : 0, std::memory_order_relaxed);
     g_enableTelemetry = GetPrivateProfileIntW(
@@ -7106,95 +7106,18 @@ std::array<ScreenParticleEntry, kScreenParticleCapacity> g_screenParticles{};
 
 void CorrectEmitterPoseNow(unsigned char* model, void* placementContext);
 
-// Diagnostics for screen particles: where the placement puts the emitter
-// relative to the raw (tick) and the predicted camera, how often, and on which
-// thread, logged once a second while one is active.
+// The predicted camera of the frame being prepared (published by the camera
+// hook), for the screen-particle correction.
 SRWLOCK g_cameraOriginLock = SRWLOCK_INIT;
-float g_rawCameraOrigin[3]{};
-float g_outputCameraOrigin[3]{};
-std::uint64_t g_cameraOriginSerial = 0;
 Transform g_outputCamera{};
 bool g_outputCameraValid = false;
-Transform g_previousOutputCamera{};
-bool g_previousOutputCameraValid = false;
 
 void NoteCameraOrigins(const Transform& raw, const Transform& output) {
+    (void)raw;
     AcquireSRWLockExclusive(&g_cameraOriginLock);
-    g_rawCameraOrigin[0] = static_cast<float>(raw.origin.x);
-    g_rawCameraOrigin[1] = static_cast<float>(raw.origin.y);
-    g_rawCameraOrigin[2] = static_cast<float>(raw.origin.z);
-    g_outputCameraOrigin[0] = static_cast<float>(output.origin.x);
-    g_outputCameraOrigin[1] = static_cast<float>(output.origin.y);
-    g_outputCameraOrigin[2] = static_cast<float>(output.origin.z);
-    g_previousOutputCamera = g_outputCamera;
-    g_previousOutputCameraValid = g_outputCameraValid;
     g_outputCamera = output;
     g_outputCameraValid = IsFinite(output);
-    ++g_cameraOriginSerial;
     ReleaseSRWLockExclusive(&g_cameraOriginLock);
-}
-
-struct ScreenParticleDiagnostics {
-    std::uint64_t windowStart = 0;
-    std::uint64_t calls = 0;
-    std::uint64_t distinctFrames = 0;
-    std::uint64_t lastFrame = 0;
-    double rawDistanceSum = 0.0;
-    double outputDistanceSum = 0.0;
-    double emitterStepSum = 0.0;
-    float lastEmitter[3]{};
-    DWORD thread = 0;
-};
-ScreenParticleDiagnostics g_screenParticleDiagnostics;
-SRWLOCK g_screenParticleDiagnosticsLock = SRWLOCK_INIT;
-
-void NoteScreenParticlePlacement(const unsigned char* model) {
-    // Emitter = camera origin + forward * offset; compare the emitter with
-    // both camera origins (the offset adds the same ~3.2 to either).
-    float emitter[3]{};
-    memcpy(emitter, model + 0x1860, sizeof(emitter));
-    float raw[3]{};
-    float output[3]{};
-    std::uint64_t frame = 0;
-    AcquireSRWLockShared(&g_cameraOriginLock);
-    memcpy(raw, g_rawCameraOrigin, sizeof(raw));
-    memcpy(output, g_outputCameraOrigin, sizeof(output));
-    frame = g_cameraOriginSerial;
-    ReleaseSRWLockShared(&g_cameraOriginLock);
-    const auto distance = [](const float* a, const float* b) {
-        const double dx = a[0] - b[0], dy = a[1] - b[1], dz = a[2] - b[2];
-        return std::sqrt(dx * dx + dy * dy + dz * dz);
-    };
-    LARGE_INTEGER frequency{};
-    QueryPerformanceFrequency(&frequency);
-    const std::uint64_t now = ReadPerformanceCounter();
-    AcquireSRWLockExclusive(&g_screenParticleDiagnosticsLock);
-    ScreenParticleDiagnostics& d = g_screenParticleDiagnostics;
-    if (d.windowStart == 0) {
-        d.windowStart = now;
-    }
-    ++d.calls;
-    if (frame != d.lastFrame) {
-        ++d.distinctFrames;
-        d.lastFrame = frame;
-    }
-    d.rawDistanceSum += distance(emitter, raw);
-    d.outputDistanceSum += distance(emitter, output);
-    d.emitterStepSum += distance(emitter, d.lastEmitter);
-    memcpy(d.lastEmitter, emitter, sizeof(emitter));
-    d.thread = GetCurrentThreadId();
-    if (now - d.windowStart >= static_cast<std::uint64_t>(frequency.QuadPart)) {
-        const double calls = static_cast<double>(d.calls);
-        Log("Screen particles: %llu placements in %.2fs over %llu rendered frames on thread "
-            "%lu; mean emitter distance to raw camera %.4f, to predicted camera %.4f, "
-            "mean emitter step %.4f.",
-            static_cast<unsigned long long>(d.calls),
-            static_cast<double>(now - d.windowStart) / static_cast<double>(frequency.QuadPart),
-            static_cast<unsigned long long>(d.distinctFrames), d.thread,
-            d.rawDistanceSum / calls, d.outputDistanceSum / calls, d.emitterStepSum / calls);
-        d = ScreenParticleDiagnostics{};
-    }
-    ReleaseSRWLockExclusive(&g_screenParticleDiagnosticsLock);
 }
 
 extern "C" std::uint64_t __fastcall HookParticleUpdate(void* system, float deltaTime,
@@ -7209,8 +7132,7 @@ extern "C" std::uint64_t __fastcall HookParticleUpdate(void* system, float delta
     if (model == nullptr) {
         return result;
     }
-    NoteScreenParticlePlacement(static_cast<const unsigned char*>(model));
-    if (g_screenParticleMode.load(std::memory_order_relaxed) >= 3 && SourceHandsActive()) {
+    if (g_screenParticleMode.load(std::memory_order_relaxed) == 3 && SourceHandsActive()) {
         CorrectEmitterPoseNow(static_cast<unsigned char*>(model), fourth);
     }
     const std::uint64_t now = ReadPerformanceCounter();
@@ -7393,100 +7315,6 @@ void UpdateScreenParticlePoseTrack(SourceTrack& track, std::uint64_t& writes) {
 bool WriteCorrectedEmitterPose(unsigned char* model, const std::array<float, 12>& base,
                                const Matrix4& delta, std::array<float, 12>* written = nullptr);
 
-// Mode 5: temporal anti-aliasing reprojects the blood with the camera's
-// motion even though it moves with the camera, so it smears behind. Here the
-// emitter pose is rewritten relative to the camera the placement used
-// (inverse(used) * pose), so the particles are built in camera space, and
-// after the flush the model's +0x20 is set to the predicted camera. The
-// model-view matrix is then the same every frame (motion vectors near zero)
-// and the blood sits exactly on the rendered camera.
-SRWLOCK g_cameraSpaceParticleLock = SRWLOCK_INIT;
-struct CameraSpaceParticle {
-    void* model = nullptr;
-    std::uint64_t seenCounter = 0;
-    bool written = false;
-};
-std::array<CameraSpaceParticle, 8> g_cameraSpaceParticles{};
-
-void PlaceScreenParticleInCameraSpace(unsigned char* model, const Transform& used) {
-    std::array<float, 12> base{};
-    ReadEmitterPose(model, base);
-    const Matrix4 inverseUsed = InvertRigidTransform(TransformMatrix(used));
-    if (!IsFinite(inverseUsed)) {
-        return;
-    }
-    if (!WriteCorrectedEmitterPose(model, base, inverseUsed)) {
-        return;
-    }
-    const std::uint64_t now = ReadPerformanceCounter();
-    AcquireSRWLockExclusive(&g_cameraSpaceParticleLock);
-    CameraSpaceParticle* slot = nullptr;
-    CameraSpaceParticle* oldest = &g_cameraSpaceParticles[0];
-    for (CameraSpaceParticle& entry : g_cameraSpaceParticles) {
-        if (entry.model == model) {
-            slot = &entry;
-            break;
-        }
-        if (entry.seenCounter < oldest->seenCounter) {
-            oldest = &entry;
-        }
-    }
-    if (slot == nullptr) {
-        slot = oldest;
-        *slot = CameraSpaceParticle{};
-        slot->model = model;
-    }
-    slot->seenCounter = now;
-    ReleaseSRWLockExclusive(&g_cameraSpaceParticleLock);
-}
-
-// After the flush (the particle commit has just set +0x20 to identity):
-// camera-space particles of this world get the predicted camera as their
-// world matrix. Ones not placed for a quarter second get identity back.
-void ApplyCameraSpaceParticles(const SourceWorldView& view) {
-    Transform predicted{};
-    bool havePredicted = false;
-    AcquireSRWLockShared(&g_cameraOriginLock);
-    predicted = g_outputCamera;
-    havePredicted = g_outputCameraValid;
-    ReleaseSRWLockShared(&g_cameraOriginLock);
-    const bool active = g_screenParticleMode.load(std::memory_order_relaxed) == 5 &&
-                        havePredicted && SourceHandsActive();
-    const Matrix4 world = TransformMatrix(predicted);
-    const Matrix4 inverseWorld = InvertRigidTransform(world);
-    Matrix4 identity{};
-    identity.values[0] = identity.values[5] = identity.values[10] = identity.values[15] = 1.0f;
-    LARGE_INTEGER frequency{};
-    QueryPerformanceFrequency(&frequency);
-    const std::uint64_t now = ReadPerformanceCounter();
-    AcquireSRWLockExclusive(&g_cameraSpaceParticleLock);
-    for (CameraSpaceParticle& entry : g_cameraSpaceParticles) {
-        if (entry.model == nullptr) {
-            continue;
-        }
-        auto* model = static_cast<unsigned char*>(entry.model);
-        std::uint16_t handle = 0;
-        memcpy(&handle, model + kRenderModelHandleOffset, sizeof(handle));
-        if (!SourceModelRegistered(view, model, handle)) {
-            continue;  // another world, or gone
-        }
-        const bool recent =
-            now - entry.seenCounter < static_cast<std::uint64_t>(frequency.QuadPart / 4);
-        if (active && recent && IsFinite(world) && IsFinite(inverseWorld)) {
-            WriteMatrix(model, kRenderModelMatrixOffset, world);
-            WriteMatrix(model, kRenderModelInverseMatrixOffset, inverseWorld);
-            entry.written = true;
-        } else {
-            if (entry.written) {
-                WriteMatrix(model, kRenderModelMatrixOffset, identity);
-                WriteMatrix(model, kRenderModelInverseMatrixOffset, identity);
-            }
-            entry = CameraSpaceParticle{};
-        }
-    }
-    ReleaseSRWLockExclusive(&g_cameraSpaceParticleLock);
-}
-
 struct ScreenParticlePlacement {
     void* model = nullptr;
     Transform used{};
@@ -7521,38 +7349,16 @@ void CorrectEmitterPoseNow(unsigned char* model, void* placementContext) {
     Transform used{};
     used.origin = {usedOrigin[0], usedOrigin[1], usedOrigin[2]};
     memcpy(used.axis, usedAxis, sizeof(used.axis));
-    if (g_screenParticleMode.load(std::memory_order_relaxed) == 5) {
-        PlaceScreenParticleInCameraSpace(model, used);
-        return;
-    }
     Transform predicted{};
-    Transform previousPredicted{};
     bool havePredicted = false;
-    bool havePrevious = false;
     AcquireSRWLockShared(&g_cameraOriginLock);
     predicted = g_outputCamera;
     havePredicted = g_outputCameraValid;
-    previousPredicted = g_previousOutputCamera;
-    havePrevious = g_previousOutputCameraValid;
     ReleaseSRWLockShared(&g_cameraOriginLock);
     Matrix4 delta{};
     Matrix4 inverseDelta{};
     if (!havePredicted || !BuildCameraCorrection(used, predicted, delta, inverseDelta)) {
         return;
-    }
-    // Mode 4: the particle geometry appears to trail the rendered camera by a
-    // frame, so extrapolate one frame: step = latest * inverse(previous),
-    // next = step * latest, delta = next * inverse(used) = step * delta. The
-    // camera-hook refresh is skipped in this mode.
-    if (g_screenParticleMode.load(std::memory_order_relaxed) == 4 && havePrevious) {
-        Matrix4 step{};
-        Matrix4 inverseStep{};
-        if (BuildCameraCorrection(previousPredicted, predicted, step, inverseStep)) {
-            const Matrix4 extrapolated = MultiplyMatrices4(step, delta);
-            if (IsFinite(extrapolated)) {
-                delta = extrapolated;
-            }
-        }
     }
     std::array<float, 12> base{};
     ReadEmitterPose(model, base);
@@ -7615,8 +7421,6 @@ bool WriteCorrectedEmitterPose(unsigned char* model, const std::array<float, 12>
 // placed since is moved again from the camera it was placed with onto the
 // camera now being rendered, unless the engine has placed it again meanwhile.
 void RefreshScreenParticlesForCamera(const Transform& predicted) {
-    // Mode 4 relies on its extrapolation alone; refreshing onto the
-    // published camera would undo it.
     if (g_screenParticleMode.load(std::memory_order_relaxed) != 3 || !SourceHandsActive()) {
         return;
     }
@@ -7648,20 +7452,16 @@ void CycleScreenParticleMode() {
         PlayToggleCue(ToggleCue::Unavailable);
         return;
     }
-    const int next = (g_screenParticleMode.load(std::memory_order_relaxed) + 1) % 6;
+    const int next = (g_screenParticleMode.load(std::memory_order_relaxed) + 1) % 4;
     g_screenParticleMode.store(next, std::memory_order_relaxed);
     if (next == 0) {
         PlayToggleCue(ToggleCue::Off);
-    } else if (next == 5) {
-        PlayToggleCue(ToggleCue::MethodSource);
     } else {
         PlayProfileCue(next);
     }
     static const char* const kNames[] = {"off", "model matrix (+0x20)",
                                          "emitter pose after the flush",
-                                         "emitter pose at placement",
-                                         "emitter pose at placement, extrapolated one frame",
-                                         "camera-space particles (+0x20 = predicted camera)"};
+                                         "emitter pose at placement"};
     Log("Ctrl+Alt+F10: screen-particle correction %s.", kNames[next]);
 }
 
@@ -7769,7 +7569,6 @@ void ProcessSourceLevelTracks(void* world, const PresentationContext& context,
             }
         }
     }
-    ApplyCameraSpaceParticles(view);
     CompactSourceTrackList();
     g_sourceCounters.activeTracks = active;
     g_sourceCounters.activePartTracks = activeParts;
@@ -8359,10 +8158,9 @@ int FormatFpsFixColumn(FpsFixColumnRow (&rows)[16]) {
     row("First-Person Hands (Shift+F11)", "%s", box(RuntimeFirstPersonHandsEnabled()));
     row("Force Blood Effect (Alt+F10)", "%s",
         box(g_forceBloodEffect.load(std::memory_order_relaxed)));
-    static const char* const kScreenModes[] = {"<off>", "<matrix>", "<pose>", "<placement>",
-                                               "<extrapolated>", "<camera space>"};
+    static const char* const kScreenModes[] = {"<off>", "<matrix>", "<pose>", "<placement>"};
     row("Screen Particle Fix (Ctrl+Alt+F10)", "%s",
-        kScreenModes[std::max(0, std::min(5, g_screenParticleMode.load(std::memory_order_relaxed)))]);
+        kScreenModes[std::max(0, std::min(3, g_screenParticleMode.load(std::memory_order_relaxed)))]);
     if (g_enableInterpolationAbProbe) {
         if (g_interpolationAbProbe.capturing) {
             LARGE_INTEGER now{};
@@ -9450,10 +9248,10 @@ bool InstallHook() {
     return true;
 }
 
-// Diagnostics: DevGUI keeps its own text drawer (0x784A0: this, x, y, scale,
-// const float* color, const char* text, int alignment), separate from the stripped debug
-// DrawString. While the overlay is on, the first distinct strings it is asked
-// to draw are logged, to see whether DevGUI's menu data exists.
+// DevGUI keeps its own text drawer (0x784A0: this, x, y, scale, const float*
+// color, const char* text, int alignment), separate from the stripped debug
+// DrawString; every string it is given during the DevGUI pass is recorded for
+// the D3D11 replay.
 constexpr std::uintptr_t kSteamDevGuiTextRva = 0x784A0;
 constexpr std::size_t kSteamDevGuiTextHookLength = 18;
 constexpr unsigned char kSteamDevGuiTextBytes[kSteamDevGuiTextHookLength] = {
@@ -9467,30 +9265,11 @@ using DevGuiTextFn = std::uint64_t(__fastcall*)(void*, float, float, float, cons
                                                 const char*, std::uint64_t, std::uint64_t,
                                                 std::uint64_t);
 DevGuiTextFn g_originalDevGuiText = nullptr;
-std::atomic<int> g_devGuiTextLogged{0};
 
 extern "C" std::uint64_t __fastcall HookDevGuiText(void* self, float x, float y, float scale,
                                                    const float* color, const char* text,
                                                    std::uint64_t seventh, std::uint64_t eighth,
                                                    std::uint64_t ninth) {
-    if (g_devGuiTextLogged.load(std::memory_order_relaxed) < 24) {
-        char sample[96]{};
-        if (text != nullptr && IsReadableMemory(text, 1)) {
-            std::size_t length = 0;
-            while (length + 1 < sizeof(sample) && IsReadableMemory(text + length, 1) &&
-                   text[length] != '\0') {
-                const char character = text[length];
-                sample[length] = (character >= 32 && character < 127) ? character : '?';
-                ++length;
-            }
-        }
-        static char last[96]{};
-        if (strcmp(sample, last) != 0) {
-            strcpy_s(last, sample);
-            g_devGuiTextLogged.fetch_add(1, std::memory_order_relaxed);
-            Log("DevGUI text: (%.0f, %.0f) scale %.2f \"%s\"", x, y, scale, sample);
-        }
-    }
     RecordDevGuiText(x, y, scale, color, text, static_cast<int>(seventh));
     return g_originalDevGuiText(self, x, y, scale, color, text, seventh, eighth, ninth);
 }
@@ -9808,60 +9587,6 @@ void UpdateForcedBloodEffect() {
     memcpy(blood + kCameraBloodHeavyIdOffset, &started, sizeof(started));
 }
 
-// Diagnostics: Iggy callback registration (0x2CD20: context, name, function,
-// user data). The pause menu's "DevGUI" and "ResumeGame" callbacks are wrapped
-// to log when the menu's script actually sends them.
-constexpr std::uintptr_t kSteamIggyRegisterCallbackRva = 0x2CD20;
-constexpr unsigned char kSteamIggyRegisterCallbackBytes[15] = {
-    0x40, 0x57, 0x48, 0x83, 0xEC, 0x40, 0x48, 0xC7, 0x44, 0x24, 0x30, 0xFE, 0xFF, 0xFF, 0xFF,
-};
-using IggyCallbackFn = std::uint64_t(__fastcall*)(void*, void*, void*, void*);
-using IggyRegisterCallbackFn = std::uint64_t(__fastcall*)(void*, const char*, void*, void*);
-IggyRegisterCallbackFn g_originalIggyRegisterCallback = nullptr;
-std::atomic<IggyCallbackFn> g_originalDevGuiCallback{nullptr};
-std::atomic<IggyCallbackFn> g_originalResumeCallback{nullptr};
-
-extern "C" std::uint64_t __fastcall HookDevGuiCallback(void* a, void* b, void* c, void* d) {
-    Log("Pause menu: the \"DevGUI\" callback was called by the menu script.");
-    return g_originalDevGuiCallback.load()(a, b, c, d);
-}
-
-extern "C" std::uint64_t __fastcall HookResumeCallback(void* a, void* b, void* c, void* d) {
-    Log("Pause menu: the \"ResumeGame\" callback was called by the menu script.");
-    return g_originalResumeCallback.load()(a, b, c, d);
-}
-
-extern "C" std::uint64_t __fastcall HookIggyRegisterCallback(void* context, const char* name,
-                                                             void* function, void* user) {
-    if (name != nullptr && IsReadableMemory(name, 11)) {
-        if (strcmp(name, "DevGUI") == 0) {
-            g_originalDevGuiCallback.store(reinterpret_cast<IggyCallbackFn>(function));
-            function = reinterpret_cast<void*>(&HookDevGuiCallback);
-            Log("Pause menu: \"DevGUI\" callback registered (handler RVA 0x%llX).",
-                static_cast<unsigned long long>(
-                    reinterpret_cast<std::uintptr_t>(g_originalDevGuiCallback.load()) -
-                    g_executableBase));
-        } else if (strcmp(name, "ResumeGame") == 0) {
-            g_originalResumeCallback.store(reinterpret_cast<IggyCallbackFn>(function));
-            function = reinterpret_cast<void*>(&HookResumeCallback);
-        }
-    }
-    return g_originalIggyRegisterCallback(context, name, function, user);
-}
-
-bool InstallIggyCallbackLogHook() {
-    void* original = nullptr;
-    if (g_layout != &kSteamLayout ||
-        !InstallInlineHook(kSteamIggyRegisterCallbackRva, kSteamIggyRegisterCallbackBytes,
-                           sizeof(kSteamIggyRegisterCallbackBytes),
-                           reinterpret_cast<const void*>(&HookIggyRegisterCallback), &original,
-                           "Iggy callback registration (log)")) {
-        return false;
-    }
-    g_originalIggyRegisterCallback = reinterpret_cast<IggyRegisterCallbackFn>(original);
-    return true;
-}
-
 // The exe's "DevGUI" pause callback (0x78F140): it closes the pause state and
 // buffers the console command "devgui 1", which the retail command system
 // does not apply (the cvar stays 0). After it runs, the plugin sets devgui to
@@ -10128,7 +9853,6 @@ DWORD WINAPI InstallThread(void*) {
         InstallShadowCasterBuildHooks();
         if (g_overlay) {
             InstallDevGuiTextLogHook();
-            InstallIggyCallbackLogHook();
             InstallPauseDevGuiCallbackHook();
             InstallDevGuiCvarSetHook();
         }
