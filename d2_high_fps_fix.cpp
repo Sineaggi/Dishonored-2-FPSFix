@@ -356,11 +356,9 @@ void NoteCameraOrigins(const Transform& raw, const Transform& output);
 void RefreshScreenParticlesForCamera(const Transform& predicted);
 void ToggleForcedBloodEffect();
 void ToggleDevGui();
-void CloseDevGuiOnEscape();
 void NoteSimulationTime(double simulationTime);
 bool ClosePauseMenu();
 bool g_crashLog = false;
-bool g_devGuiEscapeFallback = true;
 std::atomic<bool> g_forceBloodEffect{false};
 int g_devGuiScale = 0;
 bool g_autoContinueLoadScreen = false;
@@ -961,8 +959,6 @@ void LoadConfiguration() {
         L"Diagnostics", L"CrashLog", 0, path) != 0;
     g_devGuiScale = std::max(0, std::min(4, static_cast<int>(
         GetPrivateProfileIntW(L"Diagnostics", L"DevGuiScale", 0, path))));
-    g_devGuiEscapeFallback = GetPrivateProfileIntW(
-        L"Diagnostics", L"DevGuiEscapeFallback", 1, path) != 0;
     g_forceBloodEffect.store(GetPrivateProfileIntW(
         L"Diagnostics", L"ForceBloodEffect", 0, path) != 0, std::memory_order_relaxed);
     g_autoContinueLoadScreen = GetPrivateProfileIntW(
@@ -5987,7 +5983,6 @@ void ApplyPrediction(void* destination, const void* source) {
             nowEnabled ? "enabled" : "disabled");
     }
     g_f10WasDown = f10IsDown;
-    CloseDevGuiOnEscape();
     HandleInterpolationAbControls();
     if (!g_enabled.load(std::memory_order_relaxed)) {
         return;
@@ -9541,35 +9536,6 @@ unsigned char* FindDevGuiCvar() {
 void SetDevGuiCvar(unsigned char* cvar, LONG value) {
     *reinterpret_cast<volatile float*>(cvar + kCVarFloatOffset) = static_cast<float>(value);
     InterlockedExchange(reinterpret_cast<volatile LONG*>(cvar + kCVarIntegerOffset), value);
-}
-
-// DevGUI closes itself on Esc (and = and a pad button) once it has input
-// focus (handler 0x899050 sets devgui 0). As a fallback, also covering the
-// frames before it takes focus, an Esc press while devgui is above 0 sets it
-// to 0 here (Diagnostics/DevGuiEscapeFallback).
-void CloseDevGuiOnEscape() {
-    if (!g_devGuiEscapeFallback) {
-        return;
-    }
-    static bool escapeWasDown = false;
-    const bool escapeIsDown = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
-    const bool pressed = escapeIsDown && !escapeWasDown;
-    escapeWasDown = escapeIsDown;
-    if (!pressed) {
-        return;
-    }
-    unsigned char* cvar = FindDevGuiCvar();
-    if (cvar == nullptr) {
-        return;
-    }
-    LONG current = 0;
-    memcpy(&current, cvar + kCVarIntegerOffset, sizeof(current));
-    if (current <= 0) {
-        return;
-    }
-    SetDevGuiCvar(cvar, 0);
-    PlayToggleCue(ToggleCue::Off);
-    Log("Esc: DevGUI closed (devgui 0).");
 }
 
 void ToggleDevGui() {
