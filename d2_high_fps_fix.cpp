@@ -9574,10 +9574,15 @@ bool InstallDevGuiCvarSetHook() {
 // settings are real idCVars, so DevGUI rows (m_linkedCVar / "toggle ...") and
 // the console can read and change them. They are built with the engine's own
 // constructor (0x100840: this, name, default, flags, description, min, max,
-// completion). The cvar system has registered its static list by then, so the
-// new ones are registered by pointing the static list (head 0x31C04B0, next
-// at +0x78) at just them and calling idCVarSystemLocal::RegisterStatics
-// (vtable +0xD0 of the cvar system at 0x31C0640). Each frame, a value that
+// completion). Normally they are made before the engine registers its static
+// cvars: DllMain replaces idCVarSystemLocal::RegisterStatics (vtable +0xD0 of
+// the cvar system at 0x31C0640), and the replacement constructs them first on
+// the static list (head 0x31C04B0, next at +0x78), so they are registered with
+// the engine's own and exist before DevGUI binds its rows' m_linkedCVar. If
+// the engine registered its statics before the plugin loaded, they are made on
+// the first frame instead, by pointing the static list at just them and calling
+// RegisterStatics again (DevGUI rows built before then stay unbound). Each
+// frame, a value that
 // changed outside the plugin is applied, and the plugin's state is written
 // back so DevGUI shows it.
 constexpr std::uintptr_t kSteamCvarConstructRva = 0x100840;
@@ -9586,6 +9591,7 @@ constexpr unsigned char kSteamCvarConstructBytes[16] = {
     0x48, 0x83, 0xEC, 0x60, 0x48, 0xC7, 0x40, 0xE8,
 };
 constexpr std::uintptr_t kSteamCvarStaticListRva = 0x31C04B0;
+constexpr std::uintptr_t kSteamCvarStaticsRegisteredRva = 0x31C04B8;
 constexpr std::uintptr_t kSteamCvarSystemRva = 0x31C0640;
 constexpr std::uintptr_t kSteamCvarSystemVtableRva = 0x1AE6AB8;
 constexpr std::size_t kCvarSystemRegisterStaticsSlot = 0xD0;
@@ -9655,6 +9661,8 @@ std::array<unsigned char*, static_cast<std::size_t>(FpsFixCvar::Count)> g_fpsFix
 std::array<LONG, static_cast<std::size_t>(FpsFixCvar::Count)> g_fpsFixCvarLast{};
 bool g_fpsFixCvarsTried = false;
 bool g_fpsFixCvarsReady = false;
+std::atomic<bool> g_fpsFixCvarsEarly{false};
+CvarRegisterStaticsFn g_originalRegisterStatics = nullptr;
 std::uint64_t g_fpsFixStatsCounter = 0;
 
 LONG ReadCvarInteger(const unsigned char* cvar) {
@@ -9675,24 +9683,9 @@ void SetFpsFixCvarFloat(unsigned char* cvar, float value) {
                         static_cast<LONG>(value));
 }
 
-bool CreateFpsFixCvars() {
-    if (g_layout != &kSteamLayout ||
-        memcmp(reinterpret_cast<const void*>(g_executableBase + kSteamCvarConstructRva),
-               kSteamCvarConstructBytes, sizeof(kSteamCvarConstructBytes)) != 0) {
-        return false;
-    }
-    void* cvarSystem = reinterpret_cast<void*>(g_executableBase + kSteamCvarSystemRva);
-    void** systemVtable = *static_cast<void***>(cvarSystem);
-    if (reinterpret_cast<std::uintptr_t>(systemVtable) !=
-            g_executableBase + kSteamCvarSystemVtableRva ||
-        reinterpret_cast<std::uintptr_t>(
-            systemVtable[kCvarSystemRegisterStaticsSlot / sizeof(void*)]) !=
-            g_executableBase + kSteamCvarRegisterStaticsRva) {
-        Log("FPSFix cvars: the cvar system does not match; DevGUI page cvars not created.");
-        return false;
-    }
-    auto** head = reinterpret_cast<unsigned char**>(g_executableBase + kSteamCvarStaticListRva);
-    unsigned char* const oldHead = *head;
+// Builds the fpsfix_* cvars with the engine constructor, which links each
+// onto the static list head.
+bool ConstructFpsFixCvars() {
     auto* storage = static_cast<unsigned char*>(
         VirtualAlloc(nullptr, kCvarObjectSize * std::size(kFpsFixCvars),
                      MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
@@ -9708,6 +9701,81 @@ bool CreateFpsFixCvars() {
                   definition.description, definition.minimum, definition.maximum, nullptr);
         g_fpsFixCvars[index] = cvar;
     }
+    return true;
+}
+
+bool FpsFixCvarCodeMatches() {
+    return memcmp(reinterpret_cast<const void*>(g_executableBase + kSteamCvarConstructRva),
+                  kSteamCvarConstructBytes, sizeof(kSteamCvarConstructBytes)) == 0;
+}
+
+void __fastcall HookRegisterStatics(void* cvarSystem) {
+    // Only once, and only while the constructor still takes the static-list
+    // path (flag byte 0x31C04B8 clear).
+    if (!g_fpsFixCvarsEarly.load(std::memory_order_acquire) &&
+        *reinterpret_cast<const volatile unsigned char*>(
+            g_executableBase + kSteamCvarStaticsRegisteredRva) == 0 &&
+        ConstructFpsFixCvars()) {
+        g_fpsFixCvarsEarly.store(true, std::memory_order_release);
+    }
+    g_originalRegisterStatics(cvarSystem);
+}
+
+// DllMain: hooks RegisterStatics so the cvars are registered with the engine's.
+void InstallEarlyFpsFixCvarHook() {
+    const auto base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+    if (base == 0) {
+        return;
+    }
+    g_executableBase = base;
+    __try {
+        auto** slot = reinterpret_cast<void**>(base + kSteamCvarSystemVtableRva +
+                                               kCvarSystemRegisterStaticsSlot);
+        if (!FpsFixCvarCodeMatches() ||
+            reinterpret_cast<std::uintptr_t>(*slot) != base + kSteamCvarRegisterStaticsRva ||
+            *reinterpret_cast<const unsigned char*>(base + kSteamCvarStaticsRegisteredRva) != 0) {
+            return;  // Another build, or the statics are already registered.
+        }
+        DWORD oldProtect = 0;
+        if (!VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &oldProtect)) {
+            return;
+        }
+        g_originalRegisterStatics = reinterpret_cast<CvarRegisterStaticsFn>(*slot);
+        *slot = reinterpret_cast<void*>(&HookRegisterStatics);
+        VirtualProtect(slot, sizeof(void*), oldProtect, &oldProtect);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+
+// First frame: uses the early cvars, or makes and registers them now.
+bool CreateFpsFixCvars() {
+    if (g_fpsFixCvarsEarly.load(std::memory_order_acquire)) {
+        for (std::size_t index = 0; index < std::size(kFpsFixCvars); ++index) {
+            g_fpsFixCvarLast[index] = ReadCvarInteger(g_fpsFixCvars[index]);
+        }
+        Log("FPSFix cvars: %zu fpsfix_* cvars registered with the engine's statics.",
+            std::size(kFpsFixCvars));
+        return true;
+    }
+    if (g_layout != &kSteamLayout || !FpsFixCvarCodeMatches()) {
+        return false;
+    }
+    void* cvarSystem = reinterpret_cast<void*>(g_executableBase + kSteamCvarSystemRva);
+    void** systemVtable = *static_cast<void***>(cvarSystem);
+    const auto registerStatics = reinterpret_cast<std::uintptr_t>(
+        systemVtable[kCvarSystemRegisterStaticsSlot / sizeof(void*)]);
+    if (reinterpret_cast<std::uintptr_t>(systemVtable) !=
+            g_executableBase + kSteamCvarSystemVtableRva ||
+        (registerStatics != g_executableBase + kSteamCvarRegisterStaticsRva &&
+         registerStatics != reinterpret_cast<std::uintptr_t>(&HookRegisterStatics))) {
+        Log("FPSFix cvars: the cvar system does not match; DevGUI page cvars not created.");
+        return false;
+    }
+    auto** head = reinterpret_cast<unsigned char**>(g_executableBase + kSteamCvarStaticListRva);
+    unsigned char* const oldHead = *head;
+    if (!ConstructFpsFixCvars()) {
+        return false;
+    }
     // The constructors pushed the new cvars onto the static list head; register
     // only them, then reconnect the list.
     unsigned char* const firstCreated = g_fpsFixCvars[0];
@@ -9719,13 +9787,14 @@ bool CreateFpsFixCvars() {
     }
     unsigned char* const terminator = nullptr;
     memcpy(firstCreated + kCvarNextOffset, &terminator, sizeof(terminator));
-    reinterpret_cast<CvarRegisterStaticsFn>(
-        systemVtable[kCvarSystemRegisterStaticsSlot / sizeof(void*)])(cvarSystem);
+    reinterpret_cast<CvarRegisterStaticsFn>(g_executableBase + kSteamCvarRegisterStaticsRva)(
+        cvarSystem);
     memcpy(firstCreated + kCvarNextOffset, &savedNext, sizeof(savedNext));
     for (std::size_t index = 0; index < std::size(kFpsFixCvars); ++index) {
         g_fpsFixCvarLast[index] = ReadCvarInteger(g_fpsFixCvars[index]);
     }
-    Log("FPSFix cvars: registered %zu fpsfix_* cvars for the DevGUI FPSFIX page.",
+    Log("FPSFix cvars: registered %zu fpsfix_* cvars late (the engine's statics were "
+        "registered before the plugin loaded); DevGUI rows built earlier stay unbound.",
         std::size(kFpsFixCvars));
     return true;
 }
@@ -10005,6 +10074,7 @@ BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         g_pluginModule = module;
         DisableThreadLibraryCalls(module);
+        InstallEarlyFpsFixCvarHook();
         if (!g_initializationStarted.exchange(true, std::memory_order_acq_rel)) {
             HANDLE thread = CreateThread(nullptr, 0, InstallThread, nullptr, 0, nullptr);
             if (thread != nullptr) {
