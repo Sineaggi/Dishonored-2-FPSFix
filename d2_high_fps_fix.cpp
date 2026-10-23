@@ -357,7 +357,7 @@ void RefreshScreenParticlesForCamera(const Transform& predicted);
 void ToggleForcedBloodEffect();
 void ToggleDevGui();
 void NoteSimulationTime(double simulationTime);
-bool ClosePauseMenu();
+bool RunPauseMenuDevGuiAction();
 bool g_crashLog = false;
 std::atomic<bool> g_forceBloodEffect{false};
 int g_devGuiScale = 0;
@@ -9548,8 +9548,9 @@ void ToggleDevGui() {
     LONG current = 0;
     memcpy(&current, cvar + kCVarIntegerOffset, sizeof(current));
     const LONG value = current > 0 ? 0 : 2;
-    if (value != 0 && ClosePauseMenu()) {
-        Log("Ctrl+F10: closed the pause menu for DevGUI.");
+    if (value != 0 && RunPauseMenuDevGuiAction()) {
+        Log("Ctrl+F10: ran the pause menu's own DevGUI action.");
+        return;  // it closed the pause menu and opened DevGUI
     }
     SetDevGuiCvar(cvar, value);
     PlayToggleCue(value != 0 ? ToggleCue::On : ToggleCue::Off);
@@ -9594,18 +9595,16 @@ bool InstallInlineHook(std::uintptr_t rva, const unsigned char* expected, std::s
 // devgui 1. The pause state's show method (vtable slot 0x1C61678 -> 0x78F170)
 // is wrapped to remember the state object, and the game counts as sitting in
 // the pause menu when it was shown after the last simulation tick. Ctrl+F10
-// there closes the pause menu the same way the callback does
-// (0x7885B0(state+8, 1)) and opens DevGUI.
+// there runs that same callback with the remembered state, exactly as the
+// restored Dev GUI button does.
 constexpr std::uintptr_t kSteamPauseShowSlotRva = 0x1C61678;
 constexpr std::uintptr_t kSteamPauseShowRva = 0x78F170;
-constexpr std::uintptr_t kSteamPauseCloseRva = 0x7885B0;
 constexpr unsigned char kSteamPauseDevGuiCallbackBytes[16] = {
     0x48, 0x83, 0xEC, 0x28, 0x48, 0x8B, 0x49, 0x08,
     0xBA, 0x01, 0x00, 0x00, 0x00, 0xE8, 0x5E, 0x94,
 };
 constexpr std::uintptr_t kSteamPauseDevGuiCallbackRva = 0x78F140;
 using PauseShowFn = std::uint64_t(__fastcall*)(void*, void*, void*, void*);
-using PauseCloseFn = void(__fastcall*)(void*, int);
 PauseShowFn g_originalPauseShow = nullptr;
 std::atomic<void*> g_pauseState{nullptr};
 std::atomic<std::uint64_t> g_pauseShownCounter{0};
@@ -9638,20 +9637,23 @@ bool PauseMenuIsOpen() {
            now - lastTick > static_cast<std::uint64_t>(frequency.QuadPart / 5);
 }
 
-bool ClosePauseMenu() {
-    if (!PauseMenuIsOpen()) {
+extern bool g_pauseDevGuiCallbackHooked;
+
+// Calls the exe's own "DevGUI" pause callback (through its hooked entry, so
+// devgui is then set as for the button). False when the pause menu is not
+// open or the callback hook is not installed.
+bool RunPauseMenuDevGuiAction() {
+    if (!PauseMenuIsOpen() || !g_pauseDevGuiCallbackHooked) {
         return false;
     }
-    auto* state = static_cast<unsigned char*>(g_pauseState.load(std::memory_order_relaxed));
-    void* owner = nullptr;
-    if (!IsReadableMemory(state + 8, sizeof(owner))) {
+    void* state = g_pauseState.load(std::memory_order_relaxed);
+    if (state == nullptr || !IsReadableMemory(static_cast<unsigned char*>(state) + 8,
+                                              sizeof(void*))) {
         return false;
     }
-    memcpy(&owner, state + 8, sizeof(owner));
-    if (owner == nullptr) {
-        return false;
-    }
-    reinterpret_cast<PauseCloseFn>(g_executableBase + kSteamPauseCloseRva)(owner, 1);
+    using PauseDevGuiActionFn = std::uint64_t(__fastcall*)(void*, void*, void*, void*);
+    reinterpret_cast<PauseDevGuiActionFn>(g_executableBase + kSteamPauseDevGuiCallbackRva)(
+        state, nullptr, nullptr, nullptr);
     g_pauseShownCounter.store(0, std::memory_order_relaxed);
     return true;
 }
@@ -9872,6 +9874,7 @@ constexpr unsigned char kSteamPauseDevGuiCallbackEntryBytes[18] = {
 };
 using PauseCallbackFn = std::uint64_t(__fastcall*)(void*, void*, void*, void*);
 PauseCallbackFn g_originalPauseDevGuiCallback = nullptr;
+bool g_pauseDevGuiCallbackHooked = false;
 
 extern "C" std::uint64_t __fastcall HookPauseDevGuiCallback(void* a, void* b, void* c, void* d) {
     const std::uint64_t result = g_originalPauseDevGuiCallback(a, b, c, d);
@@ -9928,7 +9931,8 @@ bool InstallPauseDevGuiCallbackHook() {
     FlushInstructionCache(GetCurrentProcess(), entry, sizeof(patch));
     DWORD ignored = 0;
     VirtualProtect(entry, sizeof(patch), oldProtection, &ignored);
-    Log("Installed the pause-menu DevGUI callback log hook at RVA 0x78F140.");
+    g_pauseDevGuiCallbackHooked = true;
+    Log("Installed the pause-menu DevGUI callback hook at RVA 0x78F140.");
     return true;
 }
 
