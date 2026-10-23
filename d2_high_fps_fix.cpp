@@ -1607,6 +1607,8 @@ bool VerifyExecutableLayout() {
     }
     if (selected == nullptr) {
         g_layout = &kGogLayout;
+        Log("Executable layout does not match a known layout profile (no layout passed "
+            "strict validation); patch not installed.");
         return false;
     }
 
@@ -9550,7 +9552,6 @@ bool InstallShadowCasterBuildHooks() {
         reinterpret_cast<const void*>(&HookShadowCasterBuildA),
         reinterpret_cast<const void*>(&HookShadowCasterBuildB),
     };
-    constexpr std::size_t kAbsoluteJumpLength = 14;
     for (std::size_t index = 0; index < entries.size(); ++index) {
         const HookSiteLayout& site = sites[index];
         entries[index] = reinterpret_cast<unsigned char*>(
