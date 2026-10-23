@@ -1,25 +1,25 @@
 Dishonored 2 FPS Fix v@VERSION@
 ================================
 
-Validated game
---------------
-GOG Dishonored 2 version 1.77.9.0 for Windows x64.
+Supported game builds
+---------------------
+Dishonored 2 version 1.77.9.0 for Windows x64, with one layout profile each:
 
-Dishonored2.exe SHA-256:
+GOG (reference build, fully live-tested), Dishonored2.exe SHA-256:
 C3150F9F2D9BF967D23CA6A79BB32703B90116854AAD9892C7FC1F46A1060293
 
-A separate layout profile covers the Steam executable (1.77.9.0, SHA-256
-B671F8249422862BF557D00AAB2F4BB671ED4515CC10AD8A8A9DECAD84516180).
-ShadowTransforms is not yet supported on Steam and is disabled there.
+Steam (February 2025 rebuild; live-tested in multi-level play, including
+vehicle cutscenes), Dishonored2.exe SHA-256:
+B671F8249422862BF557D00AAB2F4BB671ED4515CC10AD8A8A9DECAD84516180
 
-This hash identifies the fully tested reference build; it is not a hard
-allowlist. Before writing a hook, the ASI validates the x64 PE image layout,
-section permissions, renderer-view call and deep-copy target signatures,
-relevant vtable targets, and every enabled hook signature. A different-hash
-executable is accepted only if that complete runtime layout still matches.
-Relocated or changed layouts fail
-closed and require a separately researched profile. Other builds have not
-received the reference build's live gameplay coverage.
+These hashes identify the reference builds; they are not a hard allowlist.
+Before writing a hook, the ASI selects the profile whose renderer-view call
+site matches, then validates the x64 PE image layout, section permissions,
+renderer-view call and deep-copy target signatures, relevant vtable targets,
+and every enabled hook signature of that profile. A different-hash executable
+is accepted only if a profile's complete runtime layout still matches.
+Relocated or changed layouts fail closed and require a separately researched
+profile. ShadowTransforms is not available on the Steam build.
 
 Choose an installation
 ----------------------
@@ -52,19 +52,32 @@ frame-rate-independent mouse sensitivity, camera and first-person root
 stabilization, eligible world/root interpolation, first-person and selected
 world skeletal interpolation, and small cinematic-control interpolation.
 
-Press F10 in game to toggle camera prediction and first-person root correction
-for an A/B comparison. F10 does not change the FPS limit or the other
-interpolation settings.
+Camera prediction and first-person root correction are ON by default; no key
+press is needed. Press F10 in game only for an A/B comparison: it turns them
+off, and pressing it again turns them back on. F10 does not change the FPS
+limit or the other interpolation settings.
+
+RealTimeTurnPrediction=1 keeps mouse turning even at frame rates that are not
+a multiple of 120, such as 90 or 144 FPS. Ctrl+F10 switches camera rotation
+between this rule and the previous simulation-time rule for an A/B comparison.
 
 The adaptive performance controller is enabled by default. It sheds skeletal
 interpolation first, then transform interpolation, when maintaining those
 layers would leave too little native-120-Hz headroom, and restores them after
 sustained recovery. Set AdaptivePerformanceGate=0 in d2-high-fps-fix.ini to
 keep every individually enabled interpolation layer active continuously.
+During cutscenes the controller keeps every enabled layer active and does not
+measure; set FullInterpolationInCutscenes=0 to let it manage cutscenes too.
+It does the same while the game slows time, such as during kill cams and
+slowed-time powers; set FullInterpolationInSlowMotion=0 to let it manage slow
+motion too. During slow motion every layer also accepts the longer gaps between
+simulation samples, and ownerless character models, such as some in takedowns,
+are interpolated as well.
 
-Removing the game's FPS-dependent mouse multiplier makes the same in-game
-sensitivity feel lower at high FPS. Raise the in-game sensitivity once to your
-preference; it should then remain consistent as the frame rate changes.
+StabilizeMouseSensitivity=1 makes the turn per mouse count independent of the
+frame rate, above and below 120 FPS, and matches the unmodified game at its
+normal 120 FPS cap. If you raised the in-game sensitivity for an older version
+of this patch, lower it back to about half.
 
 Safety and scope
 ----------------
