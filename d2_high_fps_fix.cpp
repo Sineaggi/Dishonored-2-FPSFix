@@ -946,7 +946,7 @@ void LoadConfiguration() {
     g_sourceLevelHands = g_sourceLevelWrites &&
         GetPrivateProfileIntW(L"Interpolation", L"SourceLevelHands", 1, path) != 0;
     g_screenParticleMode.store(g_sourceLevelHands
-        ? std::max(0, std::min(4, static_cast<int>(GetPrivateProfileIntW(
+        ? std::max(0, std::min(5, static_cast<int>(GetPrivateProfileIntW(
               L"Interpolation", L"ScreenParticleCorrection", 3, path))))
         : 0, std::memory_order_relaxed);
     g_enableTelemetry = GetPrivateProfileIntW(
@@ -7395,6 +7395,103 @@ void UpdateScreenParticlePoseTrack(SourceTrack& track, std::uint64_t& writes) {
 // Mode 3: the placement (0x227190) runs once per rendered frame on a job
 // thread and rewrites the emitter pose from the unpredicted camera, after the
 // flush, so the pose is corrected right after the placement instead.
+bool WriteCorrectedEmitterPose(unsigned char* model, const std::array<float, 12>& base,
+                               const Matrix4& delta, std::array<float, 12>* written = nullptr);
+
+// Mode 5: temporal anti-aliasing reprojects the blood with the camera's
+// motion even though it moves with the camera, so it smears behind. Here the
+// emitter pose is rewritten relative to the camera the placement used
+// (inverse(used) * pose), so the particles are built in camera space, and
+// after the flush the model's +0x20 is set to the predicted camera. The
+// model-view matrix is then the same every frame (motion vectors near zero)
+// and the blood sits exactly on the rendered camera.
+SRWLOCK g_cameraSpaceParticleLock = SRWLOCK_INIT;
+struct CameraSpaceParticle {
+    void* model = nullptr;
+    std::uint64_t seenCounter = 0;
+    bool written = false;
+};
+std::array<CameraSpaceParticle, 8> g_cameraSpaceParticles{};
+
+void PlaceScreenParticleInCameraSpace(unsigned char* model, const Transform& used) {
+    std::array<float, 12> base{};
+    ReadEmitterPose(model, base);
+    const Matrix4 inverseUsed = InvertRigidTransform(TransformMatrix(used));
+    if (!IsFinite(inverseUsed)) {
+        return;
+    }
+    if (!WriteCorrectedEmitterPose(model, base, inverseUsed)) {
+        return;
+    }
+    const std::uint64_t now = ReadPerformanceCounter();
+    AcquireSRWLockExclusive(&g_cameraSpaceParticleLock);
+    CameraSpaceParticle* slot = nullptr;
+    CameraSpaceParticle* oldest = &g_cameraSpaceParticles[0];
+    for (CameraSpaceParticle& entry : g_cameraSpaceParticles) {
+        if (entry.model == model) {
+            slot = &entry;
+            break;
+        }
+        if (entry.seenCounter < oldest->seenCounter) {
+            oldest = &entry;
+        }
+    }
+    if (slot == nullptr) {
+        slot = oldest;
+        *slot = CameraSpaceParticle{};
+        slot->model = model;
+    }
+    slot->seenCounter = now;
+    ReleaseSRWLockExclusive(&g_cameraSpaceParticleLock);
+}
+
+// After the flush (the particle commit has just set +0x20 to identity):
+// camera-space particles of this world get the predicted camera as their
+// world matrix. Ones not placed for a quarter second get identity back.
+void ApplyCameraSpaceParticles(const SourceWorldView& view) {
+    Transform predicted{};
+    bool havePredicted = false;
+    AcquireSRWLockShared(&g_cameraOriginLock);
+    predicted = g_outputCamera;
+    havePredicted = g_outputCameraValid;
+    ReleaseSRWLockShared(&g_cameraOriginLock);
+    const bool active = g_screenParticleMode.load(std::memory_order_relaxed) == 5 &&
+                        havePredicted && SourceHandsActive();
+    const Matrix4 world = TransformMatrix(predicted);
+    const Matrix4 inverseWorld = InvertRigidTransform(world);
+    Matrix4 identity{};
+    identity.values[0] = identity.values[5] = identity.values[10] = identity.values[15] = 1.0f;
+    LARGE_INTEGER frequency{};
+    QueryPerformanceFrequency(&frequency);
+    const std::uint64_t now = ReadPerformanceCounter();
+    AcquireSRWLockExclusive(&g_cameraSpaceParticleLock);
+    for (CameraSpaceParticle& entry : g_cameraSpaceParticles) {
+        if (entry.model == nullptr) {
+            continue;
+        }
+        auto* model = static_cast<unsigned char*>(entry.model);
+        std::uint16_t handle = 0;
+        memcpy(&handle, model + kRenderModelHandleOffset, sizeof(handle));
+        if (!SourceModelRegistered(view, model, handle)) {
+            continue;  // another world, or gone
+        }
+        const bool recent =
+            now - entry.seenCounter < static_cast<std::uint64_t>(frequency.QuadPart / 4);
+        if (active && recent && IsFinite(world) && IsFinite(inverseWorld)) {
+            WriteMatrix(model, kRenderModelMatrixOffset, world);
+            WriteMatrix(model, kRenderModelInverseMatrixOffset, inverseWorld);
+            entry.written = true;
+        } else {
+            if (entry.written) {
+                WriteMatrix(model, kRenderModelMatrixOffset, identity);
+                WriteMatrix(model, kRenderModelInverseMatrixOffset, identity);
+            }
+            entry = CameraSpaceParticle{};
+        }
+    }
+    ReleaseSRWLockExclusive(&g_cameraSpaceParticleLock);
+}
+
 struct ScreenParticlePlacement {
     void* model = nullptr;
     Transform used{};
@@ -7403,9 +7500,6 @@ struct ScreenParticlePlacement {
 };
 SRWLOCK g_screenPlacementLock = SRWLOCK_INIT;
 std::array<ScreenParticlePlacement, 8> g_screenPlacements{};
-
-bool WriteCorrectedEmitterPose(unsigned char* model, const std::array<float, 12>& base,
-                               const Matrix4& delta, std::array<float, 12>* written = nullptr);
 
 // The placement reads its camera from [context+0x128] (origin via vtable
 // +0x20, axis via +0x30; 0x21DC00) on the same call, and it runs on a job
@@ -7432,6 +7526,10 @@ void CorrectEmitterPoseNow(unsigned char* model, void* placementContext) {
     Transform used{};
     used.origin = {usedOrigin[0], usedOrigin[1], usedOrigin[2]};
     memcpy(used.axis, usedAxis, sizeof(used.axis));
+    if (g_screenParticleMode.load(std::memory_order_relaxed) == 5) {
+        PlaceScreenParticleInCameraSpace(model, used);
+        return;
+    }
     Transform predicted{};
     Transform previousPredicted{};
     bool havePredicted = false;
@@ -7555,17 +7653,20 @@ void CycleScreenParticleMode() {
         PlayToggleCue(ToggleCue::Unavailable);
         return;
     }
-    const int next = (g_screenParticleMode.load(std::memory_order_relaxed) + 1) % 5;
+    const int next = (g_screenParticleMode.load(std::memory_order_relaxed) + 1) % 6;
     g_screenParticleMode.store(next, std::memory_order_relaxed);
     if (next == 0) {
         PlayToggleCue(ToggleCue::Off);
+    } else if (next == 5) {
+        PlayToggleCue(ToggleCue::MethodSource);
     } else {
         PlayProfileCue(next);
     }
     static const char* const kNames[] = {"off", "model matrix (+0x20)",
                                          "emitter pose after the flush",
                                          "emitter pose at placement",
-                                         "emitter pose at placement, extrapolated one frame"};
+                                         "emitter pose at placement, extrapolated one frame",
+                                         "camera-space particles (+0x20 = predicted camera)"};
     Log("Ctrl+Alt+F10: screen-particle correction %s.", kNames[next]);
 }
 
@@ -7673,6 +7774,7 @@ void ProcessSourceLevelTracks(void* world, const PresentationContext& context,
             }
         }
     }
+    ApplyCameraSpaceParticles(view);
     CompactSourceTrackList();
     g_sourceCounters.activeTracks = active;
     g_sourceCounters.activePartTracks = activeParts;
@@ -8263,9 +8365,9 @@ int FormatFpsFixColumn(FpsFixColumnRow (&rows)[16]) {
     row("Force Blood Effect (Alt+F10)", "%s",
         box(g_forceBloodEffect.load(std::memory_order_relaxed)));
     static const char* const kScreenModes[] = {"<off>", "<matrix>", "<pose>", "<placement>",
-                                               "<extrapolated>"};
+                                               "<extrapolated>", "<camera space>"};
     row("Screen Particle Fix (Ctrl+Alt+F10)", "%s",
-        kScreenModes[std::max(0, std::min(4, g_screenParticleMode.load(std::memory_order_relaxed)))]);
+        kScreenModes[std::max(0, std::min(5, g_screenParticleMode.load(std::memory_order_relaxed)))]);
     if (g_enableInterpolationAbProbe) {
         if (g_interpolationAbProbe.capturing) {
             LARGE_INTEGER now{};
