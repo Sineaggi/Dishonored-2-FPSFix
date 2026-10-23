@@ -25,6 +25,64 @@
 
 namespace {
 
+constexpr std::uintptr_t kClockOffset = 0x2E7428;
+constexpr std::uintptr_t kScaledTimeOffset = 0x68;
+constexpr std::uintptr_t kSimulationTimeOffset = 0xB8;
+
+// Clock time-scale fields from the clock update (GOG FUN_14007D8B0), read only
+// for the time-scale diagnostic. Timers 2-4 each blend toward a target scale;
+// the frame's tick count is derived from the larger of timers 3 and 4, and the
+// simulation delta is that tick count times the step divided by that scale.
+constexpr std::size_t kClockScaledTimerScaleOffset = 0x74;
+constexpr std::size_t kClockSimulationTimerScaleOffset = 0xC0;
+constexpr std::size_t kClockSimulationTimerTargetScaleOffset = 0xE8;
+constexpr std::size_t kClockTimer3ScaleOffset = 0x110;
+constexpr std::size_t kClockTimer3TargetScaleOffset = 0x138;
+constexpr std::size_t kClockTimer4ScaleOffset = 0x160;
+constexpr std::size_t kClockTimer4TargetScaleOffset = 0x188;
+constexpr std::size_t kClockFrameTickCountOffset = 0x198;
+
+// arkGameLogicManager is embedded in idGameLocal. It owns one state object per
+// arkGameLogicStateIds_t value and an idList stack of active state ids.
+constexpr std::uintptr_t kGameLogicManagerOffset = 0x1F6EC8;
+constexpr std::size_t kGameLogicOwnerOffset = 0x08;
+constexpr std::size_t kGameLogicStatesOffset = 0x18;
+constexpr std::size_t kGameLogicStackDataOffset = 0x528;
+constexpr std::size_t kGameLogicStackCountOffset = 0x530;
+constexpr std::uint32_t kGameLogicStackLimit = 32;
+constexpr std::int32_t kGameLogicStateInGame = 1;
+constexpr std::int32_t kGameLogicStateCinematic = 5;
+constexpr std::int32_t kGameLogicStateCount = 17;
+
+// The clock is an array of 0x50-byte timers (0 real, 1 scaled, 2 simulation)
+// whose delta is at +0x28; idGameLocal vtable slot 28 returns timer[index].
+// With g_fixMouseSensibility=1 the mouse-look scaler divides the look input by
+// timer 0's delta, the real frame time, while the view later turns by that
+// rate times the simulation delta. Reading timer 2 instead makes the two cancel
+// on every game frame, whatever the frame rate or tick count.
+constexpr std::size_t kGameClockDeltaVtableSlot = 28;
+constexpr std::uintptr_t kSimulationTimerDeltaOffset = 0xC8;
+constexpr unsigned char kExpectedMouseLookDeltaSite[21] = {
+    0x49, 0x8D, 0x53, 0x08,              // lea rdx,[r11+8]
+    0x45, 0x33, 0xC0,                    // xor r8d,r8d       ; timer 0
+    0x48, 0x8B, 0x01,                    // mov rax,[rcx]
+    0xFF, 0x90, 0xE0, 0x00, 0x00, 0x00,  // call [rax+0xE0]   ; delta accessor
+    0xF3, 0x44, 0x0F, 0x10, 0x08,        // movss xmm9,[rax]
+};
+constexpr std::size_t kMouseLookDeltaPatchOffset = 7;
+constexpr std::size_t kMouseLookDeltaPatchLength = 9;
+
+// The view-copy routine is byte-identical in every supported layout profile.
+constexpr unsigned char kExpectedCopyViewBytes[32] = {
+    0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x74,
+    0x24, 0x10, 0x48, 0x89, 0x7C, 0x24, 0x18, 0x41,
+    0x56, 0x48, 0x83, 0xEC, 0x20, 0x8B, 0x02, 0x4C,
+    0x8B, 0xF2, 0x48, 0x8B, 0xF1, 0x89, 0x01, 0x0F,
+};
+
+constexpr std::size_t kAbsoluteJumpLength = 14;
+constexpr std::size_t kMaximumHookLength = 32;
+
 // Executable-specific addresses and entry signatures. Everything else the
 // plugin touches (object layouts, field offsets, the view-copy body) is shared
 // by every supported build of Dishonored 2 1.77.9.0.
@@ -33,7 +91,6 @@ struct VtableLayout {
     std::array<std::uintptr_t, 4> targets;
 };
 
-constexpr std::size_t kMaximumHookLength = 32;
 
 struct HookSiteLayout {
     std::uintptr_t rva;
@@ -101,6 +158,13 @@ struct GameBuildLayout {
     std::uintptr_t commonVtableRva;
     std::size_t commonLoadPromptHandleOffset;
     std::size_t commonLoadFlagsOffset;
+    // arkGameLogicStateCinematic vtable, checked before the cutscene state is
+    // trusted by FullInterpolationInCutscenes.
+    VtableLayout cinematicGameLogicStateVtable;
+    // g_fixMouseSensibility's timer-0 delta call in the mouse-look scaler, and
+    // the idGameLocal clock-delta accessor it reaches through vtable slot 28.
+    std::uintptr_t mouseLookDeltaSiteRva;
+    std::uintptr_t clockDeltaAccessorRva;
 };
 
 constexpr GameBuildLayout kGogLayout = {
@@ -148,6 +212,12 @@ constexpr GameBuildLayout kGogLayout = {
             0x48, 0x89, 0x4C, 0x24, 0x08,
         }},
     }},
+    // Source-level layer and load-screen gate: not mapped for GOG.
+    false, {}, 0, 0, 0, 0, 0, 0, {}, {}, {}, {}, 0, {},
+    false, 0, 0, 0, 0,
+    {0x1EDECF8, {0x8D60F0, 0x8D61C0, 0x8D38A0, 0x8D6230}},
+    0x9607F7,
+    0xA3FD00,
 };
 
 // Steam build 17576867 (FileVersion 1.77.9.0, PE timestamp 0x67A50CDE). The
@@ -209,13 +279,28 @@ constexpr GameBuildLayout kSteamLayout = {
     0x1AC4D88,
     0x12D8,
     0x19A0,
+    {0x1C60128, {0x789E20, 0x78A300, 0x7897D0, 0x78A870}},
+    0x7FB644,
+    0x8A8980,
 };
 
 constexpr std::array<const GameBuildLayout*, 2> kKnownLayouts = {
     &kGogLayout, &kSteamLayout,
 };
 
-constexpr std::uintptr_t kClockOffset = 0x2E7428;
+constexpr bool KnownLayoutHookLengthsAreValid() {
+    for (const GameBuildLayout* layout : kKnownLayouts) {
+        if (layout->renderModelGpuCopy.length < kAbsoluteJumpLength ||
+            layout->renderModelGpuCopy.length > kMaximumHookLength ||
+            layout->skinnedPoseUpload.length < kAbsoluteJumpLength ||
+            layout->skinnedPoseUpload.length > kMaximumHookLength) {
+            return false;
+        }
+    }
+    return true;
+}
+static_assert(KnownLayoutHookLengthsAreValid(),
+              "Every hook must fit an absolute jump and the patch buffer");
 
 constexpr std::size_t kCVarIntegerOffset = 0x28;
 constexpr std::size_t kCVarFloatOffset = 0x2C;
@@ -225,15 +310,9 @@ constexpr char kFrameLimiterCvarName[] = "com_timeScaler";
 constexpr int kFrameLimiterBaseFps = 30;
 constexpr int kMinimumMaxFps = 30;
 constexpr int kMaximumMaxFps = 300;
-constexpr std::uintptr_t kScaledTimeOffset = 0x68;
-constexpr std::uintptr_t kSimulationTimeOffset = 0xB8;
 
-constexpr unsigned char kExpectedCopyViewBytes[32] = {
-    0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x74,
-    0x24, 0x10, 0x48, 0x89, 0x7C, 0x24, 0x18, 0x41,
-    0x56, 0x48, 0x83, 0xEC, 0x20, 0x8B, 0x02, 0x4C,
-    0x8B, 0xF2, 0x48, 0x8B, 0xF1, 0x89, 0x01, 0x0F,
-};
+// Selected by VerifyExecutableLayout before any hook is installed.
+const GameBuildLayout* g_layout = &kGogLayout;
 
 constexpr std::size_t kRenderModelSize = 0x1CD0;
 constexpr std::size_t kRenderModelMatrixOffset = 0x20;
@@ -265,6 +344,14 @@ constexpr std::uint32_t kSourceIdleTicksBeforeDrop = 3;
 // Presentation frames a track may go unseen by its world's flush.
 constexpr std::uint64_t kSourceStaleFrames = 600;
 
+constexpr std::size_t kShadowCasterBuildHookLength = 15;
+constexpr unsigned char
+    kExpectedShadowCasterBuildBytes[2][kShadowCasterBuildHookLength] = {
+    {0x4C, 0x89, 0x44, 0x24, 0x18, 0x48, 0x89, 0x54, 0x24, 0x10,
+     0x48, 0x89, 0x4C, 0x24, 0x08},
+    {0x4C, 0x89, 0x44, 0x24, 0x18, 0x48, 0x89, 0x54, 0x24, 0x10,
+     0x48, 0x89, 0x4C, 0x24, 0x08},
+};
 constexpr std::size_t kShadowCasterEntryStride = 0x30;
 constexpr std::size_t kShadowCasterMatrixPointerOffset = 0x08;
 constexpr std::size_t kShadowCasterProxyCapacity = 4096;
@@ -317,15 +404,17 @@ constexpr double kPi = 3.14159265358979323846;
 
 HMODULE g_pluginModule = nullptr;
 std::uintptr_t g_executableBase = 0;
-const GameBuildLayout* g_layout = &kGogLayout;
 void* g_relay = nullptr;
 std::array<void*, 2> g_shadowCasterBuildTrampolines{};
 void* g_renderModelGpuCopyTrampoline = nullptr;
 void* g_skinnedPoseUploadTrampoline = nullptr;
+bool g_mouseLookDeltaPatched = false;
 std::atomic<bool> g_enabled{true};
 std::atomic<bool> g_transformInterpolationRuntimeEnabled{true};
 std::atomic<bool> g_skeletalInterpolationRuntimeEnabled{true};
 std::atomic<bool> g_firstPersonHandsRuntimeEnabled{true};
+std::atomic<bool> g_realTimeTurnRuntimeEnabled{true};
+std::atomic<bool> g_slowMotionActive{false};
 std::atomic<bool> g_initializationStarted{false};
 bool g_f10WasDown = false;
 bool g_f11WasDown = false;
@@ -334,6 +423,7 @@ bool g_unlockAbove120 = false;
 int g_maxFps = 0;
 bool g_stabilizeMouseSensitivity = false;
 bool g_stabilizeFirstPersonHands = false;
+bool g_realTimeTurnPrediction = false;
 bool g_interpolateWorldTransforms = false;
 bool g_interpolateCinematicTransforms = false;
 bool g_interpolateShadowTransforms = false;
@@ -341,6 +431,8 @@ bool g_interpolateFirstPersonSkeletons = false;
 bool g_interpolateWorldSkeletons = false;
 bool g_interpolateCinematicSkeletons = false;
 bool g_enableAdaptiveInterpolation = false;
+bool g_fullInterpolationInCutscenes = false;
+bool g_fullInterpolationInSlowMotion = false;
 bool g_enableTelemetry = false;
 bool g_enableInterpolationAbProbe = false;
 bool g_toggleSounds = true;
@@ -382,6 +474,7 @@ std::atomic<std::uint64_t> g_abSourceWrites{0};
 bool SourceLevelWritesSelected();
 bool SourceHandsSelected();
 void ObserveSourceLevelRendererCall();
+bool g_logTimeScale = false;
 std::atomic<bool> g_adaptiveInterpolationManualOverride{false};
 std::atomic<int> g_unlockState{0};
 // 0 = not resolved yet, 1 = engine limiter in use, 2 = unavailable.
@@ -430,6 +523,7 @@ struct WorldTransformDiagnostics {
     std::atomic<std::uint64_t> reflectedAdjusted{0};
     std::atomic<std::uint64_t> cinematicEligible{0};
     std::atomic<std::uint64_t> cinematicAdjusted{0};
+    std::atomic<std::uint64_t> slowMotionCharacters{0};
     std::atomic<std::uint64_t> moving{0};
     std::atomic<std::uint64_t> tracksCreated{0};
     std::atomic<std::uint64_t> samplePairs{0};
@@ -513,6 +607,9 @@ struct PredictionState {
     const void* sourceView = nullptr;
     double previousTime = 0.0;
     double currentTime = 0.0;
+    // Scaled time of the frames that produced each sample.
+    double previousCaptureTime = 0.0;
+    double currentCaptureTime = 0.0;
     Transform previous{};
     Transform current{};
 };
@@ -549,6 +646,8 @@ RenderCorrectionState g_renderCorrection;
 struct PresentationContext {
     double scaledTime = 0.0;
     double simulationTime = 0.0;
+    // Stretches the sample-interval limits while slow motion lengthens ticks.
+    double intervalScale = 1.0;
     std::uint64_t serial = 0;
     bool valid = false;
 };
@@ -559,6 +658,7 @@ std::atomic<std::uint64_t> g_presentationSerial{0};
 
 void PublishPresentationContext();
 bool ReadPresentationContext(PresentationContext& context);
+double SampleIntervalScale();
 bool RuntimeTransformInterpolationEnabled();
 bool RuntimeSkeletalInterpolationEnabled();
 bool RuntimeFirstPersonHandsEnabled();
@@ -634,6 +734,7 @@ struct SkeletalDiagnostics {
     std::atomic<std::uint64_t> worldEligible{0};
     std::atomic<std::uint64_t> firstPersonEligible{0};
     std::atomic<std::uint64_t> cinematicEligible{0};
+    std::atomic<std::uint64_t> slowMotionCharacters{0};
     std::atomic<std::uint64_t> firstPersonDisabled{0};
     std::atomic<std::uint64_t> depthHackRejected{0};
     std::atomic<std::uint64_t> ownerRejected{0};
@@ -871,6 +972,10 @@ struct AdaptiveInterpolationGateState {
     bool hasSkeletalPenalty = false;
     bool hasTransformPenalty = false;
     std::uint32_t recoveryWindows = 0;
+    bool cutsceneOverride = false;
+    bool cutsceneDetectionFailed = false;
+    bool slowMotionOverride = false;
+    std::int32_t lastGameLogicState = -1;
 };
 
 AdaptiveInterpolationGateState g_adaptiveInterpolationGate;
@@ -924,6 +1029,8 @@ void LoadConfiguration() {
         L"Fix", L"StabilizeMouseSensitivity", 1, path) != 0;
     g_stabilizeFirstPersonHands = GetPrivateProfileIntW(
         L"Fix", L"StabilizeFirstPersonHands", 0, path) != 0;
+    g_realTimeTurnPrediction = GetPrivateProfileIntW(
+        L"Fix", L"RealTimeTurnPrediction", 1, path) != 0;
     g_interpolateWorldTransforms = GetPrivateProfileIntW(
         L"Interpolation", L"WorldTransforms", 0, path) != 0;
     g_interpolateCinematicTransforms = GetPrivateProfileIntW(
@@ -948,6 +1055,10 @@ void LoadConfiguration() {
         ? std::max(0, std::min(3, static_cast<int>(GetPrivateProfileIntW(
               L"Interpolation", L"ScreenParticleCorrection", 3, path))))
         : 0, std::memory_order_relaxed);
+    g_fullInterpolationInCutscenes = GetPrivateProfileIntW(
+        L"Interpolation", L"FullInterpolationInCutscenes", 1, path) != 0;
+    g_fullInterpolationInSlowMotion = GetPrivateProfileIntW(
+        L"Interpolation", L"FullInterpolationInSlowMotion", 1, path) != 0;
     g_enableTelemetry = GetPrivateProfileIntW(
         L"Diagnostics", L"Telemetry", 0, path) != 0;
     g_enableInterpolationAbProbe = GetPrivateProfileIntW(
@@ -981,15 +1092,19 @@ void LoadConfiguration() {
             "AutoABRounds=%d, AutoABQuitWhenDone=%u.", g_autoAbSegmentSeconds,
             g_autoAbRounds, g_autoAbQuitWhenDone ? 1U : 0U);
     }
+    g_logTimeScale = GetPrivateProfileIntW(
+        L"Diagnostics", L"TimeScaleLog", 1, path) != 0;
     Log("Configuration: UnlockAbove120=%u, MaxFPS=%d, StabilizeMouseSensitivity=%u, "
-        "StabilizeFirstPersonHands=%u, WorldTransforms=%u, "
-        "CinematicTransforms=%u, ShadowTransforms=%u, "
+        "StabilizeFirstPersonHands=%u, RealTimeTurnPrediction=%u, "
+        "WorldTransforms=%u, CinematicTransforms=%u, ShadowTransforms=%u, "
         "FirstPersonSkeletons=%u, WorldSkeletons=%u, "
-        "CinematicSkeletons=%u, AdaptivePerformanceGate=%u, Telemetry=%u, "
-        "InterpolationABProbe=%u.",
+        "CinematicSkeletons=%u, AdaptivePerformanceGate=%u, "
+        "FullInterpolationInCutscenes=%u, FullInterpolationInSlowMotion=%u, "
+        "Telemetry=%u, InterpolationABProbe=%u, TimeScaleLog=%u.",
         g_unlockAbove120 ? 1U : 0U, g_maxFps,
         g_stabilizeMouseSensitivity ? 1U : 0U,
         g_stabilizeFirstPersonHands ? 1U : 0U,
+        g_realTimeTurnPrediction ? 1U : 0U,
         g_interpolateWorldTransforms ? 1U : 0U,
         g_interpolateCinematicTransforms ? 1U : 0U,
         g_interpolateShadowTransforms ? 1U : 0U,
@@ -997,14 +1112,22 @@ void LoadConfiguration() {
         g_interpolateWorldSkeletons ? 1U : 0U,
         g_interpolateCinematicSkeletons ? 1U : 0U,
         g_enableAdaptiveInterpolation ? 1U : 0U,
+        g_fullInterpolationInCutscenes ? 1U : 0U,
+        g_fullInterpolationInSlowMotion ? 1U : 0U,
         g_enableTelemetry ? 1U : 0U,
-        g_enableInterpolationAbProbe ? 1U : 0U);
+        g_enableInterpolationAbProbe ? 1U : 0U,
+        g_logTimeScale ? 1U : 0U);
     Log("Configuration: SourceLevelTransforms=%u, SourceLevelWrites=%u, "
         "SourceLevelHands=%u, ToggleSounds=%u, Overlay=%u, "
         "AutoContinueLoadScreen=%u.",
         g_sourceLevelTransforms ? 1U : 0U, g_sourceLevelWrites ? 1U : 0U,
         g_sourceLevelHands ? 1U : 0U, g_toggleSounds ? 1U : 0U,
         g_overlay ? 1U : 0U, g_autoContinueLoadScreen ? 1U : 0U);
+    if (g_realTimeTurnPrediction) {
+        Log("In ordinary play, camera rotation follows the real time between "
+            "game frames, as mouse look does; Ctrl+Shift+F10 switches to the "
+            "simulation-time rotation rule for comparison.");
+    }
     if (g_enableInterpolationAbProbe) {
         Log("A/B controls: Ctrl+F11 starts/stops a clean measurement segment; "
             "F11 toggles all configured interpolation; Alt+F11 cycles all, "
@@ -1023,6 +1146,14 @@ void LoadConfiguration() {
         Log("Adaptive interpolation gate enabled: skeletal interpolation is "
             "shed before transform interpolation, with cadence hysteresis and "
             "measured-cost recovery.");
+        if (g_fullInterpolationInCutscenes) {
+            Log("Cutscenes keep every configured interpolation layer enabled "
+                "and are excluded from adaptive cadence measurement.");
+        }
+        if (g_fullInterpolationInSlowMotion) {
+            Log("Slow motion keeps every configured interpolation layer "
+                "enabled and is excluded from adaptive cadence measurement.");
+        }
     }
 }
 
@@ -1367,6 +1498,27 @@ bool ValidateHookSignatures(const ExecutableImageLayout& image) {
     return true;
 }
 
+bool ValidateMouseLookDeltaSite(const ExecutableImageLayout& image) {
+    const std::uintptr_t slotRva =
+        g_layout->gameVtable.rva + kGameClockDeltaVtableSlot * sizeof(std::uintptr_t);
+    if (!ValidateCodeRange(image, g_layout->mouseLookDeltaSiteRva,
+                           sizeof(kExpectedMouseLookDeltaSite), "mouse-look delta read") ||
+        !ValidateImageRange(image, slotRva, sizeof(std::uintptr_t), IMAGE_SCN_MEM_READ,
+                            IMAGE_SCN_MEM_WRITE | IMAGE_SCN_MEM_EXECUTE,
+                            "idGameLocal clock-delta slot")) {
+        return false;
+    }
+    std::uintptr_t accessor = 0;
+    memcpy(&accessor, reinterpret_cast<const void*>(g_executableBase + slotRva), sizeof(accessor));
+    if (memcmp(reinterpret_cast<const void*>(g_executableBase + g_layout->mouseLookDeltaSiteRva),
+               kExpectedMouseLookDeltaSite, sizeof(kExpectedMouseLookDeltaSite)) != 0 ||
+        accessor != g_executableBase + g_layout->clockDeltaAccessorRva) {
+        Log("Mouse-look delta read does not match the %s layout.", g_layout->name);
+        return false;
+    }
+    return true;
+}
+
 bool ValidateSelectedLayout(const ExecutableImageLayout& image) {
     return ValidateViewCopyCallRelationship(image) &&
            ValidateMutableDataRange(image, g_layout->gamePointerRva,
@@ -1379,9 +1531,13 @@ bool ValidateSelectedLayout(const ExecutableImageLayout& image) {
              ValidateMutableDataRange(image, g_layout->tripleBufferingRva, sizeof(LONG),
                                       "triple-buffering cvar cache"))) &&
            (!g_stabilizeMouseSensitivity ||
-            ValidateMutableDataRange(image, g_layout->fixMouseSensibilityRva,
-                                     sizeof(LONG),
-                                     "mouse-sensitivity cvar cache")) &&
+            (ValidateMutableDataRange(image, g_layout->fixMouseSensibilityRva,
+                                      sizeof(LONG),
+                                      "mouse-sensitivity cvar cache") &&
+             ValidateMouseLookDeltaSite(image))) &&
+           (!g_enableAdaptiveInterpolation || !g_fullInterpolationInCutscenes ||
+            ValidateVtable(image, g_layout->cinematicGameLogicStateVtable,
+                           "cinematic game-logic state vtable")) &&
            ValidateHookSignatures(image);
 }
 
@@ -2411,6 +2567,16 @@ WorldTransformTrack* FindWorldTransformTrack(const void* renderModel, const void
     return result;
 }
 
+// Ownerless exact-skinned models are limited to small cinematic controls,
+// except during slow motion, where full characters (for example in takedowns)
+// may also be ownerless. Every identity, rigidity, and continuity guard still
+// applies.
+std::uint32_t OwnerlessSkinnedJointLimit() {
+    return g_slowMotionActive.load(std::memory_order_relaxed)
+        ? static_cast<std::uint32_t>(kMaximumJointCount)
+        : kMaximumCinematicJointCount;
+}
+
 bool IsEligibleWorldRenderModel(const void* renderModel, const void*& owner,
                                  std::uintptr_t& vtable,
                                  const void*& modelAsset,
@@ -2492,7 +2658,7 @@ bool IsEligibleWorldRenderModel(const void* renderModel, const void*& owner,
                        kRenderModelOwnerOffset, sizeof(owner));
     if (owner == nullptr) {
         if (!exactSkinned || !g_interpolateCinematicTransforms ||
-            jointCount > kMaximumCinematicJointCount) {
+            jointCount > OwnerlessSkinnedJointLimit()) {
             g_worldDiagnostics.ownerRejected.fetch_add(
                 1, std::memory_order_relaxed);
             return false;
@@ -2501,6 +2667,10 @@ bool IsEligibleWorldRenderModel(const void* renderModel, const void*& owner,
         cinematic = true;
         g_worldDiagnostics.cinematicEligible.fetch_add(
             1, std::memory_order_relaxed);
+        if (jointCount > kMaximumCinematicJointCount) {
+            g_worldDiagnostics.slowMotionCharacters.fetch_add(
+                1, std::memory_order_relaxed);
+        }
     } else if (exactSkinned &&
                (!g_interpolateWorldTransforms ||
                 !g_interpolateWorldSkeletons)) {
@@ -2610,8 +2780,9 @@ bool BuildWorldTransformCorrection(const void* renderModel,
     }
 
     track->lastSeenSerial = context.serial;
+    const double maximumInterval = kMaximumWorldStateInterval * context.intervalScale;
     if (context.simulationTime < track->currentTime - kTimeEpsilon ||
-        context.simulationTime - track->currentTime > kMaximumWorldStateInterval) {
+        context.simulationTime - track->currentTime > maximumInterval) {
         g_worldDiagnostics.discontinuityRejected.fetch_add(1,
                                                            std::memory_order_relaxed);
         const void* savedModel = track->renderModel;
@@ -2706,7 +2877,7 @@ bool BuildWorldTransformCorrection(const void* renderModel,
         trackedPreviousSupported && trackedCurrentSupported &&
         trackedPreviousReflected != trackedCurrentReflected;
     const bool invalidPair = !track->hasPair || !(interval > kTimeEpsilon) ||
-                             interval > kMaximumWorldStateInterval ||
+                             interval > maximumInterval ||
                              !trackedPreviousSupported ||
                              !trackedCurrentSupported ||
                              reflectionParityMismatch;
@@ -3353,13 +3524,17 @@ void MaybeLogWorldTransformDiagnostics(const PresentationContext& context) {
             g_nonRigidTrackCapacityMissCount.load(std::memory_order_relaxed)),
         observed);
 
-    Log("World cinematic frame=%llu: eligible=%llu adjusted=%llu.",
+    Log("World cinematic frame=%llu: eligible=%llu adjusted=%llu "
+        "slowMotionCharacters=%llu.",
         static_cast<unsigned long long>(context.serial),
         static_cast<unsigned long long>(
             g_worldDiagnostics.cinematicEligible.load(
                 std::memory_order_relaxed)),
         static_cast<unsigned long long>(
             g_worldDiagnostics.cinematicAdjusted.load(
+                std::memory_order_relaxed)),
+        static_cast<unsigned long long>(
+            g_worldDiagnostics.slowMotionCharacters.load(
                 std::memory_order_relaxed)));
 
     if (g_interpolateShadowTransforms) {
@@ -3830,7 +4005,7 @@ bool PrepareSkeletalPose(
     if (!ownerReadable) {
         if (!firstPerson) {
             if (!g_interpolateCinematicSkeletons ||
-                jointCount > kMaximumCinematicJointCount) {
+                jointCount > OwnerlessSkinnedJointLimit()) {
                 PresentationContext ownerlessContext{};
                 if (ReadPresentationContext(ownerlessContext)) {
                     ObserveOwnerlessSkeletalModel(
@@ -3841,14 +4016,19 @@ bool PrepareSkeletalPose(
                     1, std::memory_order_relaxed);
                 return false;
             }
-            // Small exact-skinned cinematic attachments may be renderer-owned
-            // and omit the ordinary world entity owner. Keep this separate
-            // from WorldSkeletons, use the validated model asset as the second
-            // identity component, and retain all palette/layout guards.
+            // Small exact-skinned cinematic attachments, and during slow motion
+            // full characters, may be renderer-owned and omit the ordinary
+            // world entity owner. Keep this separate from WorldSkeletons, use
+            // the validated model asset as the second identity component, and
+            // retain all palette/layout guards.
             trackOwner = modelAsset;
             cinematic = true;
             g_skeletalDiagnostics.cinematicEligible.fetch_add(
                 1, std::memory_order_relaxed);
+            if (jointCount > kMaximumCinematicJointCount) {
+                g_skeletalDiagnostics.slowMotionCharacters.fetch_add(
+                    1, std::memory_order_relaxed);
+            }
         } else {
             // Depth-hacked viewmodels are renderer-owned and may not expose the
             // world-entity owner used by ordinary skinned models. The validated
@@ -3945,7 +4125,7 @@ bool PrepareSkeletalPose(
             track->hasPair = false;
         } else if (paletteRigid && track->hasSnapshot && !firstSample &&
                    interval > kTimeEpsilon &&
-                   interval <= kMaximumSkeletalStateInterval &&
+                   interval <= kMaximumSkeletalStateInterval * context.intervalScale &&
                    (!changed || JointPalettesAreContinuous(
                        track->currentPalette.data(), palette, jointCount))) {
             track->previousTime = track->simulationTime;
@@ -4039,7 +4219,7 @@ bool PrepareSkeletalPose(
         (!track->hasPresentedOutput ||
          track->lastPresentedSerial != context.serial) &&
         pairInterval > kTimeEpsilon &&
-        pairInterval <= kMaximumSkeletalStateInterval) {
+        pairInterval <= kMaximumSkeletalStateInterval * context.intervalScale) {
         const double alpha = Clamp(
             (context.scaledTime - track->previousTime) / pairInterval,
             kMinimumAlpha, kMaximumAlpha);
@@ -4505,7 +4685,8 @@ void MaybeLogSkeletalDiagnostics(const PresentationContext& context) {
                 std::memory_order_relaxed)));
 
     Log("Skeletal cinematic frame=%llu: eligible=%llu pairs=%llu "
-        "prepared=%llu adjusted=%llu forced=%llu frames=%llu.",
+        "prepared=%llu adjusted=%llu forced=%llu frames=%llu "
+        "slowMotionCharacters=%llu.",
         static_cast<unsigned long long>(context.serial),
         static_cast<unsigned long long>(
             g_skeletalDiagnostics.cinematicEligible.load(
@@ -4524,6 +4705,9 @@ void MaybeLogSkeletalDiagnostics(const PresentationContext& context) {
                 std::memory_order_relaxed)),
         static_cast<unsigned long long>(
             g_skeletalDiagnostics.cinematicAdjustedFrames.load(
+                std::memory_order_relaxed)),
+        static_cast<unsigned long long>(
+            g_skeletalDiagnostics.slowMotionCharacters.load(
                 std::memory_order_relaxed)));
 
     std::array<SkeletalTrackReport, kSkeletalTrackReportCapacity> reports{};
@@ -4984,6 +5168,7 @@ void PublishPresentationContext() {
         memcpy(&context.scaledTime, clock + kScaledTimeOffset, sizeof(context.scaledTime));
         memcpy(&context.simulationTime, clock + kSimulationTimeOffset,
                sizeof(context.simulationTime));
+        context.intervalScale = SampleIntervalScale();
         context.valid = std::isfinite(context.scaledTime) &&
                         std::isfinite(context.simulationTime);
     }
@@ -5050,18 +5235,22 @@ const char* AdaptiveInterpolationModeName(AdaptiveInterpolationMode mode) {
     return "unknown";
 }
 
-void SetAdaptiveInterpolationMode(AdaptiveInterpolationMode mode,
-                                  double measuredFps,
-                                  double predictedFps,
-                                  const char* reason) {
-    g_adaptiveInterpolationGate.mode = mode;
-    g_adaptiveInterpolationGate.recoveryWindows = 0;
+void ApplyAdaptiveInterpolationModeFlags(AdaptiveInterpolationMode mode) {
     g_transformInterpolationRuntimeEnabled.store(
         mode != AdaptiveInterpolationMode::Off,
         std::memory_order_relaxed);
     g_skeletalInterpolationRuntimeEnabled.store(
         mode == AdaptiveInterpolationMode::All,
         std::memory_order_relaxed);
+}
+
+void SetAdaptiveInterpolationMode(AdaptiveInterpolationMode mode,
+                                  double measuredFps,
+                                  double predictedFps,
+                                  const char* reason) {
+    g_adaptiveInterpolationGate.mode = mode;
+    g_adaptiveInterpolationGate.recoveryWindows = 0;
+    ApplyAdaptiveInterpolationModeFlags(mode);
     if (std::isfinite(predictedFps)) {
         Log("Adaptive interpolation -> %s: measured cadence %.2f FPS, "
             "predicted next-profile cadence %.2f FPS (%s).",
@@ -5087,6 +5276,414 @@ void SuspendAdaptiveInterpolationForManualControl() {
     }
 }
 
+// While a cutscene or slow motion keeps every configured layer on, the gate's
+// own mode waits underneath and returns once neither override applies.
+void ApplyAdaptiveInterpolationRuntimeFlags(const AdaptiveInterpolationGateState& gate) {
+    if (gate.cutsceneOverride || gate.slowMotionOverride) {
+        g_transformInterpolationRuntimeEnabled.store(true, std::memory_order_relaxed);
+        g_skeletalInterpolationRuntimeEnabled.store(true, std::memory_order_relaxed);
+    } else {
+        ApplyAdaptiveInterpolationModeFlags(gate.mode);
+    }
+}
+
+// Override frames do not describe gameplay cost, nor does a window spanning
+// an override's edges, so restart measurement and drop pending cost learning.
+void RestartAdaptiveMeasurement(AdaptiveInterpolationGateState& gate,
+                                const PresentationContext& context) {
+    ResetAdaptiveInterpolationWindow();
+    gate.recoveryWindows = 0;
+    gate.learnSkeletalPenalty = false;
+    gate.learnTransformPenalty = false;
+    gate.previousScaledTime = context.scaledTime;
+    gate.previousSimulationTime = context.simulationTime;
+}
+
+// Slow motion (kill cams, executions, slowed-time powers) ramps the clock's
+// timer 3 and timer 4 scales down together. The clock update derives the tick
+// count from the larger of the two times the scaled timer's scale and divides
+// each tick's simulation advance by that larger scale, so ticks become rarer
+// and longer: new states arrive less often than frames, and further apart.
+constexpr double kSlowMotionEnterTickRate = 0.75;
+constexpr double kSlowMotionExitTickRate = 0.90;
+constexpr double kMaximumClockScale = 4.0;
+constexpr double kMinimumIntervalTickScale = 0.05;
+constexpr double kIntervalScaleHoldSeconds = 0.5;
+constexpr double kTimeScaleLogIntervalSeconds = 0.25;
+constexpr float kTimeScaleLogThreshold = 0.01f;
+constexpr std::uint32_t kTimeScaleLogLineLimit = 2000;
+
+enum class SlowMotionTransition {
+    None,
+    Started,
+    Ended,
+};
+
+struct ClockTimeScales {
+    bool valid = false;
+    double scaledTime = 0.0;
+    double simulationTime = 0.0;
+    float scaled = 0.0f;
+    float simulation = 0.0f;
+    float simulationTarget = 0.0f;
+    float timer3 = 0.0f;
+    float timer3Target = 0.0f;
+    float timer4 = 0.0f;
+    float timer4Target = 0.0f;
+    std::int32_t frameTicks = -1;
+};
+
+ClockTimeScales ReadClockTimeScales() {
+    ClockTimeScales scales{};
+    auto* game = *reinterpret_cast<unsigned char**>(g_executableBase + g_layout->gamePointerRva);
+    if (game == nullptr || *reinterpret_cast<std::uintptr_t*>(game) !=
+                               g_executableBase + g_layout->gameVtable.rva) {
+        return scales;
+    }
+    const unsigned char* clock = game + kClockOffset;
+    memcpy(&scales.scaledTime, clock + kScaledTimeOffset, sizeof(scales.scaledTime));
+    memcpy(&scales.simulationTime, clock + kSimulationTimeOffset,
+           sizeof(scales.simulationTime));
+    memcpy(&scales.scaled, clock + kClockScaledTimerScaleOffset, sizeof(float));
+    memcpy(&scales.simulation, clock + kClockSimulationTimerScaleOffset, sizeof(float));
+    memcpy(&scales.simulationTarget, clock + kClockSimulationTimerTargetScaleOffset,
+           sizeof(float));
+    memcpy(&scales.timer3, clock + kClockTimer3ScaleOffset, sizeof(float));
+    memcpy(&scales.timer3Target, clock + kClockTimer3TargetScaleOffset, sizeof(float));
+    memcpy(&scales.timer4, clock + kClockTimer4ScaleOffset, sizeof(float));
+    memcpy(&scales.timer4Target, clock + kClockTimer4TargetScaleOffset, sizeof(float));
+    memcpy(&scales.frameTicks, clock + kClockFrameTickCountOffset,
+           sizeof(scales.frameTicks));
+    scales.valid = true;
+    return scales;
+}
+
+struct ClockTickScale {
+    bool valid = false;
+    // Simulation ticks per real second relative to the native 120.
+    double tickRate = 1.0;
+    // A tick advances simulation time by the native step divided by this.
+    double tickScale = 1.0;
+};
+
+ClockTickScale ComputeClockTickScale(const ClockTimeScales& scales) {
+    ClockTickScale result{};
+    const double scaled = scales.scaled;
+    const double timer3 = scales.timer3;
+    const double timer4 = scales.timer4;
+    if (!scales.valid || !std::isfinite(scaled) || !std::isfinite(timer3) ||
+        !std::isfinite(timer4) || scaled < 0.0 || scaled > kMaximumClockScale ||
+        timer3 > kMaximumClockScale || timer4 > kMaximumClockScale) {
+        return result;
+    }
+    result.valid = true;
+    result.tickScale = std::max(0.0, std::max(timer3, timer4));
+    result.tickRate = scaled * result.tickScale;
+    return result;
+}
+
+// The scales ramp smoothly, so the tick rate needs only hysteresis. A zero
+// rate is stopped time and leaves the state unchanged.
+SlowMotionTransition UpdateSlowMotionState(bool& active, double tickRate) {
+    if (!(tickRate > 0.0)) {
+        return SlowMotionTransition::None;
+    }
+    if (!active && tickRate < kSlowMotionEnterTickRate) {
+        active = true;
+        return SlowMotionTransition::Started;
+    }
+    if (active && tickRate >= kSlowMotionExitTickRate) {
+        active = false;
+        return SlowMotionTransition::Ended;
+    }
+    return SlowMotionTransition::None;
+}
+
+struct IntervalScaleState {
+    double deepestTickScale = 1.0;
+    double deepestScaledTime = 0.0;
+};
+
+// The sample-interval limits are written for native ticks, which slow motion
+// lengthens by 1 / tickScale. Hold the deepest recent scale briefly so a pair
+// captured during the slowdown still validates while the timers ramp back up.
+double UpdateIntervalScale(IntervalScaleState& state, double tickScale,
+                           double scaledTime) {
+    const double clamped = Clamp(tickScale, kMinimumIntervalTickScale, 1.0);
+    const double held = scaledTime - state.deepestScaledTime;
+    if (clamped <= state.deepestTickScale ||
+        !(held >= 0.0 && held <= kIntervalScaleHoldSeconds)) {
+        state.deepestTickScale = clamped;
+        state.deepestScaledTime = scaledTime;
+    }
+    return 1.0 / state.deepestTickScale;
+}
+
+struct ClockTimeScaleMonitor {
+    bool slowMotion = false;
+    IntervalScaleState intervalState{};
+    double intervalScale = 1.0;
+    bool hasPrevious = false;
+    double previousScaledTime = 0.0;
+    double previousSimulationTime = 0.0;
+    double periodStartScaledTime = 0.0;
+    double periodMinimumTickRate = 1.0;
+    double periodMaximumSimulationStep = 0.0;
+    double periodMaximumIntervalScale = 1.0;
+    bool hasLoggedScales = false;
+    std::array<float, 7> loggedScales{};
+    double secondsSinceScaleLog = 0.0;
+    std::uint32_t scaleLogLines = 0;
+};
+
+ClockTimeScaleMonitor g_clockTimeScaleMonitor;
+
+bool SlowMotionActive() {
+    return g_slowMotionActive.load(std::memory_order_relaxed);
+}
+
+double SampleIntervalScale() {
+    return g_clockTimeScaleMonitor.intervalScale;
+}
+
+bool TimeScaleChanged(float logged, float current) {
+    if (std::isnan(logged) && std::isnan(current)) {
+        return false;
+    }
+    return !(std::abs(current - logged) < kTimeScaleLogThreshold);
+}
+
+// Logs the clock's time scales whenever they move away from the last logged
+// values, at most four times a second and for a bounded number of lines.
+void MaybeLogClockTimeScales(ClockTimeScaleMonitor& monitor,
+                             const ClockTimeScales& scales,
+                             double elapsedSeconds) {
+    monitor.secondsSinceScaleLog += elapsedSeconds;
+    if (monitor.scaleLogLines >= kTimeScaleLogLineLimit) {
+        return;
+    }
+    const std::array<float, 7> values = {
+        scales.scaled, scales.simulation, scales.simulationTarget, scales.timer3,
+        scales.timer3Target, scales.timer4, scales.timer4Target,
+    };
+    bool changed = !monitor.hasLoggedScales;
+    for (std::size_t index = 0; index < values.size() && !changed; ++index) {
+        changed = TimeScaleChanged(monitor.loggedScales[index], values[index]);
+    }
+    if (!changed || (monitor.hasLoggedScales &&
+                     monitor.secondsSinceScaleLog < kTimeScaleLogIntervalSeconds)) {
+        return;
+    }
+    monitor.hasLoggedScales = true;
+    monitor.loggedScales = values;
+    monitor.secondsSinceScaleLog = 0.0;
+    ++monitor.scaleLogLines;
+    Log("Clock time scales: scaled %.3f, simulation %.3f (target %.3f), "
+        "timer3 %.3f (target %.3f), timer4 %.3f (target %.3f); %d ticks this "
+        "frame.%s",
+        scales.scaled, scales.simulation, scales.simulationTarget, scales.timer3,
+        scales.timer3Target, scales.timer4, scales.timer4Target, scales.frameTicks,
+        monitor.scaleLogLines == kTimeScaleLogLineLimit
+            ? " Later time-scale changes are not logged this session."
+            : "");
+}
+
+// Runs once per presented frame, before any layer evaluates it: keeps the
+// slow-motion state and the sample-interval scale current and logs both.
+void UpdateClockTimeScaleMonitor() {
+    ClockTimeScaleMonitor& monitor = g_clockTimeScaleMonitor;
+    const ClockTimeScales scales = ReadClockTimeScales();
+    const ClockTickScale tick = ComputeClockTickScale(scales);
+    if (!tick.valid || !std::isfinite(scales.scaledTime) ||
+        !std::isfinite(scales.simulationTime)) {
+        monitor.intervalScale = 1.0;
+        monitor.hasPrevious = false;
+        return;
+    }
+    const double scaledDelta = monitor.hasPrevious
+        ? scales.scaledTime - monitor.previousScaledTime
+        : 0.0;
+    const double simulationStep = monitor.hasPrevious
+        ? scales.simulationTime - monitor.previousSimulationTime
+        : 0.0;
+    monitor.hasPrevious = true;
+    monitor.previousScaledTime = scales.scaledTime;
+    monitor.previousSimulationTime = scales.simulationTime;
+    monitor.intervalScale = UpdateIntervalScale(monitor.intervalState, tick.tickScale,
+                                                scales.scaledTime);
+
+    const SlowMotionTransition transition =
+        UpdateSlowMotionState(monitor.slowMotion, tick.tickRate);
+    g_slowMotionActive.store(monitor.slowMotion, std::memory_order_relaxed);
+    if (transition == SlowMotionTransition::Started) {
+        monitor.periodStartScaledTime = scales.scaledTime;
+        monitor.periodMinimumTickRate = tick.tickRate;
+        monitor.periodMaximumSimulationStep = 0.0;
+        monitor.periodMaximumIntervalScale = monitor.intervalScale;
+        if (g_logTimeScale) {
+            Log("Slow motion detected: simulation ticks at %.0f%% of the native "
+                "rate (timer3 %.3f, timer4 %.3f, scaled %.3f).",
+                tick.tickRate * 100.0, scales.timer3, scales.timer4, scales.scaled);
+        }
+    }
+    if (monitor.slowMotion || transition == SlowMotionTransition::Ended) {
+        monitor.periodMinimumTickRate =
+            std::min(monitor.periodMinimumTickRate, tick.tickRate);
+        if (simulationStep > 0.0 && simulationStep < 1.0) {
+            monitor.periodMaximumSimulationStep =
+                std::max(monitor.periodMaximumSimulationStep, simulationStep);
+        }
+        monitor.periodMaximumIntervalScale =
+            std::max(monitor.periodMaximumIntervalScale, monitor.intervalScale);
+    }
+    if (transition == SlowMotionTransition::Ended && g_logTimeScale) {
+        Log("Normal time resumed after %.2f s of slow motion: deepest tick rate "
+            "%.0f%% of native, longest simulation step between frames %.1f ms "
+            "(interpolation limit up to %.0f ms).",
+            scales.scaledTime - monitor.periodStartScaledTime,
+            monitor.periodMinimumTickRate * 100.0,
+            monitor.periodMaximumSimulationStep * 1000.0,
+            kMaximumStateInterval * monitor.periodMaximumIntervalScale * 1000.0);
+    }
+    if (g_logTimeScale) {
+        MaybeLogClockTimeScales(monitor, scales, Clamp(scaledDelta, 0.0, 1.0));
+    }
+}
+
+const char* GameLogicStateName(std::int32_t state) {
+    static constexpr const char* kNames[kGameLogicStateCount] = {
+        "none", "in-game", "pause", "notification", "read-note", "cinematic",
+        "main-menu", "journal", "power-wheel", "conversation", "black-market",
+        "results", "tutorial", "game-over", "character-choice",
+        "map-transition", "demo",
+    };
+    if (state < 0) {
+        return "empty";
+    }
+    return state < kGameLogicStateCount ? kNames[state] : "unknown";
+}
+
+struct GameLogicStackSnapshot {
+    bool valid = false;
+    bool cinematic = false;
+    bool cinematicStateMismatch = false;
+    std::int32_t top = -1;
+};
+
+// Reads the game-logic state stack of the idGameLocal that supplies the
+// presentation clock. Any failed identity check leaves the snapshot invalid.
+GameLogicStackSnapshot ReadGameLogicStack() {
+    GameLogicStackSnapshot snapshot{};
+    auto* game = *reinterpret_cast<unsigned char**>(g_executableBase + g_layout->gamePointerRva);
+    if (game == nullptr || *reinterpret_cast<std::uintptr_t*>(game) !=
+                               g_executableBase + g_layout->gameVtable.rva) {
+        return snapshot;
+    }
+
+    const unsigned char* manager = game + kGameLogicManagerOffset;
+    unsigned char* owner = nullptr;
+    std::uint32_t count = 0;
+    const std::int32_t* ids = nullptr;
+    memcpy(&owner, manager + kGameLogicOwnerOffset, sizeof(owner));
+    memcpy(&count, manager + kGameLogicStackCountOffset, sizeof(count));
+    memcpy(&ids, manager + kGameLogicStackDataOffset, sizeof(ids));
+    count &= 0xFFFFFF;
+    if (owner != game || count > kGameLogicStackLimit ||
+        (count != 0 && !IsReadableMemory(ids, count * sizeof(std::int32_t)))) {
+        return snapshot;
+    }
+
+    snapshot.valid = true;
+    for (std::uint32_t index = 0; index < count; ++index) {
+        snapshot.cinematic = snapshot.cinematic || ids[index] == kGameLogicStateCinematic;
+    }
+    snapshot.top = count != 0 ? ids[count - 1] : -1;
+    if (snapshot.cinematic) {
+        // Fail closed unless the cinematic slot holds the engine's own
+        // arkGameLogicStateCinematic object.
+        const unsigned char* state = nullptr;
+        memcpy(&state, manager + kGameLogicStatesOffset +
+                           kGameLogicStateCinematic * sizeof(void*), sizeof(state));
+        std::uintptr_t vtable = 0;
+        if (IsReadableMemory(state, sizeof(vtable))) {
+            memcpy(&vtable, state, sizeof(vtable));
+        }
+        if (vtable != g_executableBase + g_layout->cinematicGameLogicStateVtable.rva) {
+            snapshot.cinematic = false;
+            snapshot.cinematicStateMismatch = true;
+        }
+    }
+    return snapshot;
+}
+
+// Cutscenes are not gameplay, so a lower frame rate there is not worth
+// stepping visibly. While the cinematic game-logic state is active, keep every
+// configured layer on and leave adaptive cadence unmeasured; afterwards the
+// gate resumes in the mode it had chosen for gameplay.
+bool UpdateCutsceneInterpolationOverride(AdaptiveInterpolationGateState& gate,
+                                         const PresentationContext& context) {
+    if (!g_fullInterpolationInCutscenes || gate.cutsceneDetectionFailed) {
+        return false;
+    }
+
+    const GameLogicStackSnapshot stack = ReadGameLogicStack();
+    if (stack.cinematicStateMismatch) {
+        gate.cutsceneDetectionFailed = true;
+        Log("The cinematic game-logic slot does not hold the expected state "
+            "object; cutscene detection is disabled for this session.");
+    } else if (stack.valid && stack.top != gate.lastGameLogicState) {
+        Log("Game-logic state: %s -> %s.",
+            GameLogicStateName(gate.lastGameLogicState),
+            GameLogicStateName(stack.top));
+        gate.lastGameLogicState = stack.top;
+    }
+
+    const bool cutscene = !gate.cutsceneDetectionFailed && stack.valid && stack.cinematic;
+    if (cutscene != gate.cutsceneOverride) {
+        gate.cutsceneOverride = cutscene;
+        RestartAdaptiveMeasurement(gate, context);
+        ApplyAdaptiveInterpolationRuntimeFlags(gate);
+        if (cutscene) {
+            Log("Cutscene started: all configured interpolation layers are enabled "
+                "and adaptive measurement is paused.");
+        } else if (gate.slowMotionOverride) {
+            Log("Cutscene ended; slow motion keeps every configured "
+                "interpolation layer enabled.");
+        } else {
+            Log("Cutscene ended: adaptive interpolation resumes in %s mode.",
+                AdaptiveInterpolationModeName(gate.mode));
+        }
+    }
+    return gate.cutsceneOverride;
+}
+
+// Slow motion is where the layers matter most: the game delivers new states
+// less often than frames. Keep every configured layer on while it lasts and
+// leave adaptive cadence unmeasured, as for cutscenes.
+bool UpdateSlowMotionInterpolationOverride(AdaptiveInterpolationGateState& gate,
+                                           const PresentationContext& context) {
+    if (!g_fullInterpolationInSlowMotion) {
+        return false;
+    }
+    const bool slowMotion = SlowMotionActive();
+    if (slowMotion != gate.slowMotionOverride) {
+        gate.slowMotionOverride = slowMotion;
+        RestartAdaptiveMeasurement(gate, context);
+        ApplyAdaptiveInterpolationRuntimeFlags(gate);
+        if (slowMotion) {
+            Log("Slow motion started: all configured interpolation layers are "
+                "enabled and adaptive measurement is paused.");
+        } else if (gate.cutsceneOverride) {
+            Log("Slow motion ended; the cutscene keeps every configured "
+                "interpolation layer enabled.");
+        } else {
+            Log("Slow motion ended: adaptive interpolation resumes in %s mode.",
+                AdaptiveInterpolationModeName(gate.mode));
+        }
+    }
+    return gate.slowMotionOverride;
+}
+
 void UpdateAdaptiveInterpolationGate(const PresentationContext& context) {
     if (!g_enableAdaptiveInterpolation || g_enableInterpolationAbProbe ||
         g_adaptiveInterpolationManualOverride.load(std::memory_order_relaxed) ||
@@ -5100,6 +5697,11 @@ void UpdateAdaptiveInterpolationGate(const PresentationContext& context) {
         gate.previousScaledTime = context.scaledTime;
         gate.previousSimulationTime = context.simulationTime;
         gate.mode = AdaptiveInterpolationMode::All;
+        return;
+    }
+    const bool cutscene = UpdateCutsceneInterpolationOverride(gate, context);
+    const bool slowMotion = UpdateSlowMotionInterpolationOverride(gate, context);
+    if (cutscene || slowMotion) {
         return;
     }
 
@@ -5823,13 +6425,99 @@ void HandleInterpolationAbControls() {
     g_f11WasDown = f11IsDown;
 }
 
-void ResetPrediction(const void* source, double simulationTime, const Transform& transform) {
-    g_prediction.initialized = true;
-    g_prediction.sourceView = source;
-    g_prediction.previousTime = simulationTime;
-    g_prediction.currentTime = simulationTime;
-    g_prediction.previous = transform;
-    g_prediction.current = transform;
+void ResetPrediction(PredictionState& state, const void* source, double simulationTime,
+                     double scaledTime, const Transform& transform) {
+    state.initialized = true;
+    state.sourceView = source;
+    state.previousTime = simulationTime;
+    state.currentTime = simulationTime;
+    state.previousCaptureTime = scaledTime;
+    state.currentCaptureTime = scaledTime;
+    state.previous = transform;
+    state.current = transform;
+}
+
+// Advances the camera history with this frame's raw renderer camera and
+// evaluates it at the scaled presentation time; false leaves the raw camera.
+// Position follows the simulation-time spacing of the two samples. Mouse look
+// is applied once per game frame from input gathered in real time, so with
+// realTimeTurn the rotation follows the scaled time between the frames that
+// produced the samples instead: raw on every frame that ran a tick, and
+// extrapolated only across frames that ran none. maximumInterval is the
+// longest sample spacing that may be blended.
+bool PredictCamera(PredictionState& state, const void* source, double scaledTime,
+                   double simulationTime, const Transform& raw, bool realTimeTurn,
+                   double maximumInterval, Transform& predicted, double& alpha) {
+    if (!state.initialized || state.sourceView != source ||
+        simulationTime < state.currentTime - kTimeEpsilon) {
+        ResetPrediction(state, source, simulationTime, scaledTime, raw);
+        return false;
+    }
+
+    if (simulationTime > state.currentTime + kTimeEpsilon) {
+        const double interval = simulationTime - state.currentTime;
+        if (interval > maximumInterval ||
+            PositionDistance(state.current, raw) > kMaximumPositionJump ||
+            RotationDistanceDegrees(state.current, raw) > kMaximumRotationJumpDegrees) {
+            ResetPrediction(state, source, simulationTime, scaledTime, raw);
+            return false;
+        }
+        state.previousTime = state.currentTime;
+        state.previousCaptureTime = state.currentCaptureTime;
+        state.previous = state.current;
+        state.currentTime = simulationTime;
+        state.currentCaptureTime = scaledTime;
+        state.current = raw;
+    }
+
+    const double interval = state.currentTime - state.previousTime;
+    if (!(interval > kTimeEpsilon) || interval > maximumInterval) {
+        return false;
+    }
+
+    alpha = Clamp((scaledTime - state.previousTime) / interval,
+                  kMinimumAlpha, kMaximumAlpha);
+    double rotationAlpha = alpha;
+    const double captureInterval = state.currentCaptureTime - state.previousCaptureTime;
+    if (realTimeTurn && captureInterval > kTimeEpsilon) {
+        rotationAlpha = Clamp((scaledTime - state.previousCaptureTime) / captureInterval,
+                              kMinimumAlpha, kMaximumAlpha);
+    }
+    predicted.origin = {
+        state.previous.origin.x +
+            alpha * (state.current.origin.x - state.previous.origin.x),
+        state.previous.origin.y +
+            alpha * (state.current.origin.y - state.previous.origin.y),
+        state.previous.origin.z +
+            alpha * (state.current.origin.z - state.previous.origin.z),
+    };
+    const Quaternion previousRotation = MatrixToQuaternion(state.previous.axis);
+    const Quaternion currentRotation = MatrixToQuaternion(state.current.axis);
+    QuaternionToMatrix(SlerpUnclamped(previousRotation, currentRotation, rotationAlpha),
+                       predicted.axis);
+    return true;
+}
+
+// The real-time rule suits only a mouse-driven camera. Cutscenes, menus, and
+// every other game-logic state keep the simulation-time rotation rule.
+bool UseRealTimeTurnPrediction() {
+    if (!g_realTimeTurnPrediction ||
+        !g_realTimeTurnRuntimeEnabled.load(std::memory_order_relaxed)) {
+        return false;
+    }
+    const GameLogicStackSnapshot stack = ReadGameLogicStack();
+    return stack.valid && !stack.cinematic && stack.top == kGameLogicStateInGame;
+}
+
+void ToggleRealTimeTurnPrediction() {
+    if (!g_realTimeTurnPrediction) {
+        Log("Ctrl+Shift+F10: real-time turn prediction is disabled by configuration.");
+        return;
+    }
+    const bool nowEnabled = !g_realTimeTurnRuntimeEnabled.load(std::memory_order_relaxed);
+    g_realTimeTurnRuntimeEnabled.store(nowEnabled, std::memory_order_relaxed);
+    Log("Ctrl+Shift+F10: camera rotation now uses the %s rule.",
+        nowEnabled ? "real-time (mouse-look)" : "previous simulation-time");
 }
 
 bool IsWritableMemory(const void* address, std::size_t size) {
@@ -5935,6 +6623,12 @@ void TryStabilizeMouseSensitivity() {
         return;
     }
 
+    // Without the simulation-delta patch, the cvar's frame-time path would
+    // reintroduce the FPS-dependent gain, so leave the game's choice alone.
+    if (!g_mouseLookDeltaPatched) {
+        return;
+    }
+
     auto* fixMouseSensibility = reinterpret_cast<volatile LONG*>(
         g_executableBase + g_layout->fixMouseSensibilityRva);
     const LONG value = *fixMouseSensibility;
@@ -5945,17 +6639,22 @@ void TryStabilizeMouseSensitivity() {
         return;
     }
 
+    // g_fixMouseSensibility=1 selects the scaler patched to divide by the
+    // simulation delta; the 0 path multiplies the turn by the frame's tick
+    // count, so it speeds up below 120 FPS.
     int expected = 0;
-    if (value == 0) {
+    if (value == 1) {
         if (g_mouseStabilizationState.compare_exchange_strong(expected, 2)) {
-            Log("Mouse sensitivity is already stable: g_fixMouseSensibility=0.");
+            Log("Mouse sensitivity is stable: g_fixMouseSensibility=1 with the "
+                "simulation-delta look scaling.");
         }
         return;
     }
 
     if (g_mouseStabilizationState.compare_exchange_strong(expected, 1)) {
-        InterlockedExchange(fixMouseSensibility, 0);
-        Log("Stabilized mouse sensitivity by applying g_fixMouseSensibility=0.");
+        InterlockedExchange(fixMouseSensibility, 1);
+        Log("Stabilized mouse sensitivity by applying g_fixMouseSensibility=1 with "
+            "the simulation-delta look scaling.");
     }
 }
 
@@ -5970,8 +6669,11 @@ void ApplyPrediction(void* destination, const void* source) {
     const bool f10IsDown = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
     const bool controlIsDown = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
     const bool altIsDown = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+    const bool shiftIsDown = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
     if (f10IsDown && !g_f10WasDown && controlIsDown && altIsDown) {
         CycleScreenParticleMode();
+    } else if (f10IsDown && !g_f10WasDown && controlIsDown && shiftIsDown) {
+        ToggleRealTimeTurnPrediction();
     } else if (f10IsDown && !g_f10WasDown && controlIsDown && g_overlay) {
         ToggleDevGui();
     } else if (f10IsDown && !g_f10WasDown && altIsDown) {
@@ -6010,47 +6712,15 @@ void ApplyPrediction(void* destination, const void* source) {
         return;
     }
 
-    if (!g_prediction.initialized || g_prediction.sourceView != source ||
-        simulationTime < g_prediction.currentTime - kTimeEpsilon) {
-        ResetPrediction(source, simulationTime, raw);
-        return;
-    }
-
-    if (simulationTime > g_prediction.currentTime + kTimeEpsilon) {
-        const double interval = simulationTime - g_prediction.currentTime;
-        if (interval > kMaximumStateInterval ||
-            PositionDistance(g_prediction.current, raw) > kMaximumPositionJump ||
-            RotationDistanceDegrees(g_prediction.current, raw) > kMaximumRotationJumpDegrees) {
-            ResetPrediction(source, simulationTime, raw);
-            return;
-        }
-        g_prediction.previousTime = g_prediction.currentTime;
-        g_prediction.previous = g_prediction.current;
-        g_prediction.currentTime = simulationTime;
-        g_prediction.current = raw;
-    }
-
-    const double interval = g_prediction.currentTime - g_prediction.previousTime;
-    if (!(interval > kTimeEpsilon) || interval > kMaximumStateInterval) {
-        return;
-    }
-
-    const double alpha = Clamp((scaledTime - g_prediction.previousTime) / interval,
-                               kMinimumAlpha, kMaximumAlpha);
-    g_lastAlpha = alpha;
     Transform predicted{};
-    predicted.origin = {
-        g_prediction.previous.origin.x +
-            alpha * (g_prediction.current.origin.x - g_prediction.previous.origin.x),
-        g_prediction.previous.origin.y +
-            alpha * (g_prediction.current.origin.y - g_prediction.previous.origin.y),
-        g_prediction.previous.origin.z +
-            alpha * (g_prediction.current.origin.z - g_prediction.previous.origin.z),
-    };
-    const Quaternion previousRotation = MatrixToQuaternion(g_prediction.previous.axis);
-    const Quaternion currentRotation = MatrixToQuaternion(g_prediction.current.axis);
-    QuaternionToMatrix(SlerpUnclamped(previousRotation, currentRotation, alpha), predicted.axis);
-
+    double alpha = 0.0;
+    if (!PredictCamera(g_prediction, source, scaledTime, simulationTime, raw,
+                       UseRealTimeTurnPrediction(),
+                       kMaximumStateInterval * SampleIntervalScale(), predicted,
+                       alpha)) {
+        return;
+    }
+    g_lastAlpha = alpha;
     if (IsFinite(predicted)) {
         WriteTransform(destination, predicted);
     }
@@ -6336,6 +7006,7 @@ void UpdateAutoAbSchedule(const PresentationContext& context) {
 extern "C" void* __fastcall HookCopyView(void* destination, const void* source) {
     void* result = g_originalCopyView(destination, source);
     const Transform rawCamera = ReadTransform(destination);
+    UpdateClockTimeScaleMonitor();
     ApplyPrediction(destination, source);
     PublishRenderCorrection(rawCamera, ReadTransform(destination));
     NoteCameraOrigins(rawCamera, ReadTransform(destination));
@@ -8947,6 +9618,47 @@ bool InstallShadowCasterBuildHooks() {
     return true;
 }
 
+// Makes the mouse-look scaler read the simulation timer's delta in place of
+// the real frame time: `mov rax,[rcx]; call [rax+0xE0]` becomes
+// `lea rax,[rcx+clock+0xC8]` plus a two-byte nop.
+bool InstallMouseLookDeltaPatch() {
+    if (!g_stabilizeMouseSensitivity) {
+        return false;
+    }
+
+    auto* site = reinterpret_cast<unsigned char*>(
+        g_executableBase + g_layout->mouseLookDeltaSiteRva);
+    if (memcmp(site, kExpectedMouseLookDeltaSite, sizeof(kExpectedMouseLookDeltaSite)) != 0) {
+        Log("Mouse-look delta bytes do not match; mouse stabilization was not installed.");
+        return false;
+    }
+
+    const std::uint32_t displacement =
+        static_cast<std::uint32_t>(kClockOffset + kSimulationTimerDeltaOffset);
+    unsigned char patch[kMouseLookDeltaPatchLength] = {0x48, 0x8D, 0x81};
+    memcpy(patch + 3, &displacement, sizeof(displacement));
+    patch[7] = 0x66;
+    patch[8] = 0x90;
+
+    unsigned char* entry = site + kMouseLookDeltaPatchOffset;
+    DWORD oldProtection = 0;
+    if (!VirtualProtect(entry, sizeof(patch), PAGE_EXECUTE_READWRITE, &oldProtection)) {
+        Log("VirtualProtect failed at the mouse-look delta read; mouse stabilization "
+            "was not installed.");
+        return false;
+    }
+    memcpy(entry, patch, sizeof(patch));
+    FlushInstructionCache(GetCurrentProcess(), entry, sizeof(patch));
+    DWORD ignored = 0;
+    VirtualProtect(entry, sizeof(patch), oldProtection, &ignored);
+    g_mouseLookDeltaPatched = true;
+
+    Log("Installed mouse-look simulation-delta scaling at RVA 0x%llX.",
+        static_cast<unsigned long long>(g_layout->mouseLookDeltaSiteRva +
+                                        kMouseLookDeltaPatchOffset));
+    return true;
+}
+
 bool InstallRenderModelGpuCopyHook() {
     if (!g_stabilizeFirstPersonHands && !g_interpolateWorldTransforms &&
         !g_interpolateCinematicTransforms) {
@@ -8954,14 +9666,15 @@ bool InstallRenderModelGpuCopyHook() {
         return false;
     }
 
-    const HookSiteLayout& site = g_layout->renderModelGpuCopy;
-    auto* entry = reinterpret_cast<unsigned char*>(g_executableBase + site.rva);
-    if (memcmp(entry, site.bytes.data(), site.length) != 0) {
+    auto* entry = reinterpret_cast<unsigned char*>(
+        g_executableBase + g_layout->renderModelGpuCopy.rva);
+    const std::size_t hookLength = g_layout->renderModelGpuCopy.length;
+    if (memcmp(entry, g_layout->renderModelGpuCopy.bytes.data(), hookLength) != 0) {
         Log("Renderer GPU-copy bytes do not match; renderer model features were not installed.");
         return false;
     }
 
-    constexpr std::size_t kAbsoluteJumpLength = 14;
+    const std::size_t trampolineSize = hookLength + kAbsoluteJumpLength;
     auto* trampoline = static_cast<unsigned char*>(
         VirtualAlloc(nullptr, 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE));
     if (trampoline == nullptr) {
@@ -8969,18 +9682,17 @@ bool InstallRenderModelGpuCopyHook() {
             "hands stabilization was not installed.");
         return false;
     }
-    memcpy(trampoline, entry, site.length);
-    WriteAbsoluteIndirectJump(trampoline + site.length, entry + site.length);
-    FlushInstructionCache(GetCurrentProcess(), trampoline,
-                          site.length + kAbsoluteJumpLength);
+    memcpy(trampoline, entry, hookLength);
+    WriteAbsoluteIndirectJump(trampoline + hookLength, entry + hookLength);
+    FlushInstructionCache(GetCurrentProcess(), trampoline, trampolineSize);
 
     unsigned char patch[kMaximumHookLength]{};
-    memset(patch, 0x90, sizeof(patch));
+    memset(patch, 0x90, hookLength);
     WriteAbsoluteIndirectJump(patch,
                               reinterpret_cast<const void*>(&HookRenderModelGpuCopy));
 
     DWORD oldProtection = 0;
-    if (!VirtualProtect(entry, site.length, PAGE_EXECUTE_READWRITE, &oldProtection)) {
+    if (!VirtualProtect(entry, hookLength, PAGE_EXECUTE_READWRITE, &oldProtection)) {
         VirtualFree(trampoline, 0, MEM_RELEASE);
         Log("VirtualProtect failed at the renderer GPU-copy boundary; "
             "renderer model features were not installed.");
@@ -8988,10 +9700,10 @@ bool InstallRenderModelGpuCopyHook() {
     }
     g_originalRenderModelGpuCopy = reinterpret_cast<RenderModelGpuCopyFn>(trampoline);
     g_renderModelGpuCopyTrampoline = trampoline;
-    memcpy(entry, patch, site.length);
-    FlushInstructionCache(GetCurrentProcess(), entry, site.length);
+    memcpy(entry, patch, hookLength);
+    FlushInstructionCache(GetCurrentProcess(), entry, hookLength);
     DWORD ignored = 0;
-    VirtualProtect(entry, site.length, oldProtection, &ignored);
+    VirtualProtect(entry, hookLength, oldProtection, &ignored);
 
     Log("Installed renderer model GPU-copy hook at RVA 0x%llX "
         "(first-person roots=%u, world transforms=%u, cinematic transforms=%u).",
@@ -9010,15 +9722,16 @@ bool InstallSkinnedPoseUploadHook() {
         return false;
     }
 
-    const HookSiteLayout& site = g_layout->skinnedPoseUpload;
-    auto* entry = reinterpret_cast<unsigned char*>(g_executableBase + site.rva);
-    if (memcmp(entry, site.bytes.data(), site.length) != 0) {
+    auto* entry = reinterpret_cast<unsigned char*>(
+        g_executableBase + g_layout->skinnedPoseUpload.rva);
+    const std::size_t hookLength = g_layout->skinnedPoseUpload.length;
+    if (memcmp(entry, g_layout->skinnedPoseUpload.bytes.data(), hookLength) != 0) {
         Log("Skinned-pose upload bytes do not match; skeletal interpolation "
             "was not installed.");
         return false;
     }
 
-    constexpr std::size_t kAbsoluteJumpLength = 14;
+    const std::size_t trampolineSize = hookLength + kAbsoluteJumpLength;
     auto* trampoline = static_cast<unsigned char*>(
         VirtualAlloc(nullptr, 0x1000, MEM_RESERVE | MEM_COMMIT,
                      PAGE_EXECUTE_READWRITE));
@@ -9027,18 +9740,17 @@ bool InstallSkinnedPoseUploadHook() {
             "interpolation was not installed.");
         return false;
     }
-    memcpy(trampoline, entry, site.length);
-    WriteAbsoluteIndirectJump(trampoline + site.length, entry + site.length);
-    FlushInstructionCache(GetCurrentProcess(), trampoline,
-                          site.length + kAbsoluteJumpLength);
+    memcpy(trampoline, entry, hookLength);
+    WriteAbsoluteIndirectJump(trampoline + hookLength, entry + hookLength);
+    FlushInstructionCache(GetCurrentProcess(), trampoline, trampolineSize);
 
     unsigned char patch[kMaximumHookLength]{};
-    memset(patch, 0x90, sizeof(patch));
+    memset(patch, 0x90, hookLength);
     WriteAbsoluteIndirectJump(patch,
                               reinterpret_cast<const void*>(&HookSkinnedPoseUpload));
 
     DWORD oldProtection = 0;
-    if (!VirtualProtect(entry, site.length, PAGE_EXECUTE_READWRITE,
+    if (!VirtualProtect(entry, hookLength, PAGE_EXECUTE_READWRITE,
                         &oldProtection)) {
         VirtualFree(trampoline, 0, MEM_RELEASE);
         Log("VirtualProtect failed at the skinned-pose upload boundary; skeletal "
@@ -9048,10 +9760,10 @@ bool InstallSkinnedPoseUploadHook() {
     g_originalSkinnedPoseUpload =
         reinterpret_cast<SkinnedPoseUploadFn>(trampoline);
     g_skinnedPoseUploadTrampoline = trampoline;
-    memcpy(entry, patch, site.length);
-    FlushInstructionCache(GetCurrentProcess(), entry, site.length);
+    memcpy(entry, patch, hookLength);
+    FlushInstructionCache(GetCurrentProcess(), entry, hookLength);
     DWORD ignored = 0;
-    VirtualProtect(entry, site.length, oldProtection, &ignored);
+    VirtualProtect(entry, hookLength, oldProtection, &ignored);
 
     Log("Installed experimental skeletal hook at pose-upload RVA 0x%llX "
         "(first-person=%u, world=%u, cinematic=%u); CPU poses remain unmodified and "
@@ -10039,6 +10751,7 @@ DWORD WINAPI InstallThread(void*) {
         InitializeTelemetry();
     }
     if (InstallHook()) {
+        InstallMouseLookDeltaPatch();
         InstallSourceLevelHooks();
         if (g_sourceLevelInstalled) {
             InstallScreenParticleHook();

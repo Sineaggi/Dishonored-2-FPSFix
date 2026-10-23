@@ -76,7 +76,7 @@ int wmain(int argumentCount, wchar_t** arguments) {
         return 2;
     }
     const char* expectedDiagnostic = layoutHost ?
-        "Executable layout check failed for renderer view-copy call site" :
+        "Executable layout does not match a known layout profile" :
         "Host executable is not Dishonored2.exe";
 
     wchar_t logPath[MAX_PATH]{};
