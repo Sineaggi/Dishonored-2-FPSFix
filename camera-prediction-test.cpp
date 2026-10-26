@@ -444,6 +444,119 @@ void TestSlowMotionOverride() {
     g_slowMotionActive.store(false);
 }
 
+struct FirstPersonRunResult {
+    double rms = 0.0;
+    std::uint32_t corrected = 0;
+    std::uint32_t frames = 0;
+    bool motionVectorsConsistent = true;
+};
+
+// A held weapon moves relative to a moving camera with the animated hand. Its
+// presented transform relative to the camera must follow the presentation
+// time, also in deep slow motion, and its previous-frame matrix must be the
+// pose presented on the previous frame. A model fixed to the camera keeps the
+// plain camera correction.
+FirstPersonRunResult RunFirstPersonAttachment(double fps, double tickScale, bool moving) {
+    constexpr double kLocalSpeed = 20.0;
+    constexpr double kCameraSpeed = 5.0;
+    constexpr int kFrames = 2000;
+    constexpr int kWarmupFrames = 100;
+    g_firstPersonTracks = {};
+    alignas(16) static unsigned char model[kRenderModelSize];
+    memset(model, 0, sizeof(model));
+    const void* owner = reinterpret_cast<const void*>(static_cast<std::uintptr_t>(0x1230));
+    memcpy(model + kRenderModelOwnerOffset, &owner, sizeof(owner));
+    ClockModel clock{};
+    FirstPersonRunResult result{};
+    const double frameSeconds = 1.0 / fps;
+    double previousLocal = 0.0;
+    double previousIdeal = 0.0;
+    double squares = 0.0;
+    int samples = 0;
+    Matrix4 lastPresented{};
+    bool lastApplied = false;
+    for (int frame = 0; frame < kFrames; ++frame) {
+        clock.Advance(frame == 0 ? 0.0 : frameSeconds, 1.0, tickScale);
+        const double gameTime = clock.simulation * tickScale;
+        const Transform camera = MakeCamera(kCameraSpeed * clock.simulation,
+                                            0.3 * clock.simulation);
+        Transform local = MakeCamera(moving ? 1.0 + kLocalSpeed * gameTime : 1.0, 0.0);
+        local.origin.y = -0.4;
+        local.origin.z = -0.3;
+        const Matrix4 cameraMatrix = TransformMatrix(camera);
+        const Matrix4 rawModel = MultiplyMatrices4(cameraMatrix, TransformMatrix(local));
+        memcpy(model + kRenderModelMatrixOffset, &rawModel, sizeof(rawModel));
+        memcpy(model + kRenderModelPreviousMatrixOffset, &rawModel, sizeof(rawModel));
+
+        RenderCorrectionState state{};
+        state.currentRawCamera = cameraMatrix;
+        state.currentOutputCamera = cameraMatrix;
+        state.currentValid = true;
+        PresentationContext context{};
+        context.valid = true;
+        context.serial = static_cast<std::uint64_t>(frame) + 1;
+        context.scaledTime = clock.scaled;
+        context.simulationTime = clock.simulation;
+        context.intervalScale = 1.0 / std::min(1.0, tickScale);
+        WorldMatrixCorrection correction{};
+        const bool applied =
+            BuildFirstPersonCorrection(model, 0xABCDEF, state, context, correction);
+        const Matrix4 presented =
+            applied ? MultiplyMatrices4(correction.currentDelta, rawModel) : rawModel;
+        if (applied) {
+            ++result.corrected;
+            if (lastApplied &&
+                !MatricesNearlyEqual(MultiplyMatrices4(correction.previousDelta, rawModel),
+                                     lastPresented, 1.0e-3)) {
+                result.motionVectorsConsistent = false;
+            }
+        }
+        lastPresented = presented;
+        lastApplied = applied;
+
+        const Matrix4 presentedLocal =
+            MultiplyMatrices4(InvertRigidTransform(cameraMatrix), presented);
+        const double localX = presentedLocal.values[3];
+        const double idealX = 1.0 + kLocalSpeed * tickScale * clock.scaled;
+        if (moving && frame > kWarmupFrames) {
+            const double error = ((localX - previousLocal) - (idealX - previousIdeal)) /
+                                 (kLocalSpeed * tickScale * frameSeconds);
+            squares += error * error;
+            ++samples;
+        }
+        previousLocal = localX;
+        previousIdeal = idealX;
+        ++result.frames;
+    }
+    result.rms = samples != 0 ? std::sqrt(squares / samples) : 0.0;
+    return result;
+}
+
+void TestFirstPersonTransforms() {
+    const double cases[][2] = {
+        {90.0, 0.05}, {144.0, 0.05}, {240.0, 0.05}, {60.0, 0.25},
+        {90.0, 1.0}, {144.0, 1.0}, {240.0, 1.0}, {360.0, 1.0},
+    };
+    for (const auto& entry : cases) {
+        const FirstPersonRunResult result = RunFirstPersonAttachment(entry[0], entry[1], true);
+        Check(result.rms <= 0.02 && result.corrected > result.frames / 2 &&
+                  result.motionVectorsConsistent,
+              "first-person attachment at %.0f FPS, tick scale %.2f: error %.3f, "
+              "%u of %u frames corrected, motion vectors %s",
+              entry[0], entry[1], result.rms, result.corrected, result.frames,
+              result.motionVectorsConsistent ? "consistent" : "inconsistent");
+        const FirstPersonRunResult fixed = RunFirstPersonAttachment(entry[0], entry[1], false);
+        Check(fixed.corrected == 0,
+              "a camera-fixed first-person model left the plain camera correction "
+              "(%u frames) at %.0f FPS, tick scale %.2f",
+              fixed.corrected, entry[0], entry[1]);
+    }
+    const FirstPersonRunResult slow = RunFirstPersonAttachment(90.0, 0.05, true);
+    std::printf("90 FPS first-person attachment error at a 0.05 tick scale: %.3f frames RMS "
+                "(%u of %u frames corrected).\n", slow.rms, slow.corrected, slow.frames);
+    g_firstPersonTracks = {};
+}
+
 }  // namespace
 
 int main() {
@@ -453,6 +566,7 @@ int main() {
     TestSlowMotionState();
     TestIntervalScale();
     TestSlowMotionOverride();
+    TestFirstPersonTransforms();
     if (g_failures != 0) {
         std::fprintf(stderr, "%d camera-prediction/slow-motion checks failed.\n", g_failures);
         return 1;

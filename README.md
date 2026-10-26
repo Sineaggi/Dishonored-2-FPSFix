@@ -12,7 +12,7 @@
 
 A source-only high-frame-rate fix for the GOG and Steam releases of Dishonored 2. It keeps the game's simulation and physics at their native 120 Hz while smoothing presentation above 120 FPS by interpolating all world assets, player included, alongside skeletal animations to match the display framerate, with an additional per-frame mouse delta override to keep mouse input latency low.
 
-Current release: **v1.5.0**
+Current release: **v1.5.1**
 
 ## Compatibility
 
@@ -56,7 +56,7 @@ The patch does not raise the simulation rate or modify authoritative physics, AI
 
 ## Current status
 
-Camera prediction, FPS unlocking, mouse stabilization, first-person root correction, world/root interpolation, skeletal interpolation, and cinematic-control interpolation have passed focused live tests and multi-level gameplay/lifecycle testing without a major issue. The v1.5.0 real-time turn prediction and slow-motion handling passed GOG play sessions at 90, 144, and 350 FPS and a Steam session. The validated presentation layers remain enabled by default and can still be disabled independently.
+Camera prediction, FPS unlocking, mouse stabilization, first-person root correction, world/root interpolation, skeletal interpolation, and cinematic-control interpolation have passed focused live tests and multi-level gameplay/lifecycle testing without a major issue. The v1.5.0 real-time turn prediction and slow-motion handling passed GOG play sessions at 90, 144, and 350 FPS and a Steam session, and the v1.5.1 first-person attachment interpolation passed power-wheel sessions on both builds. The validated presentation layers remain enabled by default and can still be disabled independently.
 
 Two areas are deliberately unsupported:
 
@@ -113,7 +113,7 @@ the game installation, build first and then provide the path to an x64 loader:
 The script creates a disposable staging directory below `build`, runs the
 integration host, and verifies loader discovery, system DirectInput forwarding,
 plugin loading, sibling logging, and safe unsupported-host rejection. The
-official Ultimate ASI Loader v9.7.4 x64 build passes this test and the v1.5.0
+official Ultimate ASI Loader v9.7.4 x64 build passes this test and the v1.5.1
 in-game testing on both the GOG and Steam builds.
 
 ## Package
@@ -122,7 +122,7 @@ After building and validating the plugin, create the canonical plugin-only
 archive and the optional tested-loader convenience archive with:
 
 ```powershell
-.\package-release.ps1 -Version 1.5.0 `
+.\package-release.ps1 -Version 1.5.1 `
   -LoaderPath .\build\third-party\ultimate-asi-loader-v9.7.4\extracted\dinput8.dll
 ```
 
@@ -200,6 +200,8 @@ The following validated layers are enabled by default and can be disabled indepe
 - `CinematicSkeletons=1`
 
 The supplied configuration enables all five together for the complete validated presentation path. Unsupported models, invalid layouts, discontinuities, teleports, identity changes, and missing history snap to the current native state instead of being blended.
+
+`FirstPersonSkeletons` also covers first-person models that move relative to the camera, such as the held weapon following the animated hand. Their motion relative to the camera is interpolated at the same presentation time as the hand animation and placed under the smoothed camera. Without this, a weapon steps at the simulation rate, which is most visible while time is slowed, for example in the power wheel. Models fixed to the camera keep the plain `StabilizeFirstPersonHands` correction.
 
 `AdaptivePerformanceGate=1` monitors presentation cadence through the fixed
 120 Hz simulation clock. When full interpolation cannot retain useful native-

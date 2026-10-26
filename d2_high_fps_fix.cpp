@@ -473,6 +473,9 @@ struct RenderCorrectionState {
     Matrix4 currentInverseDelta{};
     Matrix4 previousDelta{};
     Matrix4 previousInverseDelta{};
+    // This frame's raw and presented camera matrices.
+    Matrix4 currentRawCamera{};
+    Matrix4 currentOutputCamera{};
     bool currentValid = false;
     bool previousValid = false;
     std::uint64_t serial = 0;
@@ -1663,6 +1666,8 @@ void PublishRenderCorrection(const Transform& rawCamera, const Transform& output
     g_renderCorrection.previousValid = g_renderCorrection.currentValid;
     g_renderCorrection.currentDelta = delta;
     g_renderCorrection.currentInverseDelta = inverseDelta;
+    g_renderCorrection.currentRawCamera = TransformMatrix(rawCamera);
+    g_renderCorrection.currentOutputCamera = TransformMatrix(outputCamera);
     g_renderCorrection.currentValid = valid;
     ++g_renderCorrection.serial;
     ReleaseSRWLockExclusive(&g_renderCorrectionLock);
@@ -2563,8 +2568,10 @@ bool BuildWorldTransformCorrection(const void* renderModel,
         return false;
     }
 
-    const double targetTime = Clamp(context.scaledTime, track->previousTime,
-                                    track->currentTime + kNativeSimulationStep);
+    // Extrapolate at most one tick, which slow motion lengthens.
+    const double targetTime = Clamp(
+        context.scaledTime, track->previousTime,
+        track->currentTime + kNativeSimulationStep * context.intervalScale);
     const double alpha = (targetTime - track->previousTime) / interval;
     Matrix4 target{};
     if (!InterpolateWorldMatrices(track->previous, track->current, alpha,
@@ -2614,6 +2621,208 @@ bool BuildWorldTransformCorrection(const void* renderModel,
     }
     ReleaseSRWLockExclusive(&g_worldTransformLock);
     return corrected;
+}
+
+// First-person models follow the camera, which the camera correction already
+// moves to its presentation pose. A model that also moves relative to the
+// camera, such as the held weapon following the animated hand, otherwise keeps
+// that relative motion at the tick rate. Track each model's transform relative
+// to the raw camera across simulation samples, evaluate it at the same alpha as
+// the first-person palettes, and place it under the presented camera.
+constexpr std::size_t kFirstPersonTrackCapacity = 64;
+
+struct FirstPersonTrack {
+    const void* renderModel = nullptr;
+    const void* owner = nullptr;
+    std::uintptr_t vtable = 0;
+    std::uint64_t lastSeenSerial = 0;
+    bool hasPair = false;
+    double previousTime = 0.0;
+    double currentTime = 0.0;
+    // Model matrices relative to the raw camera.
+    Matrix4 previous{};
+    Matrix4 current{};
+    bool hasLastPresented = false;
+    std::uint64_t lastPresentedSerial = 0;
+    Matrix4 lastPresented{};
+    Matrix4 previousPresented{};
+};
+
+struct FirstPersonTransformDiagnostics {
+    std::atomic<std::uint64_t> candidates{0};
+    std::atomic<std::uint64_t> tracksCreated{0};
+    std::atomic<std::uint64_t> moving{0};
+    std::atomic<std::uint64_t> adjusted{0};
+    std::atomic<std::uint64_t> discontinuityRejected{0};
+    std::atomic<std::uint64_t> sameTimeMutationRejected{0};
+    std::atomic<std::uint64_t> jumpRejected{0};
+    std::atomic<std::uint64_t> capacityMiss{0};
+};
+
+SRWLOCK g_firstPersonTrackLock = SRWLOCK_INIT;
+std::array<FirstPersonTrack, kFirstPersonTrackCapacity> g_firstPersonTracks{};
+FirstPersonTransformDiagnostics g_firstPersonTransformDiagnostics;
+std::atomic<int> g_firstPersonTransformRenderState{0};
+
+FirstPersonTrack* FindFirstPersonTrack(const void* renderModel, const void* owner,
+                                       std::uint64_t serial) {
+    FirstPersonTrack* empty = nullptr;
+    FirstPersonTrack* stale = nullptr;
+    for (FirstPersonTrack& track : g_firstPersonTracks) {
+        if (track.renderModel == renderModel && track.owner == owner) {
+            return &track;
+        }
+        if (track.renderModel == nullptr) {
+            if (empty == nullptr) {
+                empty = &track;
+            }
+        } else if (track.lastSeenSerial + kWorldTransformStaleFrames < serial &&
+                   (stale == nullptr || track.lastSeenSerial < stale->lastSeenSerial)) {
+            stale = &track;
+        }
+    }
+    FirstPersonTrack* created = empty != nullptr ? empty : stale;
+    if (created == nullptr) {
+        g_firstPersonTransformDiagnostics.capacityMiss.fetch_add(
+            1, std::memory_order_relaxed);
+        return nullptr;
+    }
+    *created = {};
+    created->renderModel = renderModel;
+    created->owner = owner;
+    g_firstPersonTransformDiagnostics.tracksCreated.fetch_add(
+        1, std::memory_order_relaxed);
+    return created;
+}
+
+// Returns false when the plain camera correction should be used instead: no
+// usable history yet, or no motion relative to the camera.
+bool BuildFirstPersonCorrection(const void* renderModel, std::uintptr_t vtable,
+                                const RenderCorrectionState& camera,
+                                const PresentationContext& context,
+                                WorldMatrixCorrection& correction) {
+    g_firstPersonTransformDiagnostics.candidates.fetch_add(1, std::memory_order_relaxed);
+    if (!context.valid) {
+        return false;
+    }
+    const auto* bytes = static_cast<const unsigned char*>(renderModel);
+    const Matrix4 rawCurrent = ReadMatrix(bytes, kRenderModelMatrixOffset);
+    const Matrix4 rawPrevious = ReadMatrix(bytes, kRenderModelPreviousMatrixOffset);
+    const void* owner = nullptr;
+    memcpy(&owner, bytes + kRenderModelOwnerOffset, sizeof(owner));
+    const Matrix4 local =
+        MultiplyMatrices4(InvertRigidTransform(camera.currentRawCamera), rawCurrent);
+    Transform localTransform{};
+    double localScale = 1.0;
+    bool localReflected = false;
+    if (!ReadWorldTransform(local, localTransform, localScale, localReflected)) {
+        return false;
+    }
+
+    AcquireSRWLockExclusive(&g_firstPersonTrackLock);
+    FirstPersonTrack* track = FindFirstPersonTrack(renderModel, owner, context.serial);
+    if (track == nullptr) {
+        ReleaseSRWLockExclusive(&g_firstPersonTrackLock);
+        return false;
+    }
+    const double maximumInterval = kMaximumWorldStateInterval * context.intervalScale;
+    const bool fresh = track->lastSeenSerial == 0 || track->vtable != vtable;
+    track->lastSeenSerial = context.serial;
+    if (fresh || context.simulationTime < track->currentTime - kTimeEpsilon ||
+        context.simulationTime - track->currentTime > maximumInterval) {
+        if (!fresh) {
+            g_firstPersonTransformDiagnostics.discontinuityRejected.fetch_add(
+                1, std::memory_order_relaxed);
+        }
+        track->vtable = vtable;
+        track->hasPair = false;
+        track->hasLastPresented = false;
+        track->currentTime = context.simulationTime;
+        track->current = local;
+        ReleaseSRWLockExclusive(&g_firstPersonTrackLock);
+        return false;
+    }
+    if (context.simulationTime > track->currentTime + kTimeEpsilon) {
+        track->previousTime = track->currentTime;
+        track->previous = track->current;
+        track->currentTime = context.simulationTime;
+        track->current = local;
+        track->hasPair = true;
+        if (WorldMatricesDiffer(track->previous, track->current)) {
+            g_firstPersonTransformDiagnostics.moving.fetch_add(
+                1, std::memory_order_relaxed);
+        }
+    } else if (WorldMatricesDiffer(track->current, local)) {
+        track->current = local;
+        track->hasPair = false;
+        track->hasLastPresented = false;
+        g_firstPersonTransformDiagnostics.sameTimeMutationRejected.fetch_add(
+            1, std::memory_order_relaxed);
+        ReleaseSRWLockExclusive(&g_firstPersonTrackLock);
+        return false;
+    }
+
+    const double interval = track->currentTime - track->previousTime;
+    Transform previousTransform{};
+    Transform currentTransform{};
+    double previousScale = 1.0;
+    double currentScale = 1.0;
+    bool previousReflected = false;
+    bool currentReflected = false;
+    if (!track->hasPair || !(interval > kTimeEpsilon) || interval > maximumInterval ||
+        !WorldMatricesDiffer(track->previous, track->current) ||
+        !ReadWorldTransform(track->previous, previousTransform, previousScale,
+                            previousReflected) ||
+        !ReadWorldTransform(track->current, currentTransform, currentScale,
+                            currentReflected) ||
+        previousReflected != currentReflected) {
+        track->hasLastPresented = false;
+        ReleaseSRWLockExclusive(&g_firstPersonTrackLock);
+        return false;
+    }
+    if (PositionDistance(previousTransform, currentTransform) > kMaximumWorldPositionJump ||
+        RotationDistanceDegrees(previousTransform, currentTransform) >
+            kMaximumWorldRotationJumpDegrees ||
+        currentScale / previousScale > 1.10 || previousScale / currentScale > 1.10) {
+        track->hasPair = false;
+        track->hasLastPresented = false;
+        g_firstPersonTransformDiagnostics.jumpRejected.fetch_add(
+            1, std::memory_order_relaxed);
+        ReleaseSRWLockExclusive(&g_firstPersonTrackLock);
+        return false;
+    }
+
+    const double alpha = Clamp((context.scaledTime - track->previousTime) / interval,
+                               kMinimumAlpha, kMaximumAlpha);
+    Matrix4 presentedLocal{};
+    if (!InterpolateWorldMatrices(track->previous, track->current, alpha,
+                                  presentedLocal)) {
+        track->hasLastPresented = false;
+        ReleaseSRWLockExclusive(&g_firstPersonTrackLock);
+        return false;
+    }
+    const Matrix4 presented = MultiplyMatrices4(camera.currentOutputCamera, presentedLocal);
+    if (track->lastPresentedSerial != context.serial) {
+        track->previousPresented =
+            track->hasLastPresented && track->lastPresentedSerial + 1 == context.serial
+                ? track->lastPresented
+                : presented;
+        track->lastPresented = presented;
+        track->lastPresentedSerial = context.serial;
+        track->hasLastPresented = true;
+    }
+    const Matrix4 previousPresented = track->previousPresented;
+    ReleaseSRWLockExclusive(&g_firstPersonTrackLock);
+
+    correction.presentationSerial = context.serial;
+    if (!BuildWorldCorrection(rawCurrent, presented, correction.currentDelta,
+                              correction.currentInverseDelta) ||
+        !BuildWorldCorrection(rawPrevious, previousPresented, correction.previousDelta,
+                              correction.previousInverseDelta)) {
+        return false;
+    }
+    g_firstPersonTransformDiagnostics.adjusted.fetch_add(1, std::memory_order_relaxed);
+    return true;
 }
 
 ShadowCorrectionEntry* FindShadowCorrectionByPointer(const void* matrix,
@@ -3196,6 +3405,29 @@ void MaybeLogWorldTransformDiagnostics(const PresentationContext& context) {
         static_cast<unsigned long long>(
             g_worldDiagnostics.slowMotionCharacters.load(
                 std::memory_order_relaxed)));
+
+    const FirstPersonTransformDiagnostics& firstPerson =
+        g_firstPersonTransformDiagnostics;
+    Log("First-person transform frame=%llu: candidates=%llu tracks=%llu "
+        "moving=%llu adjusted=%llu rejected[discontinuity=%llu sameTime=%llu "
+        "jump=%llu] capacityMiss=%llu.",
+        static_cast<unsigned long long>(context.serial),
+        static_cast<unsigned long long>(
+            firstPerson.candidates.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(
+            firstPerson.tracksCreated.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(
+            firstPerson.moving.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(
+            firstPerson.adjusted.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(
+            firstPerson.discontinuityRejected.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(
+            firstPerson.sameTimeMutationRejected.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(
+            firstPerson.jumpRejected.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(
+            firstPerson.capacityMiss.load(std::memory_order_relaxed)));
 
     if (g_interpolateShadowTransforms) {
         Log("Shadow transform frame=%llu: calls=%llu published=%llu "
@@ -4462,6 +4694,7 @@ extern "C" void __fastcall HookRenderModelGpuCopy(
     const bool exactSkinned =
         renderModelVtable == g_executableBase + g_layout->skinnedModelVtableRva;
     bool correctedFirstPerson = false;
+    bool firstPersonMoving = false;
     std::uint64_t correctionSerial = 0;
     RenderCorrectionState firstPersonCorrection{};
     WorldMatrixCorrection worldCorrection{};
@@ -4472,6 +4705,15 @@ extern "C" void __fastcall HookRenderModelGpuCopy(
             hasCorrection = true;
             correctedFirstPerson = true;
             correctionSerial = firstPersonCorrection.serial;
+            // Follow the hand palettes: interpolate attachments only while the
+            // first-person skeletal layer runs, so the two never disagree.
+            PresentationContext context{};
+            firstPersonMoving = g_interpolateFirstPersonSkeletons &&
+                RuntimeSkeletalInterpolationEnabled() &&
+                ReadPresentationContext(context) &&
+                BuildFirstPersonCorrection(renderModel, renderModelVtable,
+                                           firstPersonCorrection, context,
+                                           worldCorrection);
         }
     } else if (transformInterpolationEnabled) {
         PresentationContext context{};
@@ -4497,7 +4739,7 @@ extern "C" void __fastcall HookRenderModelGpuCopy(
     }
     alignas(16) unsigned char renderModelClone[kSkinnedModelSize];
     memcpy(renderModelClone, renderModel, renderModelCloneSize);
-    const bool corrected = correctedFirstPerson
+    const bool corrected = correctedFirstPerson && !firstPersonMoving
         ? CorrectRenderModelClone(renderModelClone, firstPersonCorrection)
         : CorrectWorldRenderModelClone(renderModelClone, worldCorrection);
     if (!corrected) {
@@ -4529,6 +4771,13 @@ extern "C" void __fastcall HookRenderModelGpuCopy(
             Log("Applied first-person correction at the renderer GPU-parameter boundary "
                 "(camera serial %llu).",
                 static_cast<unsigned long long>(correctionSerial));
+        }
+        expected = 0;
+        if (firstPersonMoving &&
+            g_firstPersonTransformRenderState.compare_exchange_strong(expected, 1)) {
+            Log("Applied first-person transform interpolation to a model moving "
+                "relative to the camera (presentation serial %llu).",
+                static_cast<unsigned long long>(worldCorrection.presentationSerial));
         }
     } else {
         g_worldTransformAdjustedCount.fetch_add(1, std::memory_order_relaxed);
