@@ -3039,17 +3039,20 @@ FirstPersonTrack* FindFirstPersonTrack(const void* renderModel, const void* owne
 
 // Returns false when the plain camera correction should be used instead: no
 // usable history yet, or no motion relative to the camera.
-bool BuildFirstPersonCorrection(const void* renderModel, std::uintptr_t vtable,
-                                const RenderCorrectionState& camera,
-                                const PresentationContext& context,
-                                WorldMatrixCorrection& correction) {
+// Evaluates a first-person model's motion relative to the camera at the
+// presentation time. rawCurrent is the engine's committed matrix (the source-
+// level path passes it from its track, since +0x20 may hold its own write).
+bool EvaluateFirstPersonAttachment(const void* renderModel, std::uintptr_t vtable,
+                                   const Matrix4& rawCurrent,
+                                   const RenderCorrectionState& camera,
+                                   const PresentationContext& context,
+                                   Matrix4& presentedOut,
+                                   Matrix4& previousPresentedOut) {
     g_firstPersonTransformDiagnostics.candidates.fetch_add(1, std::memory_order_relaxed);
     if (!context.valid) {
         return false;
     }
     const auto* bytes = static_cast<const unsigned char*>(renderModel);
-    const Matrix4 rawCurrent = ReadMatrix(bytes, kRenderModelMatrixOffset);
-    const Matrix4 rawPrevious = ReadMatrix(bytes, kRenderModelPreviousMatrixOffset);
     const void* owner = nullptr;
     memcpy(&owner, bytes + kRenderModelOwnerOffset, sizeof(owner));
     const Matrix4 local =
@@ -3153,9 +3156,25 @@ bool BuildFirstPersonCorrection(const void* renderModel, std::uintptr_t vtable,
         track->lastPresentedSerial = context.serial;
         track->hasLastPresented = true;
     }
-    const Matrix4 previousPresented = track->previousPresented;
+    previousPresentedOut = track->previousPresented;
+    presentedOut = presented;
     ReleaseSRWLockExclusive(&g_firstPersonTrackLock);
+    return true;
+}
 
+bool BuildFirstPersonCorrection(const void* renderModel, std::uintptr_t vtable,
+                                const RenderCorrectionState& camera,
+                                const PresentationContext& context,
+                                WorldMatrixCorrection& correction) {
+    const auto* bytes = static_cast<const unsigned char*>(renderModel);
+    const Matrix4 rawCurrent = ReadMatrix(bytes, kRenderModelMatrixOffset);
+    const Matrix4 rawPrevious = ReadMatrix(bytes, kRenderModelPreviousMatrixOffset);
+    Matrix4 presented{};
+    Matrix4 previousPresented{};
+    if (!EvaluateFirstPersonAttachment(renderModel, vtable, rawCurrent, camera, context,
+                                       presented, previousPresented)) {
+        return false;
+    }
     correction.presentationSerial = context.serial;
     if (!BuildWorldCorrection(rawCurrent, presented, correction.currentDelta,
                               correction.currentInverseDelta) ||
@@ -7973,7 +7992,23 @@ void UpdateSourceHandsTrack(SourceTrack& track, const PresentationContext& conte
     Matrix4 outputInverse = track.currentInverse;
     RenderCorrectionState correction{};
     bool corrected = false;
-    if (ReadRenderCorrection(correction)) {
+    // A model moving relative to the camera (the held weapon following the
+    // animated hand) is interpolated relative to the camera, like the per-draw
+    // path does, while the first-person skeletal layer runs.
+    Matrix4 presented{};
+    Matrix4 previousPresented{};
+    Matrix4 presentedInverse{};
+    if (ReadRenderCorrection(correction) && g_interpolateFirstPersonSkeletons &&
+        RuntimeSkeletalInterpolationEnabled() &&
+        EvaluateFirstPersonAttachment(track.model, track.vtable, track.current, correction,
+                                      context, presented, previousPresented) &&
+        InvertAffineTransform(presented, presentedInverse) && IsFinite(presented) &&
+        IsFinite(presentedInverse)) {
+        output = presented;
+        outputInverse = presentedInverse;
+        corrected = true;
+        g_firstPersonTransformDiagnostics.adjusted.fetch_add(1, std::memory_order_relaxed);
+    } else if (ReadRenderCorrection(correction)) {
         const Matrix4 candidate = MultiplyMatrices4(correction.currentDelta, track.current);
         const Matrix4 candidateInverse =
             MultiplyMatrices4(track.currentInverse, correction.currentInverseDelta);
