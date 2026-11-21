@@ -437,6 +437,9 @@ bool g_enableTelemetry = false;
 bool g_enableInterpolationAbProbe = false;
 bool g_toggleSounds = true;
 bool g_overlay = false;
+// [Fix] PresentMode: 0 = the game's own sync interval, 1 = mailbox (windowed
+// presents use sync interval 0, so the compositor shows the newest frame).
+int g_presentMode = 0;
 extern std::atomic<int> g_screenParticleMode;
 void CycleScreenParticleMode();
 bool InstallInlineHook(std::uintptr_t rva, const unsigned char* expected, std::size_t length,
@@ -1070,6 +1073,8 @@ void LoadConfiguration() {
         L"Diagnostics", L"ToggleSounds", 1, path) != 0;
     g_overlay = GetPrivateProfileIntW(
         L"Diagnostics", L"Overlay", 0, path) != 0;
+    g_presentMode = std::max(0, std::min(1, static_cast<int>(
+        GetPrivateProfileIntW(L"Fix", L"PresentMode", 0, path))));
     g_crashLog = GetPrivateProfileIntW(
         L"Diagnostics", L"CrashLog", 0, path) != 0;
     g_devGuiScale = std::max(0, std::min(4, static_cast<int>(
@@ -9695,11 +9700,57 @@ void DrawOverlayFrame(IDXGISwapChain* swapChain) {
     }
 }
 
+// Logs the swap chain and the game's present arguments the first time each
+// swap chain presents, and applies PresentMode. Mailbox needs a windowed
+// (composed) swap chain: there sync interval 0 shows the newest finished
+// frame at each refresh without tearing. Exclusive fullscreen keeps the
+// game's interval, since 0 would tear there. A sync interval forced in the
+// GPU driver overrides both.
+UINT ApplyPresentMode(IDXGISwapChain* swapChain, UINT syncInterval, UINT flags) {
+    static std::atomic<IDXGISwapChain*> lastLogged{nullptr};
+    static std::atomic<IDXGISwapChain*> lastChecked{nullptr};
+    static std::atomic<bool> lastWindowed{false};
+    static std::atomic<std::uint64_t> lastCheckCounter{0};
+    const std::uint64_t now = ReadPerformanceCounter();
+    LARGE_INTEGER frequency{};
+    QueryPerformanceFrequency(&frequency);
+    if (lastChecked.load(std::memory_order_relaxed) != swapChain ||
+        now - lastCheckCounter.load(std::memory_order_relaxed) >
+            static_cast<std::uint64_t>(frequency.QuadPart)) {
+        BOOL fullscreen = FALSE;
+        if (FAILED(swapChain->GetFullscreenState(&fullscreen, nullptr))) {
+            fullscreen = TRUE;  // Unknown: keep the game's interval.
+        }
+        lastWindowed.store(!fullscreen, std::memory_order_relaxed);
+        lastChecked.store(swapChain, std::memory_order_relaxed);
+        lastCheckCounter.store(now, std::memory_order_relaxed);
+    }
+    const bool windowed = lastWindowed.load(std::memory_order_relaxed);
+    const UINT applied =
+        g_presentMode == 1 && windowed && (flags & DXGI_PRESENT_TEST) == 0 ? 0U
+                                                                           : syncInterval;
+    if (lastLogged.exchange(swapChain) != swapChain) {
+        DXGI_SWAP_CHAIN_DESC description{};
+        if (SUCCEEDED(swapChain->GetDesc(&description))) {
+            Log("Present: swap chain %p %ux%u, %u buffers, swap effect %u, swap chain "
+                "flags 0x%X, %s; game sync interval %u, flags 0x%X; PresentMode=%d "
+                "presents with sync interval %u.",
+                static_cast<void*>(swapChain), description.BufferDesc.Width,
+                description.BufferDesc.Height, description.BufferCount,
+                static_cast<unsigned>(description.SwapEffect), description.Flags,
+                windowed ? "windowed" : "exclusive fullscreen", syncInterval, flags,
+                g_presentMode, applied);
+        }
+    }
+    return applied;
+}
+
 HRESULT STDMETHODCALLTYPE HookPresent(IDXGISwapChain* swapChain, UINT syncInterval,
                                       UINT flags) {
     if ((flags & DXGI_PRESENT_TEST) == 0) {
         DrawOverlay(swapChain);
     }
+    syncInterval = ApplyPresentMode(swapChain, syncInterval, flags);
     const HRESULT result = g_originalPresent(swapChain, syncInterval, flags);
     static std::atomic<int> failures{0};
     if (FAILED(result) && failures.fetch_add(1) < 4) {
@@ -9714,6 +9765,7 @@ HRESULT STDMETHODCALLTYPE HookPresent1(IDXGISwapChain1* swapChain, UINT syncInte
     if ((flags & DXGI_PRESENT_TEST) == 0) {
         DrawOverlay(swapChain);
     }
+    syncInterval = ApplyPresentMode(swapChain, syncInterval, flags);
     return g_originalPresent1(swapChain, syncInterval, flags, parameters);
 }
 
@@ -9736,7 +9788,7 @@ DWORD WINAPI OverlayPresentHookThread(void*);
 
 void TryInstallOverlayPresentHook() {
     static bool started = false;
-    if (!g_overlay || started ||
+    if (!(g_overlay || g_presentMode != 0) || started ||
         g_presentationSerial.load(std::memory_order_acquire) < 240) {
         return;
     }
