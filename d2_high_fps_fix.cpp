@@ -448,6 +448,9 @@ bool g_overlay = false;
 // once, and a plugin thread presents the frame best matching the refresh
 // cadence, see the "PresentMode=3" section.
 int g_presentMode = 0;
+// [Fix] PresentThread (PresentMode=3 only): 0 keeps the proxy back buffer but
+// presents on the game thread, which separates proxy problems from threading.
+bool g_mailboxPresentThread = true;
 bool InstallFlipSwapChainHooks();
 bool MailboxGamePresent(IDXGISwapChain* swapChain, UINT flags, HRESULT* result);
 // Set while the overlay creates its throwaway probe swap chain.
@@ -1087,6 +1090,8 @@ void LoadConfiguration() {
         L"Diagnostics", L"Overlay", 0, path) != 0;
     g_presentMode = std::max(0, std::min(3, static_cast<int>(
         GetPrivateProfileIntW(L"Fix", L"PresentMode", 0, path))));
+    g_mailboxPresentThread =
+        GetPrivateProfileIntW(L"Fix", L"PresentThread", 1, path) != 0;
     g_crashLog = GetPrivateProfileIntW(
         L"Diagnostics", L"CrashLog", 0, path) != 0;
     g_devGuiScale = std::max(0, std::min(4, static_cast<int>(
@@ -10402,7 +10407,7 @@ bool CreateMailboxResources() {
     g_mailboxProxyResource.store(g_mailbox.proxy, std::memory_order_release);
     DXGI_SWAP_CHAIN_DESC chain{};
     g_mailbox.windowed = SUCCEEDED(g_mailbox.swapChain->GetDesc(&chain)) && chain.Windowed;
-    g_mailbox.asynchronous = g_mailbox.windowed;
+    g_mailbox.asynchronous = g_mailbox.windowed && g_mailboxPresentThread;
     // The sequence stays monotonic across resizes: the present thread compares
     // it against the last frame it showed. Slots restart empty (sequence 0).
     g_mailbox.frameIndex = 0;
@@ -10410,7 +10415,8 @@ bool CreateMailboxResources() {
         description.Width, description.Height, static_cast<unsigned>(description.Format),
         description.BindFlags,
         g_mailbox.asynchronous ? "the plugin present thread presents"
-                               : "exclusive fullscreen, the game thread presents");
+        : !g_mailbox.windowed  ? "exclusive fullscreen, the game thread presents"
+                               : "PresentThread=0, the game thread presents");
     return true;
 }
 
@@ -10738,12 +10744,19 @@ DWORD WINAPI MailboxPresentThread(void*) {
             }
             lastShownSequence = chosen->sequence;
             lastShownQpc = chosen->qpc;
+            // Overlays that hook the real Present (Steam, NVIDIA capture) set
+            // pipeline state on the immediate context and restore it; holding
+            // the device's multithread lock across the copy and Present keeps
+            // the game thread's draws from interleaving with that state.
+            ID3D11Multithread* multithread = g_mailbox.multithread;
+            multithread->Enter();
             g_mailbox.context->CopyResource(g_mailbox.realBuffer, chosen->texture);
             IDXGISwapChain* swapChain = g_mailbox.swapChain;
             ReleaseSRWLockExclusive(&g_mailboxLock);
             const std::uint64_t before = ReadPerformanceCounter();
             const HRESULT result = g_originalPresent(swapChain, 0, 0);
             const std::uint64_t after = ReadPerformanceCounter();
+            multithread->Leave();
             lastPresent = before;
             static int loggedPresents = 0;
             if (loggedPresents++ < 3) {
