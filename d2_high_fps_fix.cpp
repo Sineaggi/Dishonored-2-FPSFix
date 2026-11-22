@@ -438,8 +438,13 @@ bool g_enableInterpolationAbProbe = false;
 bool g_toggleSounds = true;
 bool g_overlay = false;
 // [Fix] PresentMode: 0 = the game's own sync interval, 1 = mailbox (windowed
-// presents use sync interval 0, so the compositor shows the newest frame).
+// presents use sync interval 0, so the compositor shows the newest frame),
+// 2 = mode 1 plus a flip-discard swap chain with 3 buffers created in place of
+// the game's blt swap chain (no tearing flag), see InstallFlipSwapChainHooks.
 int g_presentMode = 0;
+bool InstallFlipSwapChainHooks();
+// Set while the overlay creates its throwaway probe swap chain.
+std::atomic<bool> g_creatingProbeSwapChain{false};
 extern std::atomic<int> g_screenParticleMode;
 void CycleScreenParticleMode();
 bool InstallInlineHook(std::uintptr_t rva, const unsigned char* expected, std::size_t length,
@@ -1073,7 +1078,7 @@ void LoadConfiguration() {
         L"Diagnostics", L"ToggleSounds", 1, path) != 0;
     g_overlay = GetPrivateProfileIntW(
         L"Diagnostics", L"Overlay", 0, path) != 0;
-    g_presentMode = std::max(0, std::min(1, static_cast<int>(
+    g_presentMode = std::max(0, std::min(2, static_cast<int>(
         GetPrivateProfileIntW(L"Fix", L"PresentMode", 0, path))));
     g_crashLog = GetPrivateProfileIntW(
         L"Diagnostics", L"CrashLog", 0, path) != 0;
@@ -9727,7 +9732,7 @@ UINT ApplyPresentMode(IDXGISwapChain* swapChain, UINT syncInterval, UINT flags) 
     }
     const bool windowed = lastWindowed.load(std::memory_order_relaxed);
     const UINT applied =
-        g_presentMode == 1 && windowed && (flags & DXGI_PRESENT_TEST) == 0 ? 0U
+        g_presentMode >= 1 && windowed && (flags & DXGI_PRESENT_TEST) == 0 ? 0U
                                                                            : syncInterval;
     if (lastLogged.exchange(swapChain) != swapChain) {
         DXGI_SWAP_CHAIN_DESC description{};
@@ -9832,9 +9837,11 @@ bool InstallOverlayPresentHook() {
     IDXGISwapChain* swapChain = nullptr;
     ID3D11Device* device = nullptr;
     ID3D11DeviceContext* context = nullptr;
+    g_creatingProbeSwapChain.store(true, std::memory_order_release);
     const HRESULT result = create(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0,
                                   D3D11_SDK_VERSION, &description, &swapChain, &device,
                                   nullptr, &context);
+    g_creatingProbeSwapChain.store(false, std::memory_order_release);
     bool installed = false;
     if (SUCCEEDED(result) && swapChain != nullptr) {
         void** vtable = *reinterpret_cast<void***>(swapChain);
@@ -9875,6 +9882,310 @@ bool InstallOverlayPresentHook() {
 DWORD WINAPI OverlayPresentHookThread(void*) {
     InstallOverlayPresentHook();
     return 0;
+}
+
+// ---------------------------------------------------------------------------
+// PresentMode=2: flip-discard swap chain.
+//
+// The game creates a blt-model (DXGI_SWAP_EFFECT_DISCARD) swap chain with two
+// buffers. Windows 11 "Optimizations for windowed games" upgrades it to a
+// two-buffer flip chain without the tearing flag, and that chain blocks at the
+// refresh rate. Here the system DXGI factory's CreateSwapChain and
+// CreateSwapChainForHwnd are hooked (below ReShade/Luma, which call the real
+// factory) and a windowed blt request becomes FLIP_DISCARD with 3 buffers,
+// still without the tearing flag. With sync interval 0 the compositor then
+// replaces a queued frame with the newer one instead of blocking, if Windows
+// honours that for a composed flip chain; this is the experiment.
+//
+// Flip chains cannot use an _SRGB buffer format, so an sRGB request is
+// created as the matching UNORM format and the render-target views the game
+// creates on the back buffer are given the sRGB format back (D3D11 allows an
+// sRGB view of a flip chain's UNORM buffer), which keeps the gamma unchanged.
+// ---------------------------------------------------------------------------
+
+constexpr std::size_t kFactoryCreateSwapChainSlot = 10;
+constexpr std::size_t kFactory2CreateSwapChainForHwndSlot = 15;
+constexpr std::size_t kSwapChainResizeBuffersSlot = 13;
+constexpr std::size_t kDeviceCreateRenderTargetViewSlot = 9;
+constexpr UINT kFlipBufferCount = 3;
+
+using CreateSwapChainFn = HRESULT(STDMETHODCALLTYPE*)(IDXGIFactory*, IUnknown*,
+                                                      DXGI_SWAP_CHAIN_DESC*,
+                                                      IDXGISwapChain**);
+using CreateSwapChainForHwndFn = HRESULT(STDMETHODCALLTYPE*)(
+    IDXGIFactory2*, IUnknown*, HWND, const DXGI_SWAP_CHAIN_DESC1*,
+    const DXGI_SWAP_CHAIN_FULLSCREEN_DESC*, IDXGIOutput*, IDXGISwapChain1**);
+using ResizeBuffersFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT, UINT,
+                                                    DXGI_FORMAT, UINT);
+using CreateRenderTargetViewFn = HRESULT(STDMETHODCALLTYPE*)(
+    ID3D11Device*, ID3D11Resource*, const D3D11_RENDER_TARGET_VIEW_DESC*,
+    ID3D11RenderTargetView**);
+using CreateDXGIFactory1Fn = HRESULT(WINAPI*)(REFIID, void**);
+
+CreateSwapChainFn g_originalCreateSwapChain = nullptr;
+CreateSwapChainForHwndFn g_originalCreateSwapChainForHwnd = nullptr;
+ResizeBuffersFn g_originalResizeBuffers = nullptr;
+CreateRenderTargetViewFn g_originalCreateRenderTargetView = nullptr;
+std::atomic<IDXGISwapChain*> g_flipSwapChain{nullptr};
+std::atomic<ID3D11Resource*> g_flipBackBuffer{nullptr};
+std::atomic<DXGI_FORMAT> g_flipViewFormat{DXGI_FORMAT_UNKNOWN};
+std::atomic<int> g_flipViewRemaps{0};
+
+// Returns the flip-compatible buffer format for a requested format, or
+// DXGI_FORMAT_UNKNOWN when the request cannot be a flip chain. viewFormat
+// receives the sRGB format the game expects its views to have, if any.
+DXGI_FORMAT FlipBufferFormat(DXGI_FORMAT requested, DXGI_FORMAT* viewFormat) {
+    *viewFormat = DXGI_FORMAT_UNKNOWN;
+    switch (requested) {
+        case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+            *viewFormat = requested;
+            return DXGI_FORMAT_R8G8B8A8_UNORM;
+        case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+            *viewFormat = requested;
+            return DXGI_FORMAT_B8G8R8A8_UNORM;
+        case DXGI_FORMAT_R8G8B8A8_UNORM:
+        case DXGI_FORMAT_B8G8R8A8_UNORM:
+        case DXGI_FORMAT_R10G10B10A2_UNORM:
+        case DXGI_FORMAT_R16G16B16A16_FLOAT:
+            return requested;
+        default:
+            return DXGI_FORMAT_UNKNOWN;
+    }
+}
+
+bool IsBltSwapEffect(DXGI_SWAP_EFFECT effect) {
+    return effect == DXGI_SWAP_EFFECT_DISCARD || effect == DXGI_SWAP_EFFECT_SEQUENTIAL;
+}
+
+HRESULT STDMETHODCALLTYPE HookCreateRenderTargetView(
+    ID3D11Device* device, ID3D11Resource* resource,
+    const D3D11_RENDER_TARGET_VIEW_DESC* description, ID3D11RenderTargetView** view) {
+    const DXGI_FORMAT viewFormat = g_flipViewFormat.load(std::memory_order_acquire);
+    if (resource != nullptr && viewFormat != DXGI_FORMAT_UNKNOWN &&
+        resource == g_flipBackBuffer.load(std::memory_order_acquire)) {
+        D3D11_RENDER_TARGET_VIEW_DESC remapped{};
+        if (description == nullptr) {
+            remapped.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+            remapped.Texture2D.MipSlice = 0;
+        } else {
+            remapped = *description;
+        }
+        DXGI_FORMAT unused = DXGI_FORMAT_UNKNOWN;
+        if (remapped.Format == DXGI_FORMAT_UNKNOWN ||
+            remapped.Format == FlipBufferFormat(viewFormat, &unused)) {
+            remapped.Format = viewFormat;
+            if (g_flipViewRemaps.fetch_add(1) < 4) {
+                Log("PresentMode=2: back-buffer render-target view created as format %u "
+                    "(sRGB, as the game's swap chain format).",
+                    static_cast<unsigned>(viewFormat));
+            }
+            return g_originalCreateRenderTargetView(device, resource, &remapped, view);
+        }
+    }
+    return g_originalCreateRenderTargetView(device, resource, description, view);
+}
+
+void HookDeviceRenderTargetViews(IUnknown* deviceUnknown) {
+    if (g_originalCreateRenderTargetView != nullptr || deviceUnknown == nullptr) {
+        return;
+    }
+    ID3D11Device* device = nullptr;
+    if (FAILED(deviceUnknown->QueryInterface(__uuidof(ID3D11Device),
+                                             reinterpret_cast<void**>(&device)))) {
+        Log("PresentMode=2: the swap chain's device is not a D3D11 device; sRGB views "
+            "are not remapped.");
+        return;
+    }
+    void** vtable = *reinterpret_cast<void***>(device);
+    void* original = nullptr;
+    if (ReplaceSwapChainSlot(vtable, kDeviceCreateRenderTargetViewSlot,
+                             reinterpret_cast<const void*>(&HookCreateRenderTargetView),
+                             &original)) {
+        g_originalCreateRenderTargetView = reinterpret_cast<CreateRenderTargetViewFn>(original);
+    }
+    device->Release();
+}
+
+void RememberFlipBackBuffer(IDXGISwapChain* swapChain) {
+    ID3D11Texture2D* buffer = nullptr;
+    if (SUCCEEDED(swapChain->GetBuffer(0, __uuidof(ID3D11Texture2D),
+                                       reinterpret_cast<void**>(&buffer)))) {
+        // Only the identity is kept; the swap chain owns the buffer.
+        g_flipBackBuffer.store(buffer, std::memory_order_release);
+        buffer->Release();
+    }
+}
+
+HRESULT STDMETHODCALLTYPE HookResizeBuffers(IDXGISwapChain* swapChain, UINT bufferCount,
+                                            UINT width, UINT height, DXGI_FORMAT format,
+                                            UINT flags) {
+    if (swapChain != g_flipSwapChain.load(std::memory_order_acquire)) {
+        return g_originalResizeBuffers(swapChain, bufferCount, width, height, format, flags);
+    }
+    g_flipBackBuffer.store(nullptr, std::memory_order_release);
+    if (bufferCount != 0) {
+        bufferCount = std::max(bufferCount, kFlipBufferCount);
+    }
+    if (format != DXGI_FORMAT_UNKNOWN) {
+        DXGI_FORMAT viewFormat = DXGI_FORMAT_UNKNOWN;
+        const DXGI_FORMAT flipFormat = FlipBufferFormat(format, &viewFormat);
+        if (flipFormat != DXGI_FORMAT_UNKNOWN) {
+            format = flipFormat;
+            g_flipViewFormat.store(viewFormat, std::memory_order_release);
+        }
+    }
+    const HRESULT result =
+        g_originalResizeBuffers(swapChain, bufferCount, width, height, format, flags);
+    if (SUCCEEDED(result)) {
+        RememberFlipBackBuffer(swapChain);
+    } else {
+        Log("PresentMode=2: ResizeBuffers(%u, %ux%u, format %u) failed with 0x%08lX.",
+            bufferCount, width, height, static_cast<unsigned>(format),
+            static_cast<unsigned long>(result));
+    }
+    return result;
+}
+
+void AdoptFlipSwapChain(IDXGISwapChain* swapChain, IUnknown* device,
+                        DXGI_FORMAT viewFormat) {
+    g_flipViewFormat.store(viewFormat, std::memory_order_release);
+    g_flipSwapChain.store(swapChain, std::memory_order_release);
+    RememberFlipBackBuffer(swapChain);
+    if (viewFormat != DXGI_FORMAT_UNKNOWN) {
+        HookDeviceRenderTargetViews(device);
+    }
+    if (g_originalResizeBuffers == nullptr) {
+        void** vtable = *reinterpret_cast<void***>(swapChain);
+        void* original = nullptr;
+        if (ReplaceSwapChainSlot(vtable, kSwapChainResizeBuffersSlot,
+                                 reinterpret_cast<const void*>(&HookResizeBuffers),
+                                 &original)) {
+            g_originalResizeBuffers = reinterpret_cast<ResizeBuffersFn>(original);
+        }
+    }
+}
+
+HRESULT STDMETHODCALLTYPE HookCreateSwapChain(IDXGIFactory* factory, IUnknown* device,
+                                              DXGI_SWAP_CHAIN_DESC* description,
+                                              IDXGISwapChain** swapChain) {
+    if (g_creatingProbeSwapChain.load(std::memory_order_acquire)) {
+        return g_originalCreateSwapChain(factory, device, description, swapChain);
+    }
+    if (description == nullptr || !description->Windowed ||
+        !IsBltSwapEffect(description->SwapEffect) || description->SampleDesc.Count != 1) {
+        if (description != nullptr) {
+            Log("PresentMode=2: swap chain left as requested (swap effect %u, %s, %u "
+                "samples).", static_cast<unsigned>(description->SwapEffect),
+                description->Windowed ? "windowed" : "exclusive fullscreen",
+                description->SampleDesc.Count);
+        }
+        return g_originalCreateSwapChain(factory, device, description, swapChain);
+    }
+    DXGI_FORMAT viewFormat = DXGI_FORMAT_UNKNOWN;
+    const DXGI_FORMAT flipFormat = FlipBufferFormat(description->BufferDesc.Format, &viewFormat);
+    if (flipFormat == DXGI_FORMAT_UNKNOWN) {
+        Log("PresentMode=2: buffer format %u has no flip-model equivalent; swap chain left "
+            "as requested.", static_cast<unsigned>(description->BufferDesc.Format));
+        return g_originalCreateSwapChain(factory, device, description, swapChain);
+    }
+    DXGI_SWAP_CHAIN_DESC flip = *description;
+    flip.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    flip.BufferCount = std::max(description->BufferCount, kFlipBufferCount);
+    flip.BufferDesc.Format = flipFormat;
+    const HRESULT result = g_originalCreateSwapChain(factory, device, &flip, swapChain);
+    if (SUCCEEDED(result) && swapChain != nullptr && *swapChain != nullptr) {
+        AdoptFlipSwapChain(*swapChain, device, viewFormat);
+        Log("PresentMode=2: created %ux%u swap chain as flip-discard with %u buffers "
+            "(requested swap effect %u, %u buffers, format %u; buffer format %u; flags "
+            "0x%X).", flip.BufferDesc.Width, flip.BufferDesc.Height, flip.BufferCount,
+            static_cast<unsigned>(description->SwapEffect), description->BufferCount,
+            static_cast<unsigned>(description->BufferDesc.Format),
+            static_cast<unsigned>(flipFormat), flip.Flags);
+        return result;
+    }
+    Log("PresentMode=2: flip-discard creation failed with 0x%08lX; creating the swap chain "
+        "as requested.", static_cast<unsigned long>(result));
+    return g_originalCreateSwapChain(factory, device, description, swapChain);
+}
+
+HRESULT STDMETHODCALLTYPE HookCreateSwapChainForHwnd(
+    IDXGIFactory2* factory, IUnknown* device, HWND window,
+    const DXGI_SWAP_CHAIN_DESC1* description,
+    const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fullscreen, IDXGIOutput* output,
+    IDXGISwapChain1** swapChain) {
+    const bool windowed = fullscreen == nullptr || fullscreen->Windowed;
+    if (g_creatingProbeSwapChain.load(std::memory_order_acquire) || description == nullptr ||
+        !windowed || !IsBltSwapEffect(description->SwapEffect) ||
+        description->SampleDesc.Count != 1) {
+        return g_originalCreateSwapChainForHwnd(factory, device, window, description,
+                                                fullscreen, output, swapChain);
+    }
+    DXGI_FORMAT viewFormat = DXGI_FORMAT_UNKNOWN;
+    const DXGI_FORMAT flipFormat = FlipBufferFormat(description->Format, &viewFormat);
+    if (flipFormat == DXGI_FORMAT_UNKNOWN) {
+        return g_originalCreateSwapChainForHwnd(factory, device, window, description,
+                                                fullscreen, output, swapChain);
+    }
+    DXGI_SWAP_CHAIN_DESC1 flip = *description;
+    flip.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    flip.BufferCount = std::max(description->BufferCount, kFlipBufferCount);
+    flip.Format = flipFormat;
+    flip.Scaling = DXGI_SCALING_STRETCH;
+    const HRESULT result = g_originalCreateSwapChainForHwnd(factory, device, window, &flip,
+                                                            fullscreen, output, swapChain);
+    if (SUCCEEDED(result) && swapChain != nullptr && *swapChain != nullptr) {
+        AdoptFlipSwapChain(*swapChain, device, viewFormat);
+        Log("PresentMode=2: created %ux%u swap chain (ForHwnd) as flip-discard with %u "
+            "buffers (requested swap effect %u, format %u).", flip.Width, flip.Height,
+            flip.BufferCount, static_cast<unsigned>(description->SwapEffect),
+            static_cast<unsigned>(description->Format));
+        return result;
+    }
+    Log("PresentMode=2: flip-discard creation (ForHwnd) failed with 0x%08lX; creating the "
+        "swap chain as requested.", static_cast<unsigned long>(result));
+    return g_originalCreateSwapChainForHwnd(factory, device, window, description, fullscreen,
+                                            output, swapChain);
+}
+
+// Hooks the system DXGI factory vtable (shared by every factory in the
+// process). dxgi.dll is loaded from System32 explicitly, because the one in
+// the game folder is ReShade's proxy.
+bool InstallFlipSwapChainHooks() {
+    wchar_t path[MAX_PATH]{};
+    const UINT length = GetSystemDirectoryW(path, MAX_PATH);
+    if (length == 0 || length + 10 >= MAX_PATH) {
+        return false;
+    }
+    wcscat_s(path, L"\\dxgi.dll");
+    HMODULE dxgi = LoadLibraryW(path);
+    const auto create = dxgi != nullptr
+        ? reinterpret_cast<CreateDXGIFactory1Fn>(GetProcAddress(dxgi, "CreateDXGIFactory1"))
+        : nullptr;
+    IDXGIFactory2* factory = nullptr;
+    if (create == nullptr ||
+        FAILED(create(__uuidof(IDXGIFactory2), reinterpret_cast<void**>(&factory)))) {
+        Log("PresentMode=2: unable to create a system DXGI factory; the swap chain is left "
+            "to the game.");
+        return false;
+    }
+    void** vtable = *reinterpret_cast<void***>(factory);
+    void* original = nullptr;
+    bool installed = false;
+    if (ReplaceSwapChainSlot(vtable, kFactoryCreateSwapChainSlot,
+                             reinterpret_cast<const void*>(&HookCreateSwapChain), &original)) {
+        g_originalCreateSwapChain = reinterpret_cast<CreateSwapChainFn>(original);
+        installed = true;
+    }
+    if (ReplaceSwapChainSlot(vtable, kFactory2CreateSwapChainForHwndSlot,
+                             reinterpret_cast<const void*>(&HookCreateSwapChainForHwnd),
+                             &original)) {
+        g_originalCreateSwapChainForHwnd = reinterpret_cast<CreateSwapChainForHwndFn>(original);
+    }
+    factory->Release();
+    Log(installed ? "PresentMode=2: hooked the system DXGI factory; a windowed blt swap chain "
+                    "will be created as flip-discard with 3 buffers (no tearing flag)."
+                  : "PresentMode=2: unable to hook the DXGI factory.");
+    return installed;
 }
 
 bool InstallShadowCasterBuildHooks() {
@@ -11078,6 +11389,10 @@ DWORD WINAPI InstallThread(void*) {
         return 0;
     }
     LoadConfiguration();
+    // Before the layout check: the game creates its swap chain during startup.
+    if (g_presentMode == 2) {
+        InstallFlipSwapChainHooks();
+    }
     if (g_crashLog && AddVectoredExceptionHandler(1, CrashLogHandler) != nullptr) {
         Log("CrashLog: first-chance exception logging is on.");
     }
