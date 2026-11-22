@@ -10089,25 +10089,6 @@ HRESULT STDMETHODCALLTYPE HookResizeBuffers(IDXGISwapChain* swapChain, UINT buff
     if (g_presentMode == 3 && MailboxOwnsSwapChain(swapChain)) {
         return MailboxResizeBuffers(swapChain, bufferCount, width, height, format, flags);
     }
-    if (g_presentMode == 4) {
-        // Keep the third buffer the game would otherwise resize away.
-        const UINT requested = bufferCount;
-        if (bufferCount != 0 && bufferCount < kFlipBufferCount) {
-            bufferCount = kFlipBufferCount;
-        }
-        HRESULT result =
-            g_originalResizeBuffers(swapChain, bufferCount, width, height, format, flags);
-        if (FAILED(result) && bufferCount != requested) {
-            result = g_originalResizeBuffers(swapChain, requested, width, height, format, flags);
-        }
-        static std::atomic<int> logged{0};
-        if (logged.fetch_add(1) < 4) {
-            Log("PresentMode=4: ResizeBuffers(%u -> %u buffers, %ux%u, format %u) returned "
-                "0x%08lX.", requested, bufferCount, width, height,
-                static_cast<unsigned>(format), static_cast<unsigned long>(result));
-        }
-        return result;
-    }
     if (swapChain != g_flipSwapChain.load(std::memory_order_acquire)) {
         return g_originalResizeBuffers(swapChain, bufferCount, width, height, format, flags);
     }
@@ -10163,31 +10144,6 @@ HRESULT STDMETHODCALLTYPE HookCreateSwapChain(IDXGIFactory* factory, IUnknown* d
     if (g_presentMode == 3) {
         return MailboxCreateSwapChain(factory, device, description, swapChain);
     }
-    if (g_presentMode == 4) {
-        // Same swap effect and format; only a third buffer, so the GPU has a
-        // free buffer while one is on screen and one is queued.
-        if (description == nullptr || description->BufferCount >= kFlipBufferCount) {
-            return g_originalCreateSwapChain(factory, device, description, swapChain);
-        }
-        DXGI_SWAP_CHAIN_DESC more = *description;
-        more.BufferCount = kFlipBufferCount;
-        HRESULT result = g_originalCreateSwapChain(factory, device, &more, swapChain);
-        Log("PresentMode=4: created swap chain with %u buffers instead of %u (0x%08lX).",
-            more.BufferCount, description->BufferCount, static_cast<unsigned long>(result));
-        if (FAILED(result)) {
-            return g_originalCreateSwapChain(factory, device, description, swapChain);
-        }
-        if (g_originalResizeBuffers == nullptr && swapChain != nullptr && *swapChain != nullptr) {
-            void** vtable = *reinterpret_cast<void***>(*swapChain);
-            void* original = nullptr;
-            if (ReplaceSwapChainSlot(vtable, kSwapChainResizeBuffersSlot,
-                                     reinterpret_cast<const void*>(&HookResizeBuffers),
-                                     &original)) {
-                g_originalResizeBuffers = reinterpret_cast<ResizeBuffersFn>(original);
-            }
-        }
-        return result;
-    }
     if (description == nullptr || !description->Windowed ||
         !IsBltSwapEffect(description->SwapEffect) || description->SampleDesc.Count != 1) {
         if (description != nullptr) {
@@ -10234,11 +10190,6 @@ HRESULT STDMETHODCALLTYPE HookCreateSwapChainForHwnd(
     if (g_presentMode == 3 && !g_creatingProbeSwapChain.load(std::memory_order_acquire)) {
         return MailboxCreateSwapChainForHwnd(factory, device, window, description, fullscreen,
                                              output, swapChain);
-    }
-    if (g_presentMode == 4) {
-        // Only the flip conversion below is PresentMode=2's; leave this path alone.
-        return g_originalCreateSwapChainForHwnd(factory, device, window, description,
-                                                fullscreen, output, swapChain);
     }
     if (g_creatingProbeSwapChain.load(std::memory_order_acquire) || description == nullptr ||
         !windowed || !IsBltSwapEffect(description->SwapEffect) ||
@@ -10308,11 +10259,7 @@ bool InstallFlipSwapChainHooks() {
         g_originalCreateSwapChainForHwnd = reinterpret_cast<CreateSwapChainForHwndFn>(original);
     }
     factory->Release();
-    if (g_presentMode == 4) {
-        Log(installed ? "PresentMode=4: hooked the system DXGI factory; the game's swap chain "
-                        "gets a third buffer."
-                      : "PresentMode=4: unable to hook the DXGI factory.");
-    } else if (g_presentMode == 3) {
+    if (g_presentMode == 3) {
         Log(installed ? "PresentMode=3: hooked the system DXGI factory; the game's swap chain "
                         "gets a proxy back buffer and a plugin present thread."
                       : "PresentMode=3: unable to hook the DXGI factory.");
@@ -12440,7 +12387,7 @@ DWORD WINAPI InstallThread(void*) {
     }
     LoadConfiguration();
     // Before the layout check: the game creates its swap chain during startup.
-    if (g_presentMode >= 2) {
+    if (g_presentMode == 2 || g_presentMode == 3) {
         InstallFlipSwapChainHooks();
     }
     if (g_crashLog) {
