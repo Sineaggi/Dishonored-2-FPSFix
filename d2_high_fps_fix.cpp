@@ -454,6 +454,7 @@ bool g_mailboxPresentThread = true;
 // Set at process detach: the mailbox stops intercepting and its thread stops
 // touching D3D while other modules are being torn down.
 std::atomic<bool> g_mailboxShuttingDown{false};
+PVOID g_crashLogHandle = nullptr;
 bool InstallFlipSwapChainHooks();
 bool MailboxGamePresent(IDXGISwapChain* swapChain, UINT flags, HRESULT* result);
 // 4 = paced present on the game thread: the game renders uncapped and the
@@ -10997,6 +10998,7 @@ struct PacedPresentState {
     bool usable = false;
     std::uint64_t statsStart = 0, frames = 0, presents = 0, throttleTicks = 0;
     std::uint64_t lastPresent = 0, spacingError = 0, spacingCount = 0;
+    std::uint64_t lastFrame = 0, frameInterval = 0;
     // Undo record for a forwarded Present that came back still drawing.
     std::uint64_t previousDue = 0, previousLastPresent = 0, previousSpacingError = 0;
     bool previousCounted = false;
@@ -11057,6 +11059,8 @@ bool PacedPresentSkip(IDXGISwapChain* swapChain, UINT flags) {
         g_paced.swapChain = swapChain;
         g_paced.frameIndex = 0;
         g_paced.nextDue = 0;
+        g_paced.lastFrame = 0;
+        g_paced.frameInterval = 0;
         g_paced.windowedChecked = 0;
         g_paced.periodChecked = 0;
         g_paced.statsStart = now;
@@ -11107,14 +11111,27 @@ bool PacedPresentSkip(IDXGISwapChain* swapChain, UINT flags) {
     ++g_paced.frameIndex;
     ++g_paced.frames;
     const std::uint64_t decided = ReadPerformanceCounter();
-    const bool present = decided >= g_paced.nextDue;
+    // Smoothed game frame interval. A frame is presented if it arrives within
+    // half a frame interval before its due slot: at or below the refresh rate
+    // every frame is then presented (a strict "due or later" rule drops a
+    // frame whenever the phase drifts, which shows up as flicker), and above
+    // it each slot still gets the frame closest to it.
+    if (g_paced.lastFrame != 0) {
+        const std::uint64_t interval = decided - g_paced.lastFrame;
+        g_paced.frameInterval = g_paced.frameInterval == 0
+            ? interval
+            : (g_paced.frameInterval * 7 + interval) / 8;
+    }
+    g_paced.lastFrame = decided;
+    const std::uint64_t early = std::min(g_paced.frameInterval / 2, g_paced.period / 2);
+    const bool present = decided + early >= g_paced.nextDue;
     if (present) {
         g_paced.previousDue = g_paced.nextDue;
         g_paced.previousLastPresent = g_paced.lastPresent;
         g_paced.previousSpacingError = g_paced.spacingError;
         g_paced.previousCounted = g_paced.lastPresent != 0;
         // Keep a fixed cadence; resynchronize after a stall.
-        g_paced.nextDue = decided - g_paced.nextDue > g_paced.period
+        g_paced.nextDue = decided > g_paced.nextDue && decided - g_paced.nextDue > g_paced.period
             ? decided + g_paced.period
             : g_paced.nextDue + g_paced.period;
         if (g_paced.lastPresent != 0) {
@@ -12373,8 +12390,11 @@ DWORD WINAPI InstallThread(void*) {
     if (g_presentMode == 2 || g_presentMode == 3) {
         InstallFlipSwapChainHooks();
     }
-    if (g_crashLog && AddVectoredExceptionHandler(1, CrashLogHandler) != nullptr) {
-        Log("CrashLog: first-chance exception logging is on.");
+    if (g_crashLog) {
+        g_crashLogHandle = AddVectoredExceptionHandler(1, CrashLogHandler);
+        if (g_crashLogHandle != nullptr) {
+            Log("CrashLog: first-chance exception logging is on.");
+        }
     }
     if (!VerifyExecutableLayout()) {
         return 0;
@@ -12418,6 +12438,13 @@ DWORD WINAPI InstallThread(void*) {
 BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID reserved) {
     if (reason == DLL_PROCESS_DETACH) {
         g_mailboxShuttingDown.store(true, std::memory_order_release);
+        // Threads that outlive this module's teardown (the GPU driver's, at
+        // exit) must not reach the crash logger: it would run on destroyed
+        // runtime state, and Windows fast-fails the process.
+        if (g_crashLogHandle != nullptr) {
+            RemoveVectoredExceptionHandler(g_crashLogHandle);
+            g_crashLogHandle = nullptr;
+        }
     }
     if (reason == DLL_PROCESS_DETACH && g_presentMode == 3) {
         // Not reached on TerminateProcess or a fast-fail, which tells those apart.
