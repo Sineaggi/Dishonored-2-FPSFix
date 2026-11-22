@@ -451,8 +451,20 @@ int g_presentMode = 0;
 // [Fix] PresentThread (PresentMode=3 only): 0 keeps the proxy back buffer but
 // presents on the game thread, which separates proxy problems from threading.
 bool g_mailboxPresentThread = true;
+// Set at process detach: the mailbox stops intercepting and its thread stops
+// touching D3D while other modules are being torn down.
+std::atomic<bool> g_mailboxShuttingDown{false};
 bool InstallFlipSwapChainHooks();
 bool MailboxGamePresent(IDXGISwapChain* swapChain, UINT flags, HRESULT* result);
+// 4 = paced present on the game thread: the game renders uncapped and the
+// real Present runs at most once per refresh period; frames in between skip
+// it (the next frame overwrites the blt back buffer). Everything stays on the
+// game thread, which Luma and overlays that hook Present require.
+bool PacedPresentSkip(IDXGISwapChain* swapChain, UINT flags);
+// Forwards a paced Present without blocking (DXGI_PRESENT_DO_NOT_WAIT); a
+// still-busy display queue drops the frame and retries on the next one.
+HRESULT PacedPresentForward(IDXGISwapChain* swapChain, UINT flags, bool present1,
+                            const DXGI_PRESENT_PARAMETERS* parameters);
 // Set while the overlay creates its throwaway probe swap chain.
 std::atomic<bool> g_creatingProbeSwapChain{false};
 extern std::atomic<int> g_screenParticleMode;
@@ -1088,7 +1100,7 @@ void LoadConfiguration() {
         L"Diagnostics", L"ToggleSounds", 1, path) != 0;
     g_overlay = GetPrivateProfileIntW(
         L"Diagnostics", L"Overlay", 0, path) != 0;
-    g_presentMode = std::max(0, std::min(3, static_cast<int>(
+    g_presentMode = std::max(0, std::min(4, static_cast<int>(
         GetPrivateProfileIntW(L"Fix", L"PresentMode", 0, path))));
     g_mailboxPresentThread =
         GetPrivateProfileIntW(L"Fix", L"PresentThread", 1, path) != 0;
@@ -9776,6 +9788,13 @@ HRESULT STDMETHODCALLTYPE HookPresent(IDXGISwapChain* swapChain, UINT syncInterv
     if (g_presentMode == 3 && MailboxGamePresent(swapChain, flags, &mailboxResult)) {
         return mailboxResult;
     }
+    if (g_presentMode == 4 && (flags & DXGI_PRESENT_TEST) == 0) {
+        if (PacedPresentSkip(swapChain, flags)) {
+            return S_OK;
+        }
+        ApplyPresentMode(swapChain, syncInterval, flags);  // logs the "Present:" line once
+        return PacedPresentForward(swapChain, flags, false, nullptr);
+    }
     syncInterval = ApplyPresentMode(swapChain, syncInterval, flags);
     const HRESULT result = g_originalPresent(swapChain, syncInterval, flags);
     static std::atomic<int> failures{0};
@@ -9794,6 +9813,13 @@ HRESULT STDMETHODCALLTYPE HookPresent1(IDXGISwapChain1* swapChain, UINT syncInte
     HRESULT mailboxResult = S_OK;
     if (g_presentMode == 3 && MailboxGamePresent(swapChain, flags, &mailboxResult)) {
         return mailboxResult;
+    }
+    if (g_presentMode == 4 && (flags & DXGI_PRESENT_TEST) == 0) {
+        if (PacedPresentSkip(swapChain, flags)) {
+            return S_OK;
+        }
+        ApplyPresentMode(swapChain, syncInterval, flags);
+        return PacedPresentForward(swapChain, flags, true, parameters);
     }
     syncInterval = ApplyPresentMode(swapChain, syncInterval, flags);
     return g_originalPresent1(swapChain, syncInterval, flags, parameters);
@@ -10333,7 +10359,8 @@ std::atomic<std::uint64_t> g_mailboxGameTicks{0};      // QPC in the game-thread
 std::atomic<std::uint64_t> g_mailboxThrottleTicks{0};  // QPC waiting on frames in flight
 
 bool MailboxOwnsSwapChain(IDXGISwapChain* swapChain) {
-    return swapChain != nullptr && swapChain == g_mailboxSwapChain.load(std::memory_order_acquire);
+    return swapChain != nullptr && !g_mailboxShuttingDown.load(std::memory_order_acquire) &&
+           swapChain == g_mailboxSwapChain.load(std::memory_order_acquire);
 }
 
 bool LumaFrameGenerationEnabled() {
@@ -10682,8 +10709,15 @@ DWORD WINAPI MailboxPresentThread(void*) {
             period = MailboxRefreshPeriod(nullptr);
             periodChecked = ReadPerformanceCounter();
         }
+        if (g_mailboxShuttingDown.load(std::memory_order_acquire)) {
+            return 0;
+        }
         for (;;) {  // Present while new frames are pending.
             AcquireSRWLockExclusive(&g_mailboxPresentLock);
+            if (g_mailboxShuttingDown.load(std::memory_order_acquire)) {
+                ReleaseSRWLockExclusive(&g_mailboxPresentLock);
+                return 0;
+            }
             AcquireSRWLockShared(&g_mailboxLock);
             const bool ready = g_mailbox.asynchronous && g_mailbox.proxy != nullptr &&
                                g_mailbox.sequence > lastShownSequence;
@@ -10931,6 +10965,187 @@ HRESULT MailboxCreateSwapChainForHwnd(IDXGIFactory2* factory, IUnknown* device, 
         static_cast<unsigned>(description->Format));
     MailboxAdopt(*swapChain);
     return result;
+}
+
+// ---------------------------------------------------------------------------
+// PresentMode=4: paced present on the game thread.
+//
+// PresentMode=3's own present thread showed that Luma (and overlays) run code
+// inside the real Present that is not safe off the game thread. Here every
+// real Present stays on the game thread: the game renders uncapped, and its
+// Present is forwarded at most once per DWM refresh period on a fixed
+// schedule; frames in between return S_OK without presenting (with the blt
+// swap chain the next frame simply overwrites the back buffer). Because the
+// forwarded Present never outruns the display, it does not block, so the game
+// is no longer held to the refresh rate. An event query per frame keeps at
+// most 2 frames in flight on the GPU, the job Present's blocking did. Below
+// the refresh rate every frame is presented (G-Sync keeps working).
+// Exclusive fullscreen is left alone. Game thread only, so no locking.
+// ---------------------------------------------------------------------------
+
+struct PacedPresentState {
+    IDXGISwapChain* swapChain = nullptr;  // identity only
+    ID3D11Device* device = nullptr;
+    ID3D11DeviceContext* context = nullptr;
+    std::array<ID3D11Query*, 3> queries{};
+    std::uint64_t frameIndex = 0;
+    std::uint64_t nextDue = 0;
+    std::uint64_t period = 0;
+    std::uint64_t periodChecked = 0;
+    std::uint64_t windowedChecked = 0;
+    bool windowed = true;
+    bool usable = false;
+    std::uint64_t statsStart = 0, frames = 0, presents = 0, throttleTicks = 0;
+    std::uint64_t lastPresent = 0, spacingError = 0, spacingCount = 0;
+    // Undo record for a forwarded Present that came back still drawing.
+    std::uint64_t previousDue = 0, previousLastPresent = 0, previousSpacingError = 0;
+    bool previousCounted = false;
+    std::uint64_t stillDrawing = 0, presentTicks = 0, presentMax = 0;
+};
+PacedPresentState g_paced;
+
+HRESULT PacedPresentForward(IDXGISwapChain* swapChain, UINT flags, bool present1,
+                            const DXGI_PRESENT_PARAMETERS* parameters) {
+    if (!g_paced.usable || !g_paced.windowed || swapChain != g_paced.swapChain) {
+        return present1 && g_originalPresent1 != nullptr
+            ? g_originalPresent1(static_cast<IDXGISwapChain1*>(swapChain), 0, flags,
+                                 parameters)
+            : g_originalPresent(swapChain, 0, flags);
+    }
+    const UINT forwarded = flags | DXGI_PRESENT_DO_NOT_WAIT;
+    const std::uint64_t before = ReadPerformanceCounter();
+    HRESULT result =
+        present1 && g_originalPresent1 != nullptr
+            ? g_originalPresent1(static_cast<IDXGISwapChain1*>(swapChain), 0, forwarded,
+                                 parameters)
+            : g_originalPresent(swapChain, 0, forwarded);
+    const std::uint64_t took = ReadPerformanceCounter() - before;
+    g_paced.presentTicks += took;
+    g_paced.presentMax = std::max(g_paced.presentMax, took);
+    if (result == DXGI_ERROR_WAS_STILL_DRAWING) {
+        // The display queue is full: drop this frame and present the next.
+        g_paced.nextDue = g_paced.previousDue;
+        g_paced.lastPresent = g_paced.previousLastPresent;
+        if (g_paced.previousCounted) {
+            g_paced.spacingError = g_paced.previousSpacingError;
+            --g_paced.spacingCount;
+        }
+        --g_paced.presents;
+        ++g_paced.stillDrawing;
+        return S_OK;
+    }
+    return result;
+}
+
+void ReleasePacedPresentState() {
+    for (ID3D11Query*& query : g_paced.queries) {
+        ReleaseOverlayObject(query);
+    }
+    ReleaseOverlayObject(g_paced.context);
+    ReleaseOverlayObject(g_paced.device);
+    g_paced.usable = false;
+}
+
+bool PacedPresentSkip(IDXGISwapChain* swapChain, UINT flags) {
+    if ((flags & DXGI_PRESENT_TEST) != 0 || swapChain == nullptr) {
+        return false;
+    }
+    const std::uint64_t frequency = QpcFrequency();
+    const std::uint64_t now = ReadPerformanceCounter();
+    if (swapChain != g_paced.swapChain) {
+        ReleasePacedPresentState();
+        g_paced.swapChain = swapChain;
+        g_paced.frameIndex = 0;
+        g_paced.nextDue = 0;
+        g_paced.windowedChecked = 0;
+        g_paced.periodChecked = 0;
+        g_paced.statsStart = now;
+        bool ok = SUCCEEDED(swapChain->GetDevice(__uuidof(ID3D11Device),
+                                                 reinterpret_cast<void**>(&g_paced.device)));
+        if (ok) {
+            g_paced.device->GetImmediateContext(&g_paced.context);
+            D3D11_QUERY_DESC query{D3D11_QUERY_EVENT, 0};
+            for (ID3D11Query*& slot : g_paced.queries) {
+                ok = ok && SUCCEEDED(g_paced.device->CreateQuery(&query, &slot));
+            }
+        }
+        g_paced.usable = ok;
+        Log(ok ? "PresentMode=4: pacing swap chain %p on the game thread."
+               : "PresentMode=4: unable to set up pacing for swap chain %p; presenting "
+                 "normally.", static_cast<void*>(swapChain));
+    }
+    if (!g_paced.usable) {
+        return false;
+    }
+    if (g_paced.windowedChecked == 0 || now - g_paced.windowedChecked > frequency) {
+        DXGI_SWAP_CHAIN_DESC description{};  // GetDesc, not GetFullscreenState (deadlock)
+        g_paced.windowed = SUCCEEDED(swapChain->GetDesc(&description)) && description.Windowed;
+        g_paced.windowedChecked = now;
+    }
+    if (!g_paced.windowed) {
+        return false;
+    }
+    if (g_paced.periodChecked == 0 || now - g_paced.periodChecked > frequency * 2) {
+        g_paced.period = MailboxRefreshPeriod(nullptr);
+        g_paced.periodChecked = now;
+    }
+    // Frames in flight: wait for the frame two before this one.
+    ID3D11Query* current = g_paced.queries[g_paced.frameIndex % g_paced.queries.size()];
+    g_paced.context->End(current);
+    if (g_paced.frameIndex >= g_paced.queries.size() - 1) {
+        ID3D11Query* waitFor =
+            g_paced.queries[(g_paced.frameIndex + 1) % g_paced.queries.size()];
+        const std::uint64_t waitStart = ReadPerformanceCounter();
+        const std::uint64_t limit = waitStart + frequency / 4;
+        BOOL done = FALSE;
+        while (g_paced.context->GetData(waitFor, &done, sizeof(done), 0) == S_FALSE &&
+               ReadPerformanceCounter() < limit) {
+            SwitchToThread();
+        }
+        g_paced.throttleTicks += ReadPerformanceCounter() - waitStart;
+    }
+    ++g_paced.frameIndex;
+    ++g_paced.frames;
+    const std::uint64_t decided = ReadPerformanceCounter();
+    const bool present = decided >= g_paced.nextDue;
+    if (present) {
+        g_paced.previousDue = g_paced.nextDue;
+        g_paced.previousLastPresent = g_paced.lastPresent;
+        g_paced.previousSpacingError = g_paced.spacingError;
+        g_paced.previousCounted = g_paced.lastPresent != 0;
+        // Keep a fixed cadence; resynchronize after a stall.
+        g_paced.nextDue = decided - g_paced.nextDue > g_paced.period
+            ? decided + g_paced.period
+            : g_paced.nextDue + g_paced.period;
+        if (g_paced.lastPresent != 0) {
+            const std::uint64_t spacing = decided - g_paced.lastPresent;
+            g_paced.spacingError +=
+                spacing > g_paced.period ? spacing - g_paced.period : g_paced.period - spacing;
+            ++g_paced.spacingCount;
+        }
+        g_paced.lastPresent = decided;
+        ++g_paced.presents;
+    }
+    if (decided - g_paced.statsStart >= frequency * 5) {
+        const double seconds = static_cast<double>(decided - g_paced.statsStart) /
+                               static_cast<double>(frequency);
+        const double toMs = 1000.0 / static_cast<double>(frequency);
+        const std::uint64_t attempts = g_paced.presents + g_paced.stillDrawing;
+        Log("PresentMode=4 %.1fs: game %.1f FPS, shown %.1f FPS (refresh %.1f Hz), %llu "
+            "presents found the queue busy; Present %.3f ms avg, %.3f ms max; throttle "
+            "wait %.3f ms/frame; shown-frame spacing error %.3f ms avg.",
+            seconds, g_paced.frames / seconds, g_paced.presents / seconds,
+            static_cast<double>(frequency) / static_cast<double>(g_paced.period),
+            static_cast<unsigned long long>(g_paced.stillDrawing),
+            attempts ? g_paced.presentTicks * toMs / attempts : 0.0, g_paced.presentMax * toMs,
+            g_paced.frames ? g_paced.throttleTicks * toMs / g_paced.frames : 0.0,
+            g_paced.spacingCount ? g_paced.spacingError * toMs / g_paced.spacingCount : 0.0);
+        g_paced.statsStart = decided;
+        g_paced.frames = g_paced.presents = g_paced.throttleTicks = 0;
+        g_paced.spacingError = g_paced.spacingCount = 0;
+        g_paced.stillDrawing = g_paced.presentTicks = g_paced.presentMax = 0;
+    }
+    return !present;
 }
 
 HRESULT MailboxResizeBuffers(IDXGISwapChain* swapChain, UINT bufferCount, UINT width,
@@ -12155,7 +12370,7 @@ DWORD WINAPI InstallThread(void*) {
     }
     LoadConfiguration();
     // Before the layout check: the game creates its swap chain during startup.
-    if (g_presentMode >= 2) {
+    if (g_presentMode == 2 || g_presentMode == 3) {
         InstallFlipSwapChainHooks();
     }
     if (g_crashLog && AddVectoredExceptionHandler(1, CrashLogHandler) != nullptr) {
@@ -12201,6 +12416,9 @@ DWORD WINAPI InstallThread(void*) {
 }  // namespace
 
 BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID reserved) {
+    if (reason == DLL_PROCESS_DETACH) {
+        g_mailboxShuttingDown.store(true, std::memory_order_release);
+    }
     if (reason == DLL_PROCESS_DETACH && g_presentMode == 3) {
         // Not reached on TerminateProcess or a fast-fail, which tells those apart.
         Log("PresentMode=3: process detach (%s).",
