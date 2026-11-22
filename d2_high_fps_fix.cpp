@@ -451,6 +451,19 @@ int g_presentMode = 0;
 // [Fix] PresentThread (PresentMode=3 only): 0 keeps the proxy back buffer but
 // presents on the game thread, which separates proxy problems from threading.
 bool g_mailboxPresentThread = true;
+// [Fix] PresentPacingHz (PresentMode=4 diagnostic): forward Presents at this
+// rate instead of the display refresh; 0 = the refresh rate. A low value shows
+// whether presentation is what gates the game's frame rate.
+int g_presentPacingHz = 0;
+// [Fix] SkippedTestPresent (PresentMode=4): 1 = for each skipped frame, call
+// the real Present with DXGI_PRESENT_TEST (shows nothing) so overlays that
+// count Presents, like Steam's FPS counter, count rendered frames. Read live.
+bool g_skippedTestPresent = false;
+// [Fix] FpsReadout (PresentMode=4): 1 = draw "rendered / shown FPS" in the
+// top-right corner through the plugin overlay (needs Overlay=1). Read live.
+bool g_fpsReadout = false;
+std::atomic<int> g_readoutRenderedFps{0};
+std::atomic<int> g_readoutShownFps{0};
 // Set at process detach: the mailbox stops intercepting and its thread stops
 // touching D3D while other modules are being torn down.
 std::atomic<bool> g_mailboxShuttingDown{false};
@@ -1105,6 +1118,8 @@ void LoadConfiguration() {
         GetPrivateProfileIntW(L"Fix", L"PresentMode", 0, path))));
     g_mailboxPresentThread =
         GetPrivateProfileIntW(L"Fix", L"PresentThread", 1, path) != 0;
+    g_presentPacingHz = std::max(0, std::min(1000, static_cast<int>(
+        GetPrivateProfileIntW(L"Fix", L"PresentPacingHz", 0, path))));
     g_crashLog = GetPrivateProfileIntW(
         L"Diagnostics", L"CrashLog", 0, path) != 0;
     g_devGuiScale = std::max(0, std::min(4, static_cast<int>(
@@ -9650,6 +9665,18 @@ void DrawOverlayFrame(IDXGISwapChain* swapChain) {
 
     std::vector<DevGuiTextEntry> devGui;
     CopyPublishedDevGuiText(devGui);
+    if (g_fpsReadout && g_presentMode == 4) {
+        // Right-aligned near the top-right corner, in DevGUI's 720p-based units.
+        DevGuiTextEntry readout{};
+        readout.x = width - 8.0f;
+        readout.y = 8.0f;
+        readout.scale = 1.0f;
+        readout.color = 0xFFFFFFFFu;
+        readout.alignment = 1;
+        snprintf(readout.text, sizeof(readout.text), "%d FPS rendered / %d shown",
+                 g_readoutRenderedFps.load(), g_readoutShownFps.load());
+        devGui.push_back(readout);
+    }
 
     D3D11_MAPPED_SUBRESOURCE mapped{};
     ID3DDeviceContextState* previous = nullptr;
@@ -9791,6 +9818,11 @@ HRESULT STDMETHODCALLTYPE HookPresent(IDXGISwapChain* swapChain, UINT syncInterv
     }
     if (g_presentMode == 4 && (flags & DXGI_PRESENT_TEST) == 0) {
         if (PacedPresentSkip(swapChain, flags)) {
+            if (g_skippedTestPresent) {
+                // Shows nothing, but overlays that hook the real Present (Steam's
+                // FPS counter) see one call per rendered frame.
+                g_originalPresent(swapChain, 0, DXGI_PRESENT_TEST);
+            }
             return S_OK;
         }
         ApplyPresentMode(swapChain, syncInterval, flags);  // logs the "Present:" line once
@@ -10999,6 +11031,7 @@ struct PacedPresentState {
     std::uint64_t statsStart = 0, frames = 0, presents = 0, throttleTicks = 0;
     std::uint64_t lastPresent = 0, spacingError = 0, spacingCount = 0;
     std::uint64_t lastFrame = 0, frameInterval = 0;
+    std::uint64_t readoutStart = 0, readoutFrames = 0, readoutShown = 0;
     // Undo record for a forwarded Present that came back still drawing.
     std::uint64_t previousDue = 0, previousLastPresent = 0, previousSpacingError = 0;
     bool previousCounted = false;
@@ -11090,7 +11123,29 @@ bool PacedPresentSkip(IDXGISwapChain* swapChain, UINT flags) {
         return false;
     }
     if (g_paced.periodChecked == 0 || now - g_paced.periodChecked > frequency * 2) {
-        g_paced.period = MailboxRefreshPeriod(nullptr);
+        // PresentPacingHz is re-read every 2 s so it can be tuned in game.
+        wchar_t iniPath[MAX_PATH]{};
+        BuildSiblingPath(iniPath, MAX_PATH, L"d2-high-fps-fix.ini");
+        const int pacingHz = std::max(0, std::min(1000, static_cast<int>(
+            GetPrivateProfileIntW(L"Fix", L"PresentPacingHz", 0, iniPath))));
+        const bool readout = GetPrivateProfileIntW(L"Fix", L"FpsReadout", 0, iniPath) != 0;
+        if (readout != g_fpsReadout) {
+            Log("PresentMode=4: FpsReadout=%d.", readout ? 1 : 0);
+            g_fpsReadout = readout;
+        }
+        const bool testPresent =
+            GetPrivateProfileIntW(L"Fix", L"SkippedTestPresent", 0, iniPath) != 0;
+        if (testPresent != g_skippedTestPresent) {
+            Log("PresentMode=4: SkippedTestPresent=%d.", testPresent ? 1 : 0);
+            g_skippedTestPresent = testPresent;
+        }
+        if (pacingHz != g_presentPacingHz) {
+            Log("PresentMode=4: PresentPacingHz changed from %d to %d.", g_presentPacingHz,
+                pacingHz);
+            g_presentPacingHz = pacingHz;
+        }
+        g_paced.period = g_presentPacingHz > 0 ? frequency / static_cast<std::uint64_t>(g_presentPacingHz)
+                                               : MailboxRefreshPeriod(nullptr);
         g_paced.periodChecked = now;
     }
     // Frames in flight: wait for the frame two before this one.
@@ -11142,6 +11197,21 @@ bool PacedPresentSkip(IDXGISwapChain* swapChain, UINT flags) {
         }
         g_paced.lastPresent = decided;
         ++g_paced.presents;
+    }
+    // Readout counters over half-second windows.
+    ++g_paced.readoutFrames;
+    if (present) {
+        ++g_paced.readoutShown;
+    }
+    if (g_paced.readoutStart == 0) {
+        g_paced.readoutStart = decided;
+    } else if (decided - g_paced.readoutStart >= frequency / 2) {
+        const double seconds = static_cast<double>(decided - g_paced.readoutStart) /
+                               static_cast<double>(frequency);
+        g_readoutRenderedFps.store(static_cast<int>(g_paced.readoutFrames / seconds + 0.5));
+        g_readoutShownFps.store(static_cast<int>(g_paced.readoutShown / seconds + 0.5));
+        g_paced.readoutStart = decided;
+        g_paced.readoutFrames = g_paced.readoutShown = 0;
     }
     if (decided - g_paced.statsStart >= frequency * 5) {
         const double seconds = static_cast<double>(decided - g_paced.statsStart) /
