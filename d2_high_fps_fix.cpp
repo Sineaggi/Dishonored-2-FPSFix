@@ -9712,6 +9712,9 @@ void DrawOverlayFrame(IDXGISwapChain* swapChain) {
 // game's interval, since 0 would tear there. A sync interval forced in the
 // GPU driver overrides both.
 UINT ApplyPresentMode(IDXGISwapChain* swapChain, UINT syncInterval, UINT flags) {
+    if (g_presentMode == 0) {
+        return syncInterval;  // Off: leave every present untouched.
+    }
     static std::atomic<IDXGISwapChain*> lastLogged{nullptr};
     static std::atomic<IDXGISwapChain*> lastChecked{nullptr};
     static std::atomic<bool> lastWindowed{false};
@@ -9722,11 +9725,13 @@ UINT ApplyPresentMode(IDXGISwapChain* swapChain, UINT syncInterval, UINT flags) 
     if (lastChecked.load(std::memory_order_relaxed) != swapChain ||
         now - lastCheckCounter.load(std::memory_order_relaxed) >
             static_cast<std::uint64_t>(frequency.QuadPart)) {
-        BOOL fullscreen = FALSE;
-        if (FAILED(swapChain->GetFullscreenState(&fullscreen, nullptr))) {
-            fullscreen = TRUE;  // Unknown: keep the game's interval.
-        }
-        lastWindowed.store(!fullscreen, std::memory_order_relaxed);
+        // GetFullscreenState takes DXGI's fullscreen lock and can deadlock
+        // against the window thread during the load-to-menu mode change
+        // (seen as startup hangs); the description's Windowed field does not.
+        DXGI_SWAP_CHAIN_DESC state{};
+        const bool knownWindowed =
+            SUCCEEDED(swapChain->GetDesc(&state)) && state.Windowed != FALSE;
+        lastWindowed.store(knownWindowed, std::memory_order_relaxed);
         lastChecked.store(swapChain, std::memory_order_relaxed);
         lastCheckCounter.store(now, std::memory_order_relaxed);
     }
