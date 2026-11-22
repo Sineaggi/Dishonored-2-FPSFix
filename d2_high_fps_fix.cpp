@@ -10311,6 +10311,8 @@ struct MailboxState {
 };
 
 MailboxState g_mailbox;
+std::atomic<ID3D11Resource*> g_mailboxProxyResource{nullptr};
+std::atomic<DXGI_FORMAT> g_mailboxProxyFormat{DXGI_FORMAT_UNKNOWN};
 // g_mailboxPresentLock: held by the present thread across copy+Present and by
 // ResizeBuffers/adoption while resources change. g_mailboxLock: the ring and
 // the copies into and out of it. Order: present lock, then ring lock.
@@ -10346,6 +10348,7 @@ std::uint64_t QpcFrequency() {
 
 // Releases every resource except the swap chain reference. Caller holds both locks.
 void ReleaseMailboxResources() {
+    g_mailboxProxyResource.store(nullptr, std::memory_order_release);
     ReleaseOverlayObject(g_mailbox.proxy);
     ReleaseOverlayObject(g_mailbox.realBuffer);
     for (MailboxSlot& slot : g_mailbox.slots) {
@@ -10395,6 +10398,8 @@ bool CreateMailboxResources() {
         ReleaseMailboxResources();
         return false;
     }
+    g_mailboxProxyFormat.store(description.Format, std::memory_order_release);
+    g_mailboxProxyResource.store(g_mailbox.proxy, std::memory_order_release);
     DXGI_SWAP_CHAIN_DESC chain{};
     g_mailbox.windowed = SUCCEEDED(g_mailbox.swapChain->GetDesc(&chain)) && chain.Windowed;
     g_mailbox.asynchronous = g_mailbox.windowed;
@@ -10409,6 +10414,109 @@ bool CreateMailboxResources() {
     return true;
 }
 
+// Luma upgrades the real back buffer (e.g. to R16G16B16A16_FLOAT) and rewrites
+// the game's view formats for the buffers it recognizes; the proxy copies the
+// upgraded format, so a view the game asks for in its original format (sRGB
+// R8G8B8A8) would fail and leave the game with a null view. Views on the
+// proxy therefore take the proxy's format, and any failed view creation is
+// logged.
+using CreateShaderResourceViewFn = HRESULT(STDMETHODCALLTYPE*)(
+    ID3D11Device*, ID3D11Resource*, const D3D11_SHADER_RESOURCE_VIEW_DESC*,
+    ID3D11ShaderResourceView**);
+CreateRenderTargetViewFn g_mailboxOriginalCreateRtv = nullptr;
+CreateShaderResourceViewFn g_mailboxOriginalCreateSrv = nullptr;
+
+void DescribeResourceForLog(ID3D11Resource* resource, char* out, std::size_t size) {
+    ID3D11Texture2D* texture = nullptr;
+    if (resource != nullptr &&
+        SUCCEEDED(resource->QueryInterface(__uuidof(ID3D11Texture2D),
+                                           reinterpret_cast<void**>(&texture)))) {
+        D3D11_TEXTURE2D_DESC d{};
+        texture->GetDesc(&d);
+        texture->Release();
+        snprintf(out, size, "texture %ux%u format %u bind 0x%X", d.Width, d.Height,
+                 static_cast<unsigned>(d.Format), d.BindFlags);
+    } else {
+        snprintf(out, size, "resource %p", static_cast<void*>(resource));
+    }
+}
+
+HRESULT STDMETHODCALLTYPE HookMailboxCreateRtv(ID3D11Device* device, ID3D11Resource* resource,
+                                               const D3D11_RENDER_TARGET_VIEW_DESC* description,
+                                               ID3D11RenderTargetView** view) {
+    const DXGI_FORMAT proxyFormat = g_mailboxProxyFormat.load(std::memory_order_acquire);
+    if (resource != nullptr && resource == g_mailboxProxyResource.load(std::memory_order_acquire) &&
+        description != nullptr && description->Format != proxyFormat &&
+        description->Format != DXGI_FORMAT_UNKNOWN) {
+        D3D11_RENDER_TARGET_VIEW_DESC remapped = *description;
+        remapped.Format = proxyFormat;
+        static std::atomic<int> logged{0};
+        if (logged.fetch_add(1) < 6) {
+            Log("PresentMode=3: back-buffer render-target view format %u remapped to the "
+                "proxy's format %u.", static_cast<unsigned>(description->Format),
+                static_cast<unsigned>(proxyFormat));
+        }
+        return g_mailboxOriginalCreateRtv(device, resource, &remapped, view);
+    }
+    const HRESULT result = g_mailboxOriginalCreateRtv(device, resource, description, view);
+    static std::atomic<int> failures{0};
+    if (FAILED(result) && failures.fetch_add(1) < 8) {
+        char text[128]{};
+        DescribeResourceForLog(resource, text, sizeof(text));
+        Log("PresentMode=3: CreateRenderTargetView failed 0x%08lX on %s%s (view format %u).",
+            static_cast<unsigned long>(result), text,
+            resource == g_mailboxProxyResource.load() ? " [proxy]" : "",
+            description != nullptr ? static_cast<unsigned>(description->Format) : 0u);
+    }
+    return result;
+}
+
+HRESULT STDMETHODCALLTYPE HookMailboxCreateSrv(ID3D11Device* device, ID3D11Resource* resource,
+                                               const D3D11_SHADER_RESOURCE_VIEW_DESC* description,
+                                               ID3D11ShaderResourceView** view) {
+    const DXGI_FORMAT proxyFormat = g_mailboxProxyFormat.load(std::memory_order_acquire);
+    if (resource != nullptr && resource == g_mailboxProxyResource.load(std::memory_order_acquire) &&
+        description != nullptr && description->Format != proxyFormat &&
+        description->Format != DXGI_FORMAT_UNKNOWN) {
+        D3D11_SHADER_RESOURCE_VIEW_DESC remapped = *description;
+        remapped.Format = proxyFormat;
+        static std::atomic<int> logged{0};
+        if (logged.fetch_add(1) < 6) {
+            Log("PresentMode=3: back-buffer shader-resource view format %u remapped to the "
+                "proxy's format %u.", static_cast<unsigned>(description->Format),
+                static_cast<unsigned>(proxyFormat));
+        }
+        return g_mailboxOriginalCreateSrv(device, resource, &remapped, view);
+    }
+    const HRESULT result = g_mailboxOriginalCreateSrv(device, resource, description, view);
+    static std::atomic<int> failures{0};
+    if (FAILED(result) && failures.fetch_add(1) < 8) {
+        char text[128]{};
+        DescribeResourceForLog(resource, text, sizeof(text));
+        Log("PresentMode=3: CreateShaderResourceView failed 0x%08lX on %s%s (view format %u).",
+            static_cast<unsigned long>(result), text,
+            resource == g_mailboxProxyResource.load() ? " [proxy]" : "",
+            description != nullptr ? static_cast<unsigned>(description->Format) : 0u);
+    }
+    return result;
+}
+
+void HookMailboxDeviceViews(ID3D11Device* device) {
+    if (g_mailboxOriginalCreateRtv != nullptr) {
+        return;
+    }
+    void** vtable = *reinterpret_cast<void***>(device);
+    void* original = nullptr;
+    if (ReplaceSwapChainSlot(vtable, kDeviceCreateRenderTargetViewSlot,
+                             reinterpret_cast<const void*>(&HookMailboxCreateRtv), &original)) {
+        g_mailboxOriginalCreateRtv = reinterpret_cast<CreateRenderTargetViewFn>(original);
+    }
+    if (ReplaceSwapChainSlot(vtable, 7, reinterpret_cast<const void*>(&HookMailboxCreateSrv),
+                             &original)) {
+        g_mailboxOriginalCreateSrv = reinterpret_cast<CreateShaderResourceViewFn>(original);
+    }
+}
+
 HRESULT STDMETHODCALLTYPE HookGetBuffer(IDXGISwapChain* swapChain, UINT buffer, REFIID riid,
                                         void** surface) {
     if (buffer == 0 && surface != nullptr && MailboxOwnsSwapChain(swapChain)) {
@@ -10416,6 +10524,12 @@ HRESULT STDMETHODCALLTYPE HookGetBuffer(IDXGISwapChain* swapChain, UINT buffer, 
         ID3D11Texture2D* proxy = g_mailbox.proxy;
         const HRESULT result = proxy != nullptr ? proxy->QueryInterface(riid, surface) : E_FAIL;
         ReleaseSRWLockShared(&g_mailboxLock);
+        static std::atomic<int> logged{0};
+        if (logged.fetch_add(1) < 12) {
+            Log("PresentMode=3: GetBuffer(0, riid %08lX) from %p -> %s (0x%08lX).",
+                riid.Data1, _ReturnAddress(), proxy != nullptr ? "proxy" : "real buffer",
+                static_cast<unsigned long>(result));
+        }
         if (proxy != nullptr) {
             return result;
         }
@@ -10490,6 +10604,12 @@ bool MailboxGamePresent(IDXGISwapChain* swapChain, UINT flags, HRESULT* result) 
         waitFor->Release();
     }
     context->Release();
+    static std::atomic<int> logged{0};
+    if (logged.fetch_add(1) < 3) {
+        Log("PresentMode=3: game-thread present %llu queued (thread %lu).",
+            static_cast<unsigned long long>(g_mailboxGameFrames.load() + 1),
+            GetCurrentThreadId());
+    }
     g_mailboxGameFrames.fetch_add(1, std::memory_order_relaxed);
     g_mailboxGameTicks.fetch_add(ReadPerformanceCounter() - start, std::memory_order_relaxed);
     *result = S_OK;
@@ -10625,6 +10745,13 @@ DWORD WINAPI MailboxPresentThread(void*) {
             const HRESULT result = g_originalPresent(swapChain, 0, 0);
             const std::uint64_t after = ReadPerformanceCounter();
             lastPresent = before;
+            static int loggedPresents = 0;
+            if (loggedPresents++ < 3) {
+                Log("PresentMode=3: present thread Present #%d returned 0x%08lX in %.3f ms.",
+                    loggedPresents, static_cast<unsigned long>(result),
+                    1000.0 * static_cast<double>(after - before) /
+                        static_cast<double>(QpcFrequency()));
+            }
             ++presents;
             presentTicks += after - before;
             presentMax = std::max(presentMax, after - before);
@@ -10687,6 +10814,7 @@ void MailboxAdopt(IDXGISwapChain* swapChain) {
     }
     if (ok) {
         g_mailbox.multithread->SetMultithreadProtected(TRUE);
+        HookMailboxDeviceViews(g_mailbox.device);
         void** vtable = *reinterpret_cast<void***>(swapChain);
         void* original = nullptr;
         if (g_originalGetBuffer == nullptr &&
@@ -12059,7 +12187,12 @@ DWORD WINAPI InstallThread(void*) {
 
 }  // namespace
 
-BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID) {
+BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID reserved) {
+    if (reason == DLL_PROCESS_DETACH && g_presentMode == 3) {
+        // Not reached on TerminateProcess or a fast-fail, which tells those apart.
+        Log("PresentMode=3: process detach (%s).",
+            reserved != nullptr ? "the process is exiting normally" : "FreeLibrary");
+    }
     if (reason == DLL_PROCESS_ATTACH) {
         g_pluginModule = module;
         DisableThreadLibraryCalls(module);
