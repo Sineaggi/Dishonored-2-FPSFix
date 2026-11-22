@@ -3,7 +3,9 @@
 #include <windows.h>
 #include <intrin.h>
 #include <d3d11_1.h>
+#include <d3d11_4.h>
 #include <dxgi1_2.h>
+#include <dwmapi.h>
 #include <bcrypt.h>
 
 #include <algorithm>
@@ -441,8 +443,13 @@ bool g_overlay = false;
 // presents use sync interval 0, so the compositor shows the newest frame),
 // 2 = mode 1 plus a flip-discard swap chain with 3 buffers created in place of
 // the game's blt swap chain (no tearing flag), see InstallFlipSwapChainHooks.
+// 3 = plugin-owned mailbox: the game, ReShade and Luma draw into a proxy back
+// buffer, the game's Present copies it into a 3-frame ring and returns at
+// once, and a plugin thread presents the frame best matching the refresh
+// cadence, see the "PresentMode=3" section.
 int g_presentMode = 0;
 bool InstallFlipSwapChainHooks();
+bool MailboxGamePresent(IDXGISwapChain* swapChain, UINT flags, HRESULT* result);
 // Set while the overlay creates its throwaway probe swap chain.
 std::atomic<bool> g_creatingProbeSwapChain{false};
 extern std::atomic<int> g_screenParticleMode;
@@ -1078,7 +1085,7 @@ void LoadConfiguration() {
         L"Diagnostics", L"ToggleSounds", 1, path) != 0;
     g_overlay = GetPrivateProfileIntW(
         L"Diagnostics", L"Overlay", 0, path) != 0;
-    g_presentMode = std::max(0, std::min(2, static_cast<int>(
+    g_presentMode = std::max(0, std::min(3, static_cast<int>(
         GetPrivateProfileIntW(L"Fix", L"PresentMode", 0, path))));
     g_crashLog = GetPrivateProfileIntW(
         L"Diagnostics", L"CrashLog", 0, path) != 0;
@@ -9760,6 +9767,10 @@ HRESULT STDMETHODCALLTYPE HookPresent(IDXGISwapChain* swapChain, UINT syncInterv
     if ((flags & DXGI_PRESENT_TEST) == 0) {
         DrawOverlay(swapChain);
     }
+    HRESULT mailboxResult = S_OK;
+    if (g_presentMode == 3 && MailboxGamePresent(swapChain, flags, &mailboxResult)) {
+        return mailboxResult;
+    }
     syncInterval = ApplyPresentMode(swapChain, syncInterval, flags);
     const HRESULT result = g_originalPresent(swapChain, syncInterval, flags);
     static std::atomic<int> failures{0};
@@ -9774,6 +9785,10 @@ HRESULT STDMETHODCALLTYPE HookPresent1(IDXGISwapChain1* swapChain, UINT syncInte
                                        const DXGI_PRESENT_PARAMETERS* parameters) {
     if ((flags & DXGI_PRESENT_TEST) == 0) {
         DrawOverlay(swapChain);
+    }
+    HRESULT mailboxResult = S_OK;
+    if (g_presentMode == 3 && MailboxGamePresent(swapChain, flags, &mailboxResult)) {
+        return mailboxResult;
     }
     syncInterval = ApplyPresentMode(swapChain, syncInterval, flags);
     return g_originalPresent1(swapChain, syncInterval, flags, parameters);
@@ -9812,6 +9827,11 @@ void TryInstallOverlayPresentHook() {
 // Creates a throwaway device and swap chain to find the DXGI swap-chain vtable,
 // which every swap chain in the process shares, and replaces Present/Present1.
 bool InstallOverlayPresentHook() {
+    if (g_originalPresent != nullptr) {
+        // PresentMode=3 hooked Present when the game created its swap chain.
+        Log("Diagnostics overlay: Present was already hooked at swap-chain creation.");
+        return true;
+    }
     HMODULE d3d11 = LoadLibraryW(L"d3d11.dll");
     const auto create = d3d11 != nullptr
         ? reinterpret_cast<D3D11CreateDeviceAndSwapChainFn>(
@@ -10021,9 +10041,22 @@ void RememberFlipBackBuffer(IDXGISwapChain* swapChain) {
     }
 }
 
+bool MailboxOwnsSwapChain(IDXGISwapChain* swapChain);
+HRESULT MailboxResizeBuffers(IDXGISwapChain* swapChain, UINT bufferCount, UINT width,
+                             UINT height, DXGI_FORMAT format, UINT flags);
+HRESULT MailboxCreateSwapChain(IDXGIFactory* factory, IUnknown* device,
+                               DXGI_SWAP_CHAIN_DESC* description, IDXGISwapChain** swapChain);
+HRESULT MailboxCreateSwapChainForHwnd(IDXGIFactory2* factory, IUnknown* device, HWND window,
+                                      const DXGI_SWAP_CHAIN_DESC1* description,
+                                      const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fullscreen,
+                                      IDXGIOutput* output, IDXGISwapChain1** swapChain);
+
 HRESULT STDMETHODCALLTYPE HookResizeBuffers(IDXGISwapChain* swapChain, UINT bufferCount,
                                             UINT width, UINT height, DXGI_FORMAT format,
                                             UINT flags) {
+    if (g_presentMode == 3 && MailboxOwnsSwapChain(swapChain)) {
+        return MailboxResizeBuffers(swapChain, bufferCount, width, height, format, flags);
+    }
     if (swapChain != g_flipSwapChain.load(std::memory_order_acquire)) {
         return g_originalResizeBuffers(swapChain, bufferCount, width, height, format, flags);
     }
@@ -10076,6 +10109,9 @@ HRESULT STDMETHODCALLTYPE HookCreateSwapChain(IDXGIFactory* factory, IUnknown* d
     if (g_creatingProbeSwapChain.load(std::memory_order_acquire)) {
         return g_originalCreateSwapChain(factory, device, description, swapChain);
     }
+    if (g_presentMode == 3) {
+        return MailboxCreateSwapChain(factory, device, description, swapChain);
+    }
     if (description == nullptr || !description->Windowed ||
         !IsBltSwapEffect(description->SwapEffect) || description->SampleDesc.Count != 1) {
         if (description != nullptr) {
@@ -10119,6 +10155,10 @@ HRESULT STDMETHODCALLTYPE HookCreateSwapChainForHwnd(
     const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fullscreen, IDXGIOutput* output,
     IDXGISwapChain1** swapChain) {
     const bool windowed = fullscreen == nullptr || fullscreen->Windowed;
+    if (g_presentMode == 3 && !g_creatingProbeSwapChain.load(std::memory_order_acquire)) {
+        return MailboxCreateSwapChainForHwnd(factory, device, window, description, fullscreen,
+                                             output, swapChain);
+    }
     if (g_creatingProbeSwapChain.load(std::memory_order_acquire) || description == nullptr ||
         !windowed || !IsBltSwapEffect(description->SwapEffect) ||
         description->SampleDesc.Count != 1) {
@@ -10187,10 +10227,589 @@ bool InstallFlipSwapChainHooks() {
         g_originalCreateSwapChainForHwnd = reinterpret_cast<CreateSwapChainForHwndFn>(original);
     }
     factory->Release();
-    Log(installed ? "PresentMode=2: hooked the system DXGI factory; a windowed blt swap chain "
-                    "will be created as flip-discard with 3 buffers (no tearing flag)."
-                  : "PresentMode=2: unable to hook the DXGI factory.");
+    if (g_presentMode == 3) {
+        Log(installed ? "PresentMode=3: hooked the system DXGI factory; the game's swap chain "
+                        "gets a proxy back buffer and a plugin present thread."
+                      : "PresentMode=3: unable to hook the DXGI factory.");
+    } else {
+        Log(installed ? "PresentMode=2: hooked the system DXGI factory; a windowed blt swap "
+                        "chain will be created as flip-discard with 3 buffers (no tearing "
+                        "flag)."
+                      : "PresentMode=2: unable to hook the DXGI factory.");
+    }
     return installed;
+}
+
+// ---------------------------------------------------------------------------
+// PresentMode=3: plugin-owned mailbox presentation.
+//
+// The game's blt swap chain only exposes buffer 0, which is both the buffer
+// the game draws into and the one Present shows, so presenting it from another
+// thread would show half-drawn frames. Instead:
+//
+//  - When the game creates its swap chain (system DXGI factory hook, below
+//    ReShade and Luma, which call the real factory), GetBuffer is hooked so
+//    every caller - the game, ReShade, Luma, this plugin's overlay - gets a
+//    proxy texture with the real back buffer's size, format and bind flags.
+//    Only the present thread touches the real back buffer.
+//  - The game's Present (after ReShade/Luma and the overlay have drawn into
+//    the proxy) copies the proxy into the oldest of 3 ring textures, stamps it
+//    with the QPC time and returns S_OK without presenting. An event query per
+//    frame keeps at most 2 frames in flight, the job Present's own blocking
+//    normally does.
+//  - The present thread presents at most once per DWM refresh period. Below
+//    the refresh rate each new frame is presented as soon as it arrives, so
+//    G-Sync/VRR keeps working. Above it, the frame whose timestamp is closest
+//    to one refresh period after the last shown frame is chosen, which keeps
+//    the shown frames evenly spaced in game time instead of dropping frames at
+//    random (what plain mailbox does).
+//  - The immediate context is shared by the two threads, so the device is put
+//    in multithread-protected mode (ID3D11Multithread).
+//
+// Exclusive fullscreen, a failed Present (device removed) or a failed resource
+// creation fall back to presenting synchronously on the game thread (proxy
+// copied into the real buffer, then the real Present). PresentMode=3 refuses
+// to engage when Luma frame generation is enabled (ReShade.ini [Luma]
+// FrameGen=1), since that owns presentation through its own swap-chain proxy.
+//
+// Not yet done (phase 2): telling the interpolation the predicted display time
+// of a frame. The frame choice above evens out the spacing, but each frame is
+// still interpolated for the time it was rendered, not the time it is shown.
+// ---------------------------------------------------------------------------
+
+constexpr std::size_t kSwapChainGetBufferSlot = 9;
+constexpr std::size_t kMailboxSlotCount = 3;
+constexpr std::size_t kMailboxQueryCount = 3;  // frames in flight + 1
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+
+using GetBufferFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, REFIID, void**);
+using DwmGetCompositionTimingInfoFn = HRESULT(WINAPI*)(HWND, DWM_TIMING_INFO*);
+
+GetBufferFn g_originalGetBuffer = nullptr;
+
+struct MailboxSlot {
+    ID3D11Texture2D* texture = nullptr;
+    std::uint64_t qpc = 0;
+    std::uint64_t sequence = 0;
+};
+
+struct MailboxState {
+    IDXGISwapChain* swapChain = nullptr;  // referenced
+    ID3D11Device* device = nullptr;
+    ID3D11DeviceContext* context = nullptr;
+    ID3D11Multithread* multithread = nullptr;
+    ID3D11Texture2D* realBuffer = nullptr;
+    ID3D11Texture2D* proxy = nullptr;
+    std::array<MailboxSlot, kMailboxSlotCount> slots{};
+    std::array<ID3D11Query*, kMailboxQueryCount> queries{};
+    std::uint64_t sequence = 0;
+    std::uint64_t frameIndex = 0;
+    bool windowed = true;
+    bool asynchronous = false;  // present thread presents; else the game thread does
+};
+
+MailboxState g_mailbox;
+// g_mailboxPresentLock: held by the present thread across copy+Present and by
+// ResizeBuffers/adoption while resources change. g_mailboxLock: the ring and
+// the copies into and out of it. Order: present lock, then ring lock.
+SRWLOCK g_mailboxPresentLock = SRWLOCK_INIT;
+SRWLOCK g_mailboxLock = SRWLOCK_INIT;
+std::atomic<IDXGISwapChain*> g_mailboxSwapChain{nullptr};
+HANDLE g_mailboxEvent = nullptr;
+std::atomic<bool> g_mailboxThreadStarted{false};
+
+// Statistics, reset by the present thread every 5 seconds.
+std::atomic<std::uint64_t> g_mailboxGameFrames{0};
+std::atomic<std::uint64_t> g_mailboxGameTicks{0};      // QPC in the game-thread path
+std::atomic<std::uint64_t> g_mailboxThrottleTicks{0};  // QPC waiting on frames in flight
+
+bool MailboxOwnsSwapChain(IDXGISwapChain* swapChain) {
+    return swapChain != nullptr && swapChain == g_mailboxSwapChain.load(std::memory_order_acquire);
+}
+
+bool LumaFrameGenerationEnabled() {
+    wchar_t path[MAX_PATH]{};
+    BuildSiblingPath(path, MAX_PATH, L"ReShade.ini");
+    return GetPrivateProfileIntW(L"Luma", L"FrameGen", 0, path) != 0;
+}
+
+std::uint64_t QpcFrequency() {
+    static const std::uint64_t frequency = [] {
+        LARGE_INTEGER value{};
+        QueryPerformanceFrequency(&value);
+        return static_cast<std::uint64_t>(value.QuadPart);
+    }();
+    return frequency;
+}
+
+// Releases every resource except the swap chain reference. Caller holds both locks.
+void ReleaseMailboxResources() {
+    ReleaseOverlayObject(g_mailbox.proxy);
+    ReleaseOverlayObject(g_mailbox.realBuffer);
+    for (MailboxSlot& slot : g_mailbox.slots) {
+        ReleaseOverlayObject(slot.texture);
+        slot.qpc = 0;
+        slot.sequence = 0;
+    }
+    for (ID3D11Query*& query : g_mailbox.queries) {
+        ReleaseOverlayObject(query);
+    }
+    g_mailbox.asynchronous = false;
+}
+
+// Creates the proxy, ring and queries for the swap chain's current buffers.
+// Caller holds both locks. On failure the proxy is left null, so GetBuffer
+// hands out the real buffer and the game presents normally.
+bool CreateMailboxResources() {
+    if (FAILED(g_originalGetBuffer(g_mailbox.swapChain, 0, __uuidof(ID3D11Texture2D),
+                                   reinterpret_cast<void**>(&g_mailbox.realBuffer)))) {
+        Log("PresentMode=3: unable to get the real back buffer; presenting normally.");
+        return false;
+    }
+    D3D11_TEXTURE2D_DESC description{};
+    g_mailbox.realBuffer->GetDesc(&description);
+    D3D11_TEXTURE2D_DESC proxyDescription = description;
+    proxyDescription.BindFlags |= D3D11_BIND_RENDER_TARGET;
+    proxyDescription.MiscFlags = 0;
+    proxyDescription.Usage = D3D11_USAGE_DEFAULT;
+    proxyDescription.CPUAccessFlags = 0;
+    HRESULT result = g_mailbox.device->CreateTexture2D(&proxyDescription, nullptr,
+                                                       &g_mailbox.proxy);
+    for (MailboxSlot& slot : g_mailbox.slots) {
+        if (SUCCEEDED(result)) {
+            result = g_mailbox.device->CreateTexture2D(&proxyDescription, nullptr,
+                                                       &slot.texture);
+        }
+    }
+    D3D11_QUERY_DESC queryDescription{D3D11_QUERY_EVENT, 0};
+    for (ID3D11Query*& query : g_mailbox.queries) {
+        if (SUCCEEDED(result)) {
+            result = g_mailbox.device->CreateQuery(&queryDescription, &query);
+        }
+    }
+    if (FAILED(result)) {
+        Log("PresentMode=3: unable to create the proxy back buffer (0x%08lX); presenting "
+            "normally.", static_cast<unsigned long>(result));
+        ReleaseMailboxResources();
+        return false;
+    }
+    DXGI_SWAP_CHAIN_DESC chain{};
+    g_mailbox.windowed = SUCCEEDED(g_mailbox.swapChain->GetDesc(&chain)) && chain.Windowed;
+    g_mailbox.asynchronous = g_mailbox.windowed;
+    // The sequence stays monotonic across resizes: the present thread compares
+    // it against the last frame it showed. Slots restart empty (sequence 0).
+    g_mailbox.frameIndex = 0;
+    Log("PresentMode=3: proxy back buffer %ux%u format %u bind 0x%X ready; %s.",
+        description.Width, description.Height, static_cast<unsigned>(description.Format),
+        description.BindFlags,
+        g_mailbox.asynchronous ? "the plugin present thread presents"
+                               : "exclusive fullscreen, the game thread presents");
+    return true;
+}
+
+HRESULT STDMETHODCALLTYPE HookGetBuffer(IDXGISwapChain* swapChain, UINT buffer, REFIID riid,
+                                        void** surface) {
+    if (buffer == 0 && surface != nullptr && MailboxOwnsSwapChain(swapChain)) {
+        AcquireSRWLockShared(&g_mailboxLock);
+        ID3D11Texture2D* proxy = g_mailbox.proxy;
+        const HRESULT result = proxy != nullptr ? proxy->QueryInterface(riid, surface) : E_FAIL;
+        ReleaseSRWLockShared(&g_mailboxLock);
+        if (proxy != nullptr) {
+            return result;
+        }
+    }
+    return g_originalGetBuffer(swapChain, buffer, riid, surface);
+}
+
+// Copies the proxy into the real buffer and presents on the calling thread.
+// Caller holds both locks.
+HRESULT PresentMailboxSynchronously(UINT flags) {
+    g_mailbox.context->CopyResource(g_mailbox.realBuffer, g_mailbox.proxy);
+    return g_originalPresent(g_mailbox.swapChain, 0, flags);
+}
+
+bool MailboxGamePresent(IDXGISwapChain* swapChain, UINT flags, HRESULT* result) {
+    if (!MailboxOwnsSwapChain(swapChain)) {
+        return false;
+    }
+    if ((flags & DXGI_PRESENT_TEST) != 0) {
+        return false;  // Occlusion test: let the real Present answer it.
+    }
+    const std::uint64_t start = ReadPerformanceCounter();
+    AcquireSRWLockExclusive(&g_mailboxLock);
+    if (g_mailbox.proxy == nullptr) {
+        ReleaseSRWLockExclusive(&g_mailboxLock);
+        return false;
+    }
+    if (!g_mailbox.asynchronous) {
+        ReleaseSRWLockExclusive(&g_mailboxLock);
+        AcquireSRWLockExclusive(&g_mailboxPresentLock);
+        AcquireSRWLockExclusive(&g_mailboxLock);
+        *result = g_mailbox.proxy != nullptr ? PresentMailboxSynchronously(flags)
+                                             : g_originalPresent(swapChain, 0, flags);
+        ReleaseSRWLockExclusive(&g_mailboxLock);
+        ReleaseSRWLockExclusive(&g_mailboxPresentLock);
+        return true;
+    }
+    MailboxSlot* oldest = &g_mailbox.slots[0];
+    for (MailboxSlot& slot : g_mailbox.slots) {
+        if (slot.sequence < oldest->sequence) {
+            oldest = &slot;
+        }
+    }
+    g_mailbox.context->CopyResource(oldest->texture, g_mailbox.proxy);
+    oldest->qpc = start;
+    oldest->sequence = ++g_mailbox.sequence;
+    // Frames in flight: wait for the frame two before this one to finish on
+    // the GPU, as Present's own queue limit would.
+    ID3D11Query* current = g_mailbox.queries[g_mailbox.frameIndex % kMailboxQueryCount];
+    g_mailbox.context->End(current);
+    ID3D11Query* waitFor = g_mailbox.frameIndex >= kMailboxQueryCount - 1
+        ? g_mailbox.queries[(g_mailbox.frameIndex + 1) % kMailboxQueryCount]
+        : nullptr;
+    ++g_mailbox.frameIndex;
+    ID3D11DeviceContext* context = g_mailbox.context;
+    context->AddRef();
+    if (waitFor != nullptr) {
+        waitFor->AddRef();
+    }
+    ReleaseSRWLockExclusive(&g_mailboxLock);
+    SetEvent(g_mailboxEvent);
+    if (waitFor != nullptr) {
+        const std::uint64_t waitStart = ReadPerformanceCounter();
+        const std::uint64_t limit = waitStart + QpcFrequency() / 4;
+        BOOL done = FALSE;
+        while (context->GetData(waitFor, &done, sizeof(done), 0) == S_FALSE &&
+               ReadPerformanceCounter() < limit) {
+            SwitchToThread();
+        }
+        g_mailboxThrottleTicks.fetch_add(ReadPerformanceCounter() - waitStart,
+                                         std::memory_order_relaxed);
+        waitFor->Release();
+    }
+    context->Release();
+    g_mailboxGameFrames.fetch_add(1, std::memory_order_relaxed);
+    g_mailboxGameTicks.fetch_add(ReadPerformanceCounter() - start, std::memory_order_relaxed);
+    *result = S_OK;
+    return true;
+}
+
+std::uint64_t MailboxRefreshPeriod(HWND window) {
+    static DwmGetCompositionTimingInfoFn timing = [] {
+        HMODULE dwm = LoadLibraryW(L"dwmapi.dll");
+        return dwm != nullptr ? reinterpret_cast<DwmGetCompositionTimingInfoFn>(
+                                    GetProcAddress(dwm, "DwmGetCompositionTimingInfo"))
+                              : nullptr;
+    }();
+    DWM_TIMING_INFO info{};
+    info.cbSize = sizeof(info);
+    if (timing != nullptr && SUCCEEDED(timing(nullptr, &info)) && info.qpcRefreshPeriod > 0) {
+        return info.qpcRefreshPeriod;
+    }
+    (void)window;
+    return QpcFrequency() / 60;
+}
+
+void WaitUntilQpc(HANDLE timer, std::uint64_t target) {
+    for (;;) {
+        const std::uint64_t now = ReadPerformanceCounter();
+        if (now >= target) {
+            return;
+        }
+        const std::uint64_t remaining = target - now;
+        const std::uint64_t spin = QpcFrequency() / 2000;  // last 0.5 ms
+        if (remaining > spin && timer != nullptr) {
+            LARGE_INTEGER due{};
+            due.QuadPart = -static_cast<LONGLONG>((remaining - spin) * 10000000ull /
+                                                  QpcFrequency());
+            if (SetWaitableTimerEx(timer, &due, 0, nullptr, nullptr, nullptr, 0)) {
+                WaitForSingleObject(timer, 50);
+                continue;
+            }
+        }
+        SwitchToThread();
+    }
+}
+
+DWORD WINAPI MailboxPresentThread(void*) {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr,
+                                          CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                          TIMER_ALL_ACCESS);
+    std::uint64_t period = MailboxRefreshPeriod(nullptr);
+    std::uint64_t periodChecked = ReadPerformanceCounter();
+    std::uint64_t lastPresent = 0;
+    std::uint64_t lastShownSequence = 0;
+    std::uint64_t lastShownQpc = 0;
+    std::uint64_t statsStart = ReadPerformanceCounter();
+    std::uint64_t presents = 0, presentTicks = 0, presentMax = 0, spacingError = 0;
+    std::uint64_t skipped = 0;
+    int failures = 0;
+    Log("PresentMode=3: present thread started; refresh period %.3f ms.",
+        1000.0 * static_cast<double>(period) / static_cast<double>(QpcFrequency()));
+    for (;;) {
+        WaitForSingleObject(g_mailboxEvent, 50);
+        const std::uint64_t frequency = QpcFrequency();
+        if (ReadPerformanceCounter() - periodChecked > frequency * 2) {
+            period = MailboxRefreshPeriod(nullptr);
+            periodChecked = ReadPerformanceCounter();
+        }
+        for (;;) {  // Present while new frames are pending.
+            AcquireSRWLockExclusive(&g_mailboxPresentLock);
+            AcquireSRWLockShared(&g_mailboxLock);
+            const bool ready = g_mailbox.asynchronous && g_mailbox.proxy != nullptr &&
+                               g_mailbox.sequence > lastShownSequence;
+            ReleaseSRWLockShared(&g_mailboxLock);
+            if (!ready) {
+                ReleaseSRWLockExclusive(&g_mailboxPresentLock);
+                break;
+            }
+            // At most one present per refresh period.
+            if (lastPresent != 0) {
+                WaitUntilQpc(timer, lastPresent + period);
+            }
+            AcquireSRWLockExclusive(&g_mailboxLock);
+            if (!g_mailbox.asynchronous || g_mailbox.proxy == nullptr) {
+                ReleaseSRWLockExclusive(&g_mailboxLock);
+                ReleaseSRWLockExclusive(&g_mailboxPresentLock);
+                break;
+            }
+            MailboxSlot* newest = nullptr;
+            for (MailboxSlot& slot : g_mailbox.slots) {
+                if (slot.sequence > lastShownSequence &&
+                    (newest == nullptr || slot.sequence > newest->sequence)) {
+                    newest = &slot;
+                }
+            }
+            MailboxSlot* chosen = newest;
+            if (newest != nullptr && lastShownQpc != 0 &&
+                newest->qpc - lastShownQpc < 2 * period) {
+                // Above the refresh rate: the frame closest to one period after
+                // the last shown one keeps the shown frames evenly spaced.
+                const std::uint64_t target = lastShownQpc + period;
+                std::uint64_t best = ~0ull;
+                for (MailboxSlot& slot : g_mailbox.slots) {
+                    if (slot.sequence <= lastShownSequence) {
+                        continue;
+                    }
+                    const std::uint64_t error =
+                        slot.qpc > target ? slot.qpc - target : target - slot.qpc;
+                    if (error < best || (error == best && slot.sequence > chosen->sequence)) {
+                        best = error;
+                        chosen = &slot;
+                    }
+                }
+            }
+            if (chosen == nullptr) {
+                ReleaseSRWLockExclusive(&g_mailboxLock);
+                ReleaseSRWLockExclusive(&g_mailboxPresentLock);
+                break;
+            }
+            for (MailboxSlot& slot : g_mailbox.slots) {
+                if (slot.sequence > lastShownSequence && slot.sequence < chosen->sequence) {
+                    ++skipped;
+                }
+            }
+            if (lastShownQpc != 0) {
+                const std::uint64_t spacing = chosen->qpc - lastShownQpc;
+                spacingError += spacing > period ? spacing - period : period - spacing;
+            }
+            lastShownSequence = chosen->sequence;
+            lastShownQpc = chosen->qpc;
+            g_mailbox.context->CopyResource(g_mailbox.realBuffer, chosen->texture);
+            IDXGISwapChain* swapChain = g_mailbox.swapChain;
+            ReleaseSRWLockExclusive(&g_mailboxLock);
+            const std::uint64_t before = ReadPerformanceCounter();
+            const HRESULT result = g_originalPresent(swapChain, 0, 0);
+            const std::uint64_t after = ReadPerformanceCounter();
+            lastPresent = before;
+            ++presents;
+            presentTicks += after - before;
+            presentMax = std::max(presentMax, after - before);
+            if (FAILED(result) || result == DXGI_STATUS_OCCLUDED) {
+                if (FAILED(result) && ++failures <= 4) {
+                    Log("PresentMode=3: present thread's Present returned 0x%08lX; the game "
+                        "thread presents from now on.", static_cast<unsigned long>(result));
+                }
+                if (FAILED(result)) {
+                    AcquireSRWLockExclusive(&g_mailboxLock);
+                    g_mailbox.asynchronous = false;
+                    ReleaseSRWLockExclusive(&g_mailboxLock);
+                }
+            }
+            ReleaseSRWLockExclusive(&g_mailboxPresentLock);
+        }
+        const std::uint64_t now = ReadPerformanceCounter();
+        if (now - statsStart >= QpcFrequency() * 5) {
+            const double seconds =
+                static_cast<double>(now - statsStart) / static_cast<double>(QpcFrequency());
+            const double toMs = 1000.0 / static_cast<double>(QpcFrequency());
+            const std::uint64_t gameFrames = g_mailboxGameFrames.exchange(0);
+            const std::uint64_t gameTicks = g_mailboxGameTicks.exchange(0);
+            const std::uint64_t throttleTicks = g_mailboxThrottleTicks.exchange(0);
+            if (gameFrames != 0 || presents != 0) {
+                Log("PresentMode=3 %.1fs: game %.1f FPS, shown %.1f FPS (refresh %.1f Hz), "
+                    "skipped %llu; game-thread present %.3f ms avg (throttle wait %.3f ms); "
+                    "real Present %.3f ms avg, %.3f ms max; shown-frame spacing error %.3f "
+                    "ms avg.",
+                    seconds, gameFrames / seconds, presents / seconds,
+                    static_cast<double>(QpcFrequency()) / static_cast<double>(period),
+                    static_cast<unsigned long long>(skipped),
+                    gameFrames ? gameTicks * toMs / gameFrames : 0.0,
+                    gameFrames ? throttleTicks * toMs / gameFrames : 0.0,
+                    presents ? presentTicks * toMs / presents : 0.0, presentMax * toMs,
+                    presents > 1 ? spacingError * toMs / (presents - 1) : 0.0);
+            }
+            statsStart = now;
+            presents = presentTicks = presentMax = spacingError = skipped = 0;
+        }
+    }
+}
+
+// Takes over a newly created swap chain. Releases the previous one first.
+void MailboxAdopt(IDXGISwapChain* swapChain) {
+    AcquireSRWLockExclusive(&g_mailboxPresentLock);
+    AcquireSRWLockExclusive(&g_mailboxLock);
+    g_mailboxSwapChain.store(nullptr, std::memory_order_release);
+    ReleaseMailboxResources();
+    ReleaseOverlayObject(g_mailbox.multithread);
+    ReleaseOverlayObject(g_mailbox.context);
+    ReleaseOverlayObject(g_mailbox.device);
+    ReleaseOverlayObject(g_mailbox.swapChain);
+    bool ok = SUCCEEDED(swapChain->GetDevice(__uuidof(ID3D11Device),
+                                             reinterpret_cast<void**>(&g_mailbox.device)));
+    if (ok) {
+        g_mailbox.device->GetImmediateContext(&g_mailbox.context);
+        ok = SUCCEEDED(g_mailbox.context->QueryInterface(
+            __uuidof(ID3D11Multithread), reinterpret_cast<void**>(&g_mailbox.multithread)));
+    }
+    if (ok) {
+        g_mailbox.multithread->SetMultithreadProtected(TRUE);
+        void** vtable = *reinterpret_cast<void***>(swapChain);
+        void* original = nullptr;
+        if (g_originalGetBuffer == nullptr &&
+            ReplaceSwapChainSlot(vtable, kSwapChainGetBufferSlot,
+                                 reinterpret_cast<const void*>(&HookGetBuffer), &original)) {
+            g_originalGetBuffer = reinterpret_cast<GetBufferFn>(original);
+        }
+        if (g_originalResizeBuffers == nullptr &&
+            ReplaceSwapChainSlot(vtable, kSwapChainResizeBuffersSlot,
+                                 reinterpret_cast<const void*>(&HookResizeBuffers),
+                                 &original)) {
+            g_originalResizeBuffers = reinterpret_cast<ResizeBuffersFn>(original);
+        }
+        if (g_originalPresent == nullptr &&
+            ReplaceSwapChainSlot(vtable, kSwapChainPresentSlot,
+                                 reinterpret_cast<const void*>(&HookPresent), &original)) {
+            g_originalPresent = reinterpret_cast<PresentFn>(original);
+            IDXGISwapChain1* swapChain1 = nullptr;
+            if (SUCCEEDED(swapChain->QueryInterface(__uuidof(IDXGISwapChain1),
+                                                    reinterpret_cast<void**>(&swapChain1)))) {
+                void** vtable1 = *reinterpret_cast<void***>(swapChain1);
+                if (ReplaceSwapChainSlot(vtable1, kSwapChainPresent1Slot,
+                                         reinterpret_cast<const void*>(&HookPresent1),
+                                         &original)) {
+                    g_originalPresent1 = reinterpret_cast<Present1Fn>(original);
+                }
+                swapChain1->Release();
+            }
+        }
+        ok = g_originalGetBuffer != nullptr && g_originalResizeBuffers != nullptr &&
+             g_originalPresent != nullptr;
+    }
+    if (ok) {
+        swapChain->AddRef();
+        g_mailbox.swapChain = swapChain;
+        ok = CreateMailboxResources();
+        g_mailboxSwapChain.store(swapChain, std::memory_order_release);
+    } else {
+        Log("PresentMode=3: unable to take over the swap chain (device, multithread or "
+            "vtable); presenting normally.");
+        ReleaseOverlayObject(g_mailbox.multithread);
+        ReleaseOverlayObject(g_mailbox.context);
+        ReleaseOverlayObject(g_mailbox.device);
+    }
+    ReleaseSRWLockExclusive(&g_mailboxLock);
+    ReleaseSRWLockExclusive(&g_mailboxPresentLock);
+    if (ok && !g_mailboxThreadStarted.exchange(true)) {
+        g_mailboxEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        HANDLE thread = CreateThread(nullptr, 0, MailboxPresentThread, nullptr, 0, nullptr);
+        if (thread != nullptr) {
+            CloseHandle(thread);
+        }
+    }
+}
+
+bool MailboxRefused() {
+    static const bool refused = [] {
+        const bool frameGeneration = LumaFrameGenerationEnabled();
+        if (frameGeneration) {
+            Log("PresentMode=3: not engaged, because Luma frame generation is enabled "
+                "(ReShade.ini [Luma] FrameGen=1) and owns presentation.");
+        }
+        return frameGeneration;
+    }();
+    return refused;
+}
+
+HRESULT MailboxCreateSwapChain(IDXGIFactory* factory, IUnknown* device,
+                               DXGI_SWAP_CHAIN_DESC* description, IDXGISwapChain** swapChain) {
+    const HRESULT result = g_originalCreateSwapChain(factory, device, description, swapChain);
+    if (FAILED(result) || swapChain == nullptr || *swapChain == nullptr ||
+        description == nullptr || MailboxRefused()) {
+        return result;
+    }
+    if (description->SampleDesc.Count != 1) {
+        Log("PresentMode=3: multisampled swap chain left alone.");
+        return result;
+    }
+    Log("PresentMode=3: game created %ux%u swap chain (swap effect %u, %u buffers, format "
+        "%u, flags 0x%X, %s).", description->BufferDesc.Width, description->BufferDesc.Height,
+        static_cast<unsigned>(description->SwapEffect), description->BufferCount,
+        static_cast<unsigned>(description->BufferDesc.Format), description->Flags,
+        description->Windowed ? "windowed" : "exclusive fullscreen");
+    MailboxAdopt(*swapChain);
+    return result;
+}
+
+HRESULT MailboxCreateSwapChainForHwnd(IDXGIFactory2* factory, IUnknown* device, HWND window,
+                                      const DXGI_SWAP_CHAIN_DESC1* description,
+                                      const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fullscreen,
+                                      IDXGIOutput* output, IDXGISwapChain1** swapChain) {
+    const HRESULT result = g_originalCreateSwapChainForHwnd(factory, device, window, description,
+                                                            fullscreen, output, swapChain);
+    if (FAILED(result) || swapChain == nullptr || *swapChain == nullptr ||
+        description == nullptr || MailboxRefused() || description->SampleDesc.Count != 1) {
+        return result;
+    }
+    Log("PresentMode=3: game created %ux%u swap chain (ForHwnd, swap effect %u, %u buffers, "
+        "format %u).", description->Width, description->Height,
+        static_cast<unsigned>(description->SwapEffect), description->BufferCount,
+        static_cast<unsigned>(description->Format));
+    MailboxAdopt(*swapChain);
+    return result;
+}
+
+HRESULT MailboxResizeBuffers(IDXGISwapChain* swapChain, UINT bufferCount, UINT width,
+                             UINT height, DXGI_FORMAT format, UINT flags) {
+    AcquireSRWLockExclusive(&g_mailboxPresentLock);
+    AcquireSRWLockExclusive(&g_mailboxLock);
+    // Callers released their proxy references; the real buffer is only ours.
+    ReleaseMailboxResources();
+    const HRESULT result =
+        g_originalResizeBuffers(swapChain, bufferCount, width, height, format, flags);
+    if (SUCCEEDED(result)) {
+        CreateMailboxResources();
+    } else {
+        Log("PresentMode=3: ResizeBuffers(%u, %ux%u, format %u) failed with 0x%08lX.",
+            bufferCount, width, height, static_cast<unsigned>(format),
+            static_cast<unsigned long>(result));
+    }
+    ReleaseSRWLockExclusive(&g_mailboxLock);
+    ReleaseSRWLockExclusive(&g_mailboxPresentLock);
+    return result;
 }
 
 bool InstallShadowCasterBuildHooks() {
@@ -11395,7 +12014,7 @@ DWORD WINAPI InstallThread(void*) {
     }
     LoadConfiguration();
     // Before the layout check: the game creates its swap chain during startup.
-    if (g_presentMode == 2) {
+    if (g_presentMode >= 2) {
         InstallFlipSwapChainHooks();
     }
     if (g_crashLog && AddVectoredExceptionHandler(1, CrashLogHandler) != nullptr) {
