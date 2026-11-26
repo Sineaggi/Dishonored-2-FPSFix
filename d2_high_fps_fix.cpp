@@ -8329,9 +8329,39 @@ struct ScreenParticlePlacement {
     Transform used{};
     std::array<float, 12> base{};
     std::array<float, 12> written{};
+    std::uint64_t placedCounter = 0;  // QPC time of the placement
 };
 SRWLOCK g_screenPlacementLock = SRWLOCK_INIT;
 std::array<ScreenParticlePlacement, 8> g_screenPlacements{};
+
+// A placement is only re-corrected shortly after the engine made it: the
+// engine places a live screen particle every rendered frame, so an older entry
+// means the particle system is gone, possibly freed with its level. Its model
+// pointer must not be touched again (a level change freed one while it was
+// still listed, and the next camera frame read the freed model).
+constexpr double kScreenPlacementMaxAgeSeconds = 0.1;
+
+// Forgets every screen-particle model pointer, for when the particle systems
+// that own them are torn down (level unload, camera blood shutdown).
+void ClearScreenParticleState(const char* reason) {
+    bool hadEntries = false;
+    AcquireSRWLockExclusive(&g_screenPlacementLock);
+    for (ScreenParticlePlacement& placement : g_screenPlacements) {
+        hadEntries = hadEntries || placement.model != nullptr;
+        placement = ScreenParticlePlacement{};
+    }
+    ReleaseSRWLockExclusive(&g_screenPlacementLock);
+    AcquireSRWLockExclusive(&g_screenParticleLock);
+    for (ScreenParticleEntry& entry : g_screenParticles) {
+        hadEntries = hadEntries || entry.model != nullptr;
+        entry = ScreenParticleEntry{};
+    }
+    ReleaseSRWLockExclusive(&g_screenParticleLock);
+    static std::atomic<int> logged{0};
+    if (hadEntries && logged.fetch_add(1) < 8) {
+        Log("Screen particles: forgot the listed screen-particle models (%s).", reason);
+    }
+}
 
 // The placement reads its camera from [context+0x128] (origin via vtable
 // +0x20, axis via +0x30; 0x21DC00) on the same call, and it runs on a job
@@ -8391,6 +8421,7 @@ void CorrectEmitterPoseNow(unsigned char* model, void* placementContext) {
     slot->used = used;
     slot->base = base;
     slot->written = written;
+    slot->placedCounter = ReadPerformanceCounter();
     ReleaseSRWLockExclusive(&g_screenPlacementLock);
 }
 
@@ -8433,12 +8464,22 @@ void RefreshScreenParticlesForCamera(const Transform& predicted) {
     if (g_screenParticleMode.load(std::memory_order_relaxed) != 3 || !SourceHandsActive()) {
         return;
     }
+    LARGE_INTEGER frequency{};
+    QueryPerformanceFrequency(&frequency);
+    const std::uint64_t now = ReadPerformanceCounter();
+    const auto maxAge = static_cast<std::uint64_t>(
+        static_cast<double>(frequency.QuadPart) * kScreenPlacementMaxAgeSeconds);
     AcquireSRWLockExclusive(&g_screenPlacementLock);
     for (ScreenParticlePlacement& placement : g_screenPlacements) {
         if (placement.model == nullptr) {
             continue;
         }
         auto* model = static_cast<unsigned char*>(placement.model);
+        if (now - placement.placedCounter > maxAge ||
+            !IsReadableMemory(model + kRenderModelOriginOffset, 12 * sizeof(float))) {
+            placement = ScreenParticlePlacement{};  // no longer placed: possibly freed
+            continue;
+        }
         std::array<float, 12> current{};
         ReadEmitterPose(model, current);
         if (current != placement.written) {
@@ -11783,11 +11824,16 @@ std::atomic<void*> g_cameraBlood{nullptr};
 std::uint64_t g_lastForcedBloodCounter = 0;
 
 extern "C" void __fastcall HookCameraBloodInit(void* self) {
+    // A new player FX instance: models listed from the previous one are gone.
+    ClearScreenParticleState("camera blood init");
     g_cameraBlood.store(self, std::memory_order_relaxed);
     g_originalCameraBloodInit(self);
 }
 
 extern "C" void __fastcall HookCameraBloodShutdown(void* self) {
+    // The camera-blood particle systems (screen particles) are torn down with
+    // the level; forget their models before they are freed.
+    ClearScreenParticleState("camera blood shutdown");
     void* expected = self;
     g_cameraBlood.compare_exchange_strong(expected, nullptr, std::memory_order_relaxed);
     g_originalCameraBloodShutdown(self);
